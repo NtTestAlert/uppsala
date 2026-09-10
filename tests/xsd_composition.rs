@@ -628,3 +628,42 @@ fn uncanonicalizable_base_path_fails_closed() {
         err
     );
 }
+
+#[test]
+fn redefined_simple_content_uses_original_value_type() {
+    let dir = mkdir_unique("redefine-simple-content");
+    fs::write(
+        dir.join("base.xsd"),
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:complexType name="Amount"><xs:simpleContent>
+        <xs:extension base="xs:decimal"/>
+      </xs:simpleContent></xs:complexType>
+    </xs:schema>"#,
+    )
+    .unwrap();
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:redefine schemaLocation="base.xsd">
+        <xs:complexType name="Amount"><xs:simpleContent>
+          <xs:extension base="Amount">
+            <xs:attribute name="unit" type="xs:string" use="required"/>
+          </xs:extension>
+        </xs:simpleContent></xs:complexType>
+      </xs:redefine>
+      <xs:element name="r" type="Amount"/>
+    </xs:schema>"#;
+    fs::write(dir.join("schema.xsd"), schema).unwrap();
+    let validator = XsdValidator::from_schema_with_base_path(
+        &parse(schema).unwrap(),
+        Some(&dir.join("schema.xsd")),
+    )
+    .unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    for (xml, valid) in [
+        (r#"<r unit="USD">12.50</r>"#, true),
+        (r#"<r unit="USD">garbage</r>"#, false),
+        ("<r>12.50</r>", false),
+    ] {
+        let errors = validator.validate(&parse(xml).unwrap());
+        assert_eq!(errors.is_empty(), valid, "{xml}: {errors:?}");
+    }
+}
