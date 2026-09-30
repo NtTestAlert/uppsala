@@ -725,6 +725,28 @@ impl XsdValidator {
             }
         }
 
+        // An empty element with a fixed value takes that value (XSD 1.0
+        // cvc-elt.5.1.2); the value is validated in place of the empty text.
+        let has_child_elements = self.element_has_child_elements(doc, node);
+        let is_empty = !has_child_elements && doc.text_content_deep(node).is_empty();
+        let supplied = decl.fixed.as_deref().filter(|_| is_empty);
+        if decl.fixed.is_some() {
+            let is_id = self
+                .element_value_type(decl)
+                .is_some_and(|value_type| self.is_id_type(&value_type));
+            if is_id {
+                // e-props-correct.4: an ID-typed element has no value constraint.
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has type ID and cannot have a fixed value",
+                        decl.name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            }
+        }
+
         // Check for xsi:type override
         if let Some(xsi_type_ref) = self.resolve_xsi_type(doc, node) {
             match xsi_type_ref {
@@ -754,7 +776,10 @@ impl XsdValidator {
                             });
                             return;
                         }
-                        let text = doc.text_content_deep(node);
+                        let text = match supplied {
+                            Some(text) => text.to_string(),
+                            None => doc.text_content_deep(node),
+                        };
                         validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
                     }
                     return;
@@ -819,7 +844,7 @@ impl XsdValidator {
                                 });
                                 return;
                             }
-                            self.validate_simple_content(doc, node, &st, errors);
+                            self.validate_simple_content(doc, node, &st, supplied, errors);
                         }
                     }
                     return;
@@ -857,7 +882,7 @@ impl XsdValidator {
                         column: Some(doc.node_column(node)),
                     });
                 }
-                self.validate_simple_content(doc, node, st, errors);
+                self.validate_simple_content(doc, node, st, supplied, errors);
             }
             None => {
                 // If type can't be resolved, check if it's a built-in
@@ -884,7 +909,10 @@ impl XsdValidator {
                                     column: Some(doc.node_column(node)),
                                 });
                             }
-                            let text = doc.text_content_deep(node);
+                            let text = match supplied {
+                                Some(text) => text.to_string(),
+                                None => doc.text_content_deep(node),
+                            };
                             validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
                         }
                     },
@@ -910,10 +938,32 @@ impl XsdValidator {
             }
         }
 
-        // Check fixed-value constraint (raw lexical comparison, no whitespace normalization)
-        if let Some(ref fixed_value) = decl.fixed {
+        // Check the fixed-value constraint of a non-empty element
+        // (cvc-elt.5.2.2). The element must have no element children
+        // (5.2.2.1), whatever its content type, mixed included; then its
+        // text is compared by value with the fixed value, read in the
+        // declared type, or character for character for mixed content
+        // (5.2.2.2); see `element_matches_fixed_value`.
+        if let Some(ref fixed_value) = decl.fixed.as_ref().filter(|_| has_child_elements) {
+            errors.push(ValidationError {
+                message: format!(
+                    "Element '{}' has fixed value '{}' but contains child elements",
+                    decl.name, fixed_value
+                ),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
+        } else if let Some(ref fixed_value) = decl.fixed.as_ref().filter(|_| !is_empty) {
             let text = doc.text_content_deep(node);
-            if text != *fixed_value {
+            let matches = self.element_matches_fixed_value(
+                &text,
+                fixed_value,
+                &decl.type_ref,
+                &decl.type_ref,
+                doc,
+                node,
+            );
+            if !matches {
                 errors.push(ValidationError {
                     message: format!(
                         "Element '{}' has fixed value '{}' but content is '{}'",
@@ -1056,13 +1106,26 @@ impl XsdValidator {
                     .find(|a| attr_decl_matches(a, attr_decl))
                 {
                     let value = &attr.value;
+                    let (type_ref, fixed) = self.effective_attribute_use(attr_decl);
                     debug_log!(
                         "validating attr {}={} against {:?}",
                         attr_decl.name,
                         value,
-                        attr_decl.type_ref
+                        type_ref
                     );
-                    self.validate_attribute_value(value, &attr_decl.type_ref, doc, node, errors);
+                    let start = errors.len();
+                    self.validate_attribute_value(value, type_ref, doc, node, errors);
+                    if errors.len() == start {
+                        self.check_attribute_fixed_value(
+                            &attr_decl.name,
+                            value,
+                            type_ref,
+                            fixed,
+                            doc,
+                            node,
+                            errors,
+                        );
+                    }
                 }
             }
 
@@ -1121,6 +1184,7 @@ impl XsdValidator {
                             match global_decl {
                                 Some(decl) => {
                                     // Validate attribute value against its declared type
+                                    let start = errors.len();
                                     self.validate_attribute_value(
                                         &attr.value,
                                         &decl.type_ref,
@@ -1128,6 +1192,17 @@ impl XsdValidator {
                                         node,
                                         errors,
                                     );
+                                    if errors.len() == start {
+                                        self.check_attribute_fixed_value(
+                                            &decl.name,
+                                            &attr.value,
+                                            &decl.type_ref,
+                                            decl.fixed.as_deref(),
+                                            doc,
+                                            node,
+                                            errors,
+                                        );
+                                    }
                                 }
                                 None => {
                                     // For strict: must find a declaration
@@ -1324,7 +1399,7 @@ impl XsdValidator {
                         if let Some(type_def) = self.types.get(&key) {
                             match type_def {
                                 TypeDef::Simple(st) => {
-                                    self.validate_simple_content(doc, node, st, errors);
+                                    self.validate_simple_content(doc, node, st, None, errors);
                                 }
                                 TypeDef::Complex(_) => {
                                     // Complex base type for simpleContent — text validated against
@@ -1335,7 +1410,7 @@ impl XsdValidator {
                     }
                     TypeRef::Inline(inner_type_def) => {
                         if let TypeDef::Simple(st) = inner_type_def.as_ref() {
-                            self.validate_simple_content(doc, node, st, errors);
+                            self.validate_simple_content(doc, node, st, None, errors);
                         }
                     }
                     // Decided at build; never present in a built validator.
@@ -2066,17 +2141,24 @@ impl XsdValidator {
 
     /// Validate simple (text) content of an element against a simple type definition.
     ///
-    /// See [`XsdValidator::validate_simple_value`] for the derivation-chain,
-    /// list and union semantics.
+    /// `text` replaces the element's text when given (an empty element with a
+    /// fixed value takes that value). See [`XsdValidator::validate_simple_value`]
+    /// for the derivation-chain, list and union semantics.
     fn validate_simple_content(
         &self,
         doc: &Document,
         node: NodeId,
         st: &SimpleTypeDef,
+        text: Option<&str>,
         errors: &mut Vec<ValidationError>,
     ) {
-        let raw_text = doc.text_content_deep(node);
-        self.validate_simple_value(&raw_text, st, doc, node, errors);
+        match text {
+            Some(text) => self.validate_simple_value(text, st, doc, node, errors),
+            None => {
+                let raw_text = doc.text_content_deep(node);
+                self.validate_simple_value(&raw_text, st, doc, node, errors);
+            }
+        }
     }
 
     /// Validate an attribute value against its declared type reference
@@ -2091,6 +2173,198 @@ impl XsdValidator {
     ) {
         debug_log!("validate_attribute_value type_ref={:?}", type_ref);
         self.check_type_ref_value(value, type_ref, doc, node, errors, 0, &mut UnionMemo::new());
+    }
+
+    /// The type and fixed value that govern an attribute use. A use that
+    /// references a global attribute declaration takes that declaration's
+    /// type, and its fixed value unless the use sets its own.
+    fn effective_attribute_use<'a>(
+        &'a self,
+        decl: &'a AttributeDecl,
+    ) -> (&'a TypeRef, Option<&'a str>) {
+        if decl.is_ref {
+            let key = (decl.namespace.clone(), decl.name.clone());
+            if let Some(global) = self.global_attributes.get(&key) {
+                return (
+                    &global.type_ref,
+                    decl.fixed.as_deref().or(global.fixed.as_deref()),
+                );
+            }
+        }
+        (&decl.type_ref, decl.fixed.as_deref())
+    }
+
+    /// Whether `value` equals the fixed value `fixed` as values of `type_ref`:
+    /// both are whitespace-normalized and read by the type (for a union, by
+    /// the member that accepts each), then compared as values. An invalid
+    /// value never matches.
+    fn matches_fixed_value(
+        &self,
+        value: &str,
+        fixed: &str,
+        type_ref: &TypeRef,
+        doc: &Document,
+        node: NodeId,
+    ) -> bool {
+        let mut scratch = Vec::new();
+        let mut memo = UnionMemo::new();
+        let actual =
+            self.check_type_ref_value(value, type_ref, doc, node, &mut scratch, 0, &mut memo);
+        let expected =
+            self.check_type_ref_value(fixed, type_ref, doc, node, &mut scratch, 0, &mut memo);
+        match (actual, expected) {
+            (Some((a, a_type)), Some((b, b_type))) => values_equal(&a, &a_type, &b, &b_type),
+            _ => false,
+        }
+    }
+
+    /// Whether a non-empty element's text `value` equals its declaration's
+    /// fixed value `fixed` (cvc-elt.5.2.2.2).
+    ///
+    /// The two are read in different types. The fixed value is the
+    /// declaration's value constraint, a value of the **declared** type
+    /// (XSD 1.0 Part 1 §3.3.1, {value constraint}), so its literal is
+    /// normalized and read in `declared`. The element's value is read in
+    /// the **actual** type, `actual` (the `xsi:type` type when one applies,
+    /// cvc-elt.5.2.2.2.2). A type validly derived from the declared type
+    /// shares its primitive, so the two compare by value: under `xs:token`
+    /// the text `1` is not the `xs:string` fixed value ` 1 `.
+    ///
+    /// When the declared type is `xs:anySimpleType`, the literal's value is
+    /// indeterminate: it may map to values of several primitives, and which
+    /// one is meant is not decided (XSD 1.1 Part 2 §3.2.1). An `xsi:type`
+    /// chooses the reading of an element's content, not of a schema's
+    /// literal, so only the lexical form is compared: the element's value,
+    /// normalized by the actual type, must equal the literal character for
+    /// character. When the declared type is not a
+    /// simple type and has no simple content (`xs:anyType`, which includes
+    /// a declaration without a type, or any mixed type), the fixed value is
+    /// an `xs:string` (XSD 1.0 Part 1 §3.3.2, {value constraint}), so only
+    /// an actual type derived from `xs:string` can match it. When the actual
+    /// type has mixed content, text and literal are compared character for
+    /// character (cvc-elt.5.2.2.2.1). An invalid text or literal never
+    /// matches.
+    fn element_matches_fixed_value(
+        &self,
+        value: &str,
+        fixed: &str,
+        declared: &TypeRef,
+        actual: &TypeRef,
+        doc: &Document,
+        node: NodeId,
+    ) -> bool {
+        let Some(actual_value_type) = self.value_type_of(actual) else {
+            return value == fixed;
+        };
+        let mut scratch = Vec::new();
+        let mut memo = UnionMemo::new();
+        let Some((item, item_type)) = self.check_type_ref_value(
+            value,
+            &actual_value_type,
+            doc,
+            node,
+            &mut scratch,
+            0,
+            &mut memo,
+        ) else {
+            return false;
+        };
+        let read_literal_in = |type_ref: &TypeRef, memo: &mut UnionMemo| {
+            self.check_type_ref_value(fixed, type_ref, doc, node, &mut Vec::new(), 0, memo)
+        };
+        let constraint = match self.value_type_of(declared) {
+            Some(declared_value_type) => match read_literal_in(&declared_value_type, &mut memo) {
+                Some((_, BuiltInType::AnySimpleType)) => return item == fixed,
+                other => other,
+            },
+            None => Some((fixed.to_string(), BuiltInType::String)),
+        };
+        match constraint {
+            Some((literal, literal_type)) => {
+                values_equal(&item, &item_type, &literal, &literal_type)
+            }
+            None => false,
+        }
+    }
+
+    /// Check a present attribute against the fixed value of its use, if any.
+    #[allow(clippy::too_many_arguments)]
+    fn check_attribute_fixed_value(
+        &self,
+        attr_name: &str,
+        value: &str,
+        type_ref: &TypeRef,
+        fixed: Option<&str>,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Some(fixed) = fixed {
+            if self.is_id_type(type_ref) {
+                // a-props-correct.3: an ID-typed attribute has no value constraint.
+                errors.push(ValidationError {
+                    message: format!(
+                        "Attribute '{}' has type ID and cannot have a fixed value",
+                        attr_name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            } else if !self.matches_fixed_value(value, fixed, type_ref, doc, node) {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Attribute '{}' has fixed value '{}' but its value is '{}'",
+                        attr_name, fixed, value
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            }
+        }
+    }
+
+    /// Whether a simple type is `xs:ID` or restricts it.
+    fn is_id_type(&self, type_ref: &TypeRef) -> bool {
+        let st = match type_ref {
+            TypeRef::BuiltIn(bt) => return *bt == BuiltInType::ID,
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(st) => st,
+                TypeDef::Complex(_) => return false,
+            },
+            TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
+                Some(TypeDef::Simple(st)) => st,
+                Some(TypeDef::Complex(_)) => return false,
+                None => {
+                    return ns.as_deref() == Some(XS_NAMESPACE)
+                        && parse_builtin_type(name) == Some(BuiltInType::ID)
+                }
+            },
+            TypeRef::Unqualified(_) => return false,
+        };
+        self.simple_type_chain(st).is_ok_and(|chain| {
+            let root = chain[chain.len() - 1];
+            root.union_members.is_none() && !root.is_list && root.base == BuiltInType::ID
+        })
+    }
+
+    /// The simple type an element's value is read with, for comparing it
+    /// with the element's fixed value; `None` when the element has mixed,
+    /// element-only or empty content (compared character for character).
+    fn element_value_type(&self, decl: &ElementDecl) -> Option<TypeRef> {
+        self.value_type_of(&decl.type_ref)
+    }
+
+    /// The simple type a value of `type_ref` is read with; see
+    /// [`XsdValidator::element_value_type`].
+    fn value_type_of(&self, type_ref: &TypeRef) -> Option<TypeRef> {
+        match type_ref {
+            TypeRef::BuiltIn(BuiltInType::AnyType) => None,
+            TypeRef::BuiltIn(_) => Some(type_ref.clone()),
+            _ => match self.resolve_type(type_ref)? {
+                TypeDef::Simple(_) => Some(type_ref.clone()),
+                TypeDef::Complex(_) => None,
+            },
+        }
     }
 
     /// Validate a value against a simple type, following its whole derivation chain.

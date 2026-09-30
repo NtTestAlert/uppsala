@@ -856,6 +856,10 @@ pub(super) fn parse_attribute_group_def(
                             // local overrides for use/required
                             let mut attr = global_attr.clone();
                             attr.is_ref = true;
+                            // A fixed value on the use overrides the declaration's.
+                            if let Some(fixed) = child_elem.get_attribute("fixed") {
+                                attr.fixed = Some(fixed.to_string());
+                            }
                             if child_elem.get_attribute("use") == Some("required") {
                                 attr.required = true;
                             } else if child_elem.get_attribute("use") == Some("prohibited") {
@@ -872,6 +876,7 @@ pub(super) fn parse_attribute_group_def(
                                 type_ref: TypeRef::BuiltIn(BuiltInType::String),
                                 required,
                                 default: None,
+                                fixed: child_elem.get_attribute("fixed").map(|s| s.to_string()),
                                 prohibited,
                                 is_ref: true,
                                 qualified: false,
@@ -1307,6 +1312,7 @@ fn parse_attribute_decl(
     let required = elem.get_attribute("use") == Some("required");
     let prohibited = elem.get_attribute("use") == Some("prohibited");
     let default = elem.get_attribute("default").map(|s| s.to_string());
+    let fixed = elem.get_attribute("fixed").map(|s| s.to_string());
 
     Ok(AttributeDecl {
         name,
@@ -1314,6 +1320,7 @@ fn parse_attribute_decl(
         type_ref,
         required,
         default,
+        fixed,
         prohibited,
         is_ref,
         qualified,

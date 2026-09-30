@@ -86,8 +86,10 @@ pub(crate) struct ElementDecl {
     pub(super) substitution_group: Option<(Option<String>, String)>,
     /// Whether this element is abstract (cannot appear directly in instances).
     pub(super) is_abstract: bool,
-    /// Fixed value constraint: if set, the element's text content must exactly
-    /// match this string (raw lexical comparison, no whitespace normalization).
+    /// Fixed value constraint. An empty element takes this value; otherwise
+    /// the element's value must equal it: in the value space of the element's
+    /// simple type (after whitespace normalization), or character for
+    /// character for mixed content.
     pub(super) fixed: Option<String>,
     /// Identity constraints declared on this element.
     pub(super) identity_constraints: Vec<IdentityConstraint>,
@@ -395,6 +397,11 @@ pub(crate) struct AttributeDecl {
     /// Default value (parsed for spec completeness; not yet enforced during validation).
     #[allow(dead_code)]
     pub(super) default: Option<String>,
+    /// Fixed value constraint: when the attribute is present, its value must
+    /// equal this one in the value space of the attribute's type. For a use
+    /// that references a global declaration (`is_ref`), `None` means the
+    /// global declaration's constraint applies.
+    pub(super) fixed: Option<String>,
     pub(super) prohibited: bool,
     /// Whether this use came from `ref=` (a global attribute reference). Under
     /// chameleon include, ref'd no-namespace attributes move to the including

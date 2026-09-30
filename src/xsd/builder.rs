@@ -604,12 +604,14 @@ impl XsdValidator {
                             };
                             let required = attr_elem.get_attribute("use") == Some("required");
                             let default = attr_elem.get_attribute("default").map(|s| s.to_string());
+                            let fixed = attr_elem.get_attribute("fixed").map(|s| s.to_string());
                             let decl = AttributeDecl {
                                 name: name.to_string(),
                                 namespace: validator.target_namespace.clone(),
                                 type_ref,
                                 required,
                                 default,
+                                fixed,
                                 prohibited: false,
                                 is_ref: false,
                                 qualified: true,
@@ -776,12 +778,14 @@ impl XsdValidator {
                                 let required = attr_elem.get_attribute("use") == Some("required");
                                 let default =
                                     attr_elem.get_attribute("default").map(|s| s.to_string());
+                                let fixed = attr_elem.get_attribute("fixed").map(|s| s.to_string());
                                 let decl = AttributeDecl {
                                     name: name.to_string(),
                                     namespace: validator.target_namespace.clone(),
                                     type_ref,
                                     required,
                                     default,
+                                    fixed,
                                     prohibited: false,
                                     is_ref: false,
                                     qualified: true,

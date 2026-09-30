@@ -865,6 +865,93 @@ fn union_members_are_tried_in_declaration_order() {
     check_element_values(&token_first, &[("a b", true), ("a  b", true)]);
 }
 
+// ─── Fixed values ──────────────────────────────────────────
+
+#[test]
+fn attribute_fixed_value_is_enforced() {
+    let xsd = schema(
+        r#"<xs:element name="e"><xs:complexType>
+             <xs:attribute name="code" type="xs:string" fixed="v (1)"/>
+             <xs:attribute name="n" type="xs:int" fixed="5"/>
+             <xs:attribute name="t" type="xs:token" fixed="a b"/>
+           </xs:complexType></xs:element>"#,
+    );
+    let validator = build(&xsd).expect("schema builds");
+    for (attrs, valid) in [
+        (r#"code="v (1)""#, true),
+        ("", true),
+        (r#"code="v (2)""#, false),
+        // xs:string keeps the space, so this is another value.
+        (r#"code="v (1) ""#, false),
+        (r#"n="05""#, true),
+        (r#"n=" +5 ""#, true),
+        (r#"n="6""#, false),
+        (r#"t="  a   b ""#, true),
+        (r#"t="ab""#, false),
+    ] {
+        let errs = errors(&validator, &format!("<e {}/>", attrs));
+        assert_eq!(errs.is_empty(), valid, "{}: {:?}", attrs, errs);
+    }
+}
+
+#[test]
+fn attribute_fixed_value_of_references_and_inherited_uses() {
+    let xsd = schema(
+        r#"<xs:attribute name="g" type="xs:int" fixed="7"/>
+           <xs:attribute name="h" type="xs:string"/>
+           <xs:attributeGroup name="AG"><xs:attribute ref="g"/></xs:attributeGroup>
+           <xs:complexType name="Base"><xs:attribute name="b" type="xs:string" fixed="x"/></xs:complexType>
+           <xs:complexType name="Derived"><xs:complexContent><xs:extension base="Base">
+             <xs:attribute ref="g"/>
+             <xs:attribute ref="h" fixed="y"/>
+           </xs:extension></xs:complexContent></xs:complexType>
+           <xs:element name="root"><xs:complexType><xs:sequence>
+             <xs:element name="d" type="Derived" minOccurs="0" maxOccurs="unbounded"/>
+             <xs:element name="a" minOccurs="0" maxOccurs="unbounded"><xs:complexType><xs:attributeGroup ref="AG"/></xs:complexType></xs:element>
+           </xs:sequence></xs:complexType></xs:element>"#,
+    );
+    let validator = build(&xsd).expect("schema builds");
+    for (child, valid) in [
+        (r#"<d b="x" g="07" h="y"/>"#, true),
+        (r#"<d b="z"/>"#, false),
+        (r#"<d g="8"/>"#, false),
+        // The use's own fixed value applies to the referenced declaration.
+        (r#"<d h="z"/>"#, false),
+        // A referenced declaration's type applies too.
+        (r#"<d g="x"/>"#, false),
+        (r#"<a g="7"/>"#, true),
+        (r#"<a g="6"/>"#, false),
+    ] {
+        let errs = errors(&validator, &format!("<root>{}</root>", child));
+        assert_eq!(errs.is_empty(), valid, "{}: {:?}", child, errs);
+    }
+}
+
+/// An empty element with a fixed value takes that value, so it is valid
+/// even when the empty string is not a value of its type.
+#[test]
+fn empty_element_takes_its_fixed_value() {
+    let xsd = schema(
+        r#"<xs:simpleType name="Code"><xs:restriction base="xs:normalizedString"><xs:enumeration value="PL"/><xs:enumeration value="DE"/></xs:restriction></xs:simpleType>
+           <xs:element name="root"><xs:complexType><xs:sequence>
+             <xs:element name="p" type="Code" fixed="PL" minOccurs="0"/>
+             <xs:element name="i" type="xs:int" fixed="5" minOccurs="0"/>
+           </xs:sequence></xs:complexType></xs:element>"#,
+    );
+    let validator = build(&xsd).expect("schema builds");
+    for (child, valid) in [
+        ("<p/>", true),
+        ("<p></p>", true),
+        ("<p>DE</p>", false),
+        ("<i/>", true),
+        // Whitespace is content: an int cannot be " ".
+        ("<i> </i>", false),
+    ] {
+        let errs = errors(&validator, &format!("<root>{}</root>", child));
+        assert_eq!(errs.is_empty(), valid, "{}: {:?}", child, errs);
+    }
+}
+
 // ─── Type name resolution ──────────────────────────────────
 
 /// QName attribute values are whitespace-collapsed.
@@ -1175,6 +1262,92 @@ fn float_and_double_ranges_compare_by_value() {
             ("INF", false),
         ],
     );
+}
+
+/// The lexical space of `gYear` and `gYearMonth` bounds no year, but a
+/// value is compared on the timeline, and a year too far from zero has no
+/// representable instant there. Such a value is never compared: enumeration,
+/// range facets and fixed values refuse it, even where wrapped arithmetic
+/// would land on an allowed instant (the first two years below do, for
+/// 2000). Without a facet it is valid.
+#[test]
+fn years_too_far_from_zero_to_place_on_the_timeline_are_refused() {
+    let lands_on_2000 = "-829761002728217058590027200404985271";
+    let also_lands_on_2000 = "9571365952522854667069173408180337626";
+    let digits_32 = format!("1{}", "0".repeat(31));
+    let digits_37 = format!("1{}", "0".repeat(36));
+    let beyond_i128 = format!("-{}", "9".repeat(40));
+    let year = |facets: &str| {
+        schema(&format!(
+            r#"<xs:simpleType name="Y"><xs:restriction base="xs:gYear">{facets}</xs:restriction></xs:simpleType>
+               <xs:element name="e" type="Y"/>"#
+        ))
+    };
+    check_element_values(
+        &year(r#"<xs:enumeration value="2000"/>"#),
+        &[
+            ("2000", true),
+            ("2001", false),
+            (lands_on_2000, false),
+            (also_lands_on_2000, false),
+            (&digits_32, false),
+            (&digits_37, false),
+            (&beyond_i128, false),
+        ],
+    );
+    let validator = build(&year(r#"<xs:enumeration value="2000"/>"#)).expect("builds");
+    let errs = errors(&validator, &format!("<e>{}</e>", lands_on_2000));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains(lands_on_2000) && e.contains("cannot be compared")),
+        "{:?}",
+        errs
+    );
+    // Not even the same literal is compared.
+    check_element_values(
+        &year(&format!(r#"<xs:enumeration value="{lands_on_2000}"/>"#)),
+        &[(lands_on_2000, false), ("2000", false)],
+    );
+    check_element_values(
+        &year(r#"<xs:maxInclusive value="2100"/>"#),
+        &[
+            ("2099", true),
+            ("2101", false),
+            (&digits_32, false),
+            (&format!("-{}", digits_32), false),
+        ],
+    );
+    check_element_values(
+        &year(r#"<xs:minInclusive value="1900"/><xs:maxInclusive value="2050"/>"#),
+        &[("2000", true), (lands_on_2000, false)],
+    );
+    check_element_values(&year(""), &[(lands_on_2000, true), (&digits_37, true)]);
+    check_element_values(
+        &schema(
+            r#"<xs:simpleType name="YM"><xs:restriction base="xs:gYearMonth"><xs:enumeration value="2000-05"/></xs:restriction></xs:simpleType>
+               <xs:element name="e" type="YM"/>"#,
+        ),
+        &[
+            ("2000-05", true),
+            ("829761002728217058590027200404989271-05", false),
+        ],
+    );
+    check_element_values(
+        &schema(r#"<xs:element name="e" type="xs:gYear" fixed="2000"/>"#),
+        &[("2000", true), (lands_on_2000, false)],
+    );
+    check_element_values(
+        &schema(&format!(
+            r#"<xs:element name="e" type="xs:gYear" fixed="{lands_on_2000}"/>"#
+        )),
+        &[(lands_on_2000, false)],
+    );
+    let validator = build(&schema(
+        r#"<xs:element name="e"><xs:complexType><xs:attribute name="a" type="xs:gYear" fixed="2000"/></xs:complexType></xs:element>"#,
+    ))
+    .expect("builds");
+    assert!(errors(&validator, r#"<e a="2000"/>"#).is_empty());
+    assert!(!errors(&validator, &format!(r#"<e a="{}"/>"#, lands_on_2000)).is_empty());
 }
 
 #[test]
@@ -1564,6 +1737,137 @@ fn many_unprefixed_built_in_names_build_in_linear_time() {
     );
 }
 
+// ─── Chameleon-included attribute types ────────────────────
+
+/// A no-namespace module's attribute declarations reference its types
+/// unprefixed; a chameleon include moves those references with the types.
+#[test]
+fn chameleon_include_moves_attribute_type_references() {
+    let (validator, dir) = build_files(
+        "chameleon-attribute",
+        &[
+            (
+                "main.xsd",
+                format!(
+                    r#"<xs:schema {} xmlns:m="urn:m" targetNamespace="urn:m">
+                         <xs:include schemaLocation="module.xsd"/>
+                         <xs:element name="e"><xs:complexType>
+                           <xs:attribute name="local" type="m:Code"/>
+                           <xs:attributeGroup ref="m:G"/>
+                           <xs:attribute ref="m:g"/>
+                         </xs:complexType></xs:element>
+                       </xs:schema>"#,
+                    XS
+                ),
+            ),
+            (
+                "module.xsd",
+                schema(
+                    r#"<xs:simpleType name="Code"><xs:restriction base="xs:string"><xs:pattern value="[A-Z]{2}"/></xs:restriction></xs:simpleType>
+                       <xs:attribute name="g" type="Code"/>
+                       <xs:attributeGroup name="G"><xs:attribute name="a" type="Code"/></xs:attributeGroup>"#,
+                ),
+            ),
+        ],
+    );
+    assert_instances(
+        &validator,
+        &[
+            (r#"<m:e xmlns:m="urn:m" local="AB" a="CD" m:g="EF"/>"#, true),
+            (r#"<m:e xmlns:m="urn:m" local="ab"/>"#, false),
+            (r#"<m:e xmlns:m="urn:m" a="cd"/>"#, false),
+            (r#"<m:e xmlns:m="urn:m" m:g="ef"/>"#, false),
+        ],
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ─── Fixed values: wildcards, ID types, mixed content ──────
+
+/// An attribute matched by a strict or lax wildcard is validated against
+/// its global declaration, including that declaration's fixed value.
+#[test]
+fn wildcard_matched_attribute_enforces_its_fixed_value() {
+    for process_contents in ["strict", "lax"] {
+        let xsd = format!(
+            r###"<xs:schema {} xmlns:t="urn:t" targetNamespace="urn:t">
+                 <xs:attribute name="g" type="xs:token" fixed="x"/>
+                 <xs:element name="e"><xs:complexType>
+                   <xs:anyAttribute namespace="##targetNamespace" processContents="{}"/>
+                 </xs:complexType></xs:element>
+               </xs:schema>"###,
+            XS, process_contents
+        );
+        let validator = build(&xsd).expect("schema builds");
+        assert_instances(
+            &validator,
+            &[
+                (r#"<t:e xmlns:t="urn:t" t:g=" x "/>"#, true),
+                (r#"<t:e xmlns:t="urn:t" t:g="y"/>"#, false),
+                (r#"<t:e xmlns:t="urn:t"/>"#, true),
+            ],
+        );
+    }
+}
+
+/// e-props-correct.4 / a-props-correct.3: an element or attribute of type
+/// `xs:ID` (or a restriction of it) cannot have a fixed value. The schema
+/// still builds; every element, and every attribute present, with such a
+/// declaration is reported during validation.
+#[test]
+fn id_typed_declarations_with_a_fixed_value_are_reported() {
+    let xsd = schema(
+        r#"<xs:simpleType name="MyId"><xs:restriction base="xs:ID"><xs:maxLength value="5"/></xs:restriction></xs:simpleType>
+           <xs:element name="root"><xs:complexType><xs:sequence>
+             <xs:element name="i" type="xs:ID" fixed="a1" minOccurs="0"/>
+             <xs:element name="d" type="MyId" fixed="b1" minOccurs="0"/>
+             <xs:element name="c" minOccurs="0"><xs:complexType>
+               <xs:attribute name="id" type="xs:ID" fixed="c1"/>
+               <xs:attribute name="my" type="MyId" fixed="d1"/>
+             </xs:complexType></xs:element>
+           </xs:sequence></xs:complexType></xs:element>"#,
+    );
+    let validator = build(&xsd).expect("schema builds");
+    let cases = [
+        ("<root><i>a1</i></root>", "Element 'i'"),
+        ("<root><i/></root>", "Element 'i'"),
+        ("<root><d>b1</d></root>", "Element 'd'"),
+        (r#"<root><c id="c1"/></root>"#, "id"),
+        (r#"<root><c my="d1"/></root>"#, "my"),
+    ];
+    for (xml, name) in cases {
+        let errs = errors(&validator, xml);
+        assert!(
+            errs.iter().any(|e| e.contains(name) && e.contains("ID")),
+            "{}: {:?}",
+            xml,
+            errs
+        );
+    }
+}
+
+/// cvc-elt.5.2.2.1: an element with a fixed value has no element children,
+/// whatever its content type; mixed content compares its text only when
+/// there are none.
+#[test]
+fn fixed_element_with_mixed_content_refuses_child_elements() {
+    let xsd = schema(
+        r#"<xs:element name="e" fixed="PL"><xs:complexType mixed="true"><xs:sequence>
+             <xs:element name="b" minOccurs="0" type="xs:string"/>
+           </xs:sequence></xs:complexType></xs:element>"#,
+    );
+    check_element_values(
+        &xsd,
+        &[
+            ("PL", true),
+            ("P<b>L</b>", false),
+            ("PL<b/>", false),
+            ("<b>PL</b>", false),
+            ("PX", false),
+        ],
+    );
+}
+
 // ─── Float literals round once ─────────────────────────────
 
 /// An `xs:float` literal maps to the nearest single-precision value.
@@ -1916,6 +2220,39 @@ fn values_padded_with_non_xml_whitespace_are_refused() {
             }
         }
     }
+}
+
+/// Enumeration and fixed values compare by value, but a padded value is not
+/// a value of the type: it matches no literal.
+#[test]
+fn enumerations_compare_without_trimming_non_xml_whitespace() {
+    check_element_values(
+        &schema(
+            r#"<xs:element name="e"><xs:simpleType><xs:restriction base="xs:byte"><xs:enumeration value="3"/></xs:restriction></xs:simpleType></xs:element>"#,
+        ),
+        &[
+            ("3", true),
+            (" 3 ", true),
+            ("03", true),
+            ("\u{A0}3", false),
+            ("3\u{A0}", false),
+        ],
+    );
+    check_element_values(
+        &schema(
+            r#"<xs:element name="e"><xs:simpleType><xs:restriction base="xs:integer"><xs:enumeration value="1"/><xs:enumeration value="2"/></xs:restriction></xs:simpleType></xs:element>"#,
+        ),
+        &[("2", true), ("\u{A0}2", false), ("\u{2003}1", false)],
+    );
+    check_element_values(
+        &schema(r#"<xs:element name="e" type="xs:boolean" fixed="true"/>"#),
+        &[
+            ("true", true),
+            ("1", true),
+            ("\u{A0}true", false),
+            ("true\u{3000}", false),
+        ],
+    );
 }
 
 /// Range, `totalDigits` and `fractionDigits` facets see the value as it is:
