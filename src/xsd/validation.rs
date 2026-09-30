@@ -10,6 +10,7 @@
 //! - xsi:type resolution and type substitution blocking checks
 //! - Substitution group matching for element declarations
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Document, NodeId, NodeKind};
@@ -44,6 +45,126 @@ enum XsiTypeResult {
     Named(Box<TypeDef>),
     /// The xsi:type QName could not be resolved.
     NotFound(String),
+}
+
+/// The content type of a complex type, see [`XsdValidator::content_type`].
+enum ContentType<'a> {
+    /// Empty, element-only or mixed content: the model and whether it is
+    /// mixed.
+    Model(Cow<'a, ContentModel>, bool),
+    /// Simple content, read with `simple_content_types` of this definition.
+    Simple(&'a ComplexTypeDef),
+}
+
+/// Whether a model has no particle: the explicit content of a derivation
+/// is then empty (XSD 1.0 Part 1 §3.4.2, clause 2.1 of the complexContent
+/// mapping).
+fn model_is_empty(model: &ContentModel) -> bool {
+    match model {
+        ContentModel::Empty => true,
+        ContentModel::Sequence(particles, _, max) => {
+            particles.is_empty() || matches!(max, MaxOccurs::Bounded(0))
+        }
+        ContentModel::Choice(particles, min, max) => {
+            (particles.is_empty() && *min == 0) || matches!(max, MaxOccurs::Bounded(0))
+        }
+        ContentModel::All(particles) => particles.is_empty(),
+        ContentModel::SimpleContent(_) | ContentModel::Any => false,
+    }
+}
+
+/// The content type of `derived`, an extension, given its base's.
+///
+/// The result is `sequence(base, own)` (XSD 1.0 Part 1 §3.4.2). A base that
+/// is a sequence occurring once contributes its particles rather than one
+/// nested particle, and so does an own sequence occurring once: a (1,1)
+/// sequence inside a sequence matches exactly what its particles do in its
+/// place. Any other base (a choice, or a sequence with other occurrences) is
+/// kept whole as one particle; the result is then a (1,1) sequence, so the
+/// next extension splices it. The model therefore nests at most one level
+/// more than its root, whatever the derivation depth, and validating a child
+/// never runs one frame deeper per step. The accumulated model is moved from
+/// step to step, not copied, so building it is linear in the depth.
+fn extend_content_type<'a>(base: ContentType<'a>, derived: &'a ComplexTypeDef) -> ContentType<'a> {
+    // An extension without particles has the base's content type.
+    if model_is_empty(&derived.content) {
+        return base;
+    }
+    let own = ContentType::Model(Cow::Borrowed(&derived.content), derived.mixed);
+    let ContentType::Model(base_model, _) = base else {
+        // Particles added to simple content: not a valid schema
+        // (cos-ct-extends.1.4); the extension's own particles apply.
+        return own;
+    };
+    if model_is_empty(&base_model) {
+        return own;
+    }
+    let is_group = |model: &ContentModel| {
+        matches!(model, ContentModel::Sequence(..) | ContentModel::Choice(..))
+    };
+    if !is_group(&base_model) || !is_group(&derived.content) {
+        // An `all` group on either side (not valid in an extension of
+        // non-empty content in XSD 1.0), or the lax wildcard content of
+        // xs:anyType: the extension's own particles apply.
+        return own;
+    }
+    let base_model = match base_model {
+        Cow::Owned(model) => model,
+        Cow::Borrowed(model) => clone_model(model),
+    };
+    let mut particles = match base_model {
+        ContentModel::Sequence(particles, 1, MaxOccurs::Bounded(1)) => particles,
+        ContentModel::Sequence(particles, min, max) => vec![Particle {
+            kind: ParticleKind::Sequence(particles),
+            min_occurs: min,
+            max_occurs: max,
+        }],
+        ContentModel::Choice(particles, min, max) => vec![Particle {
+            kind: ParticleKind::Choice(particles),
+            min_occurs: min,
+            max_occurs: max,
+        }],
+        _ => return own,
+    };
+    match &derived.content {
+        ContentModel::Sequence(own_particles, 1, MaxOccurs::Bounded(1)) => {
+            particles.extend(clone_particles(own_particles));
+        }
+        ContentModel::Sequence(own_particles, min, max) => particles.push(Particle {
+            kind: ParticleKind::Sequence(clone_particles(own_particles)),
+            min_occurs: *min,
+            max_occurs: *max,
+        }),
+        ContentModel::Choice(own_particles, min, max) => particles.push(Particle {
+            kind: ParticleKind::Choice(clone_particles(own_particles)),
+            min_occurs: *min,
+            max_occurs: *max,
+        }),
+        _ => return own,
+    }
+    ContentType::Model(
+        Cow::Owned(ContentModel::Sequence(particles, 1, MaxOccurs::Bounded(1))),
+        derived.mixed,
+    )
+}
+
+/// A copy of a schema's content model, for a content type built from it.
+fn clone_model(model: &ContentModel) -> ContentModel {
+    match model {
+        ContentModel::Sequence(particles, min, max) => {
+            ContentModel::Sequence(clone_particles(particles), *min, *max)
+        }
+        ContentModel::Choice(particles, min, max) => {
+            ContentModel::Choice(clone_particles(particles), *min, *max)
+        }
+        other => other.clone(),
+    }
+}
+
+/// A copy of a schema's particles, counted for the complexity tests.
+fn clone_particles(particles: &[Particle]) -> Vec<Particle> {
+    test_counters::note_many(&test_counters::CONTENT_PARTICLE_COPIES, particles.len());
+    particles.to_vec()
 }
 
 impl XsdValidator {
@@ -567,60 +688,47 @@ impl XsdValidator {
         }
     }
 
-    /// Compute the effective content model for a complex type, merging base type
-    /// particles for extension types.
+    /// The content type of a complex type (XSD 1.0 Part 1 §3.4.2).
     ///
-    /// For a type derived by extension from another complex type with a sequence
-    /// content model, the effective content is the base type's particles followed
-    /// by the extension's particles. This recursively walks the extension chain.
-    ///
-    /// Returns `None` if the type is not an extension or cannot be merged.
-    fn compute_effective_particles(&self, ct: &ComplexTypeDef) -> Option<Vec<Particle>> {
-        self.compute_effective_particles_inner(ct, &mut HashSet::new())
-    }
-
-    fn compute_effective_particles_inner(
-        &self,
-        ct: &ComplexTypeDef,
-        seen: &mut HashSet<(Option<String>, String)>,
-    ) -> Option<Vec<Particle>> {
-        if ct.derived_by_extension != Some(true) {
-            return None;
-        }
-        let (base_ns, base_name) = ct.base_type.as_ref()?;
-        let key = (base_ns.clone(), base_name.clone());
-        if !seen.insert(key.clone()) {
-            return None;
-        }
-        let base_type = self.types.get(&key)?;
-        if let TypeDef::Complex(base_ct) = base_type {
-            // Recursively get the base type's effective particles
-            let base_particles =
-                if let Some(recursive) = self.compute_effective_particles_inner(base_ct, seen) {
-                    recursive
-                } else {
-                    // No further merging needed, just get the base type's own particles
-                    match &base_ct.content {
-                        ContentModel::Sequence(particles, _, _) => particles.clone(),
-                        ContentModel::Empty => Vec::new(),
-                        _ => return None, // Can't merge non-sequence base content
-                    }
-                };
-
-            // Get the extension's own particles
-            let ext_particles = match &ct.content {
-                ContentModel::Sequence(particles, _, _) => particles.clone(),
-                ContentModel::Empty => Vec::new(),
-                _ => return None,
+    /// A `complexContent` restriction has its own explicit content (empty
+    /// when it declares no particle). An extension whose explicit content
+    /// is empty has the base's content type; otherwise, when the base's
+    /// content type is not empty, a sequence of the base's particle
+    /// followed by the extension's. A type derived through `simpleContent`
+    /// has simple content, read with [`Self::simple_content_types`].
+    fn content_type<'a>(&'a self, ct: &'a ComplexTypeDef) -> ContentType<'a> {
+        // The extension chain down to the first type that is not an
+        // extension of a known complex type.
+        let mut chain = vec![ct];
+        let mut seen = HashSet::new();
+        let mut current = ct;
+        while current.derived_by_extension == Some(true) && !current.simple_content {
+            let Some(key) = current.base_type.as_ref() else {
+                break;
             };
-
-            // Merge: base particles followed by extension particles
-            let mut merged = base_particles;
-            merged.extend(ext_particles);
-            Some(merged)
-        } else {
-            None
+            if !seen.insert(key) {
+                break; // a derivation cycle, reported by the caller
+            }
+            match self.types.get(key) {
+                Some(TypeDef::Complex(base)) => {
+                    chain.push(base);
+                    current = base;
+                }
+                // A missing base, or a simple type (not a valid
+                // complexContent base): the type's own content only.
+                _ => break,
+            }
         }
+        let root = chain.pop().unwrap_or(ct);
+        let mut content = if root.simple_content {
+            ContentType::Simple(root)
+        } else {
+            ContentType::Model(Cow::Borrowed(&root.content), root.mixed)
+        };
+        while let Some(derived) = chain.pop() {
+            content = extend_content_type(content, derived);
+        }
+        content
     }
 
     fn has_complex_derivation_cycle(&self, ct: &ComplexTypeDef) -> bool {
@@ -830,7 +938,7 @@ impl XsdValidator {
                     }
                     match *td {
                         TypeDef::Complex(ct) => {
-                            self.validate_complex_content(doc, node, &ct, errors);
+                            self.validate_complex_content(doc, node, &ct, supplied, errors);
                         }
                         TypeDef::Simple(st) => {
                             // Simple type: element must not have child elements
@@ -864,7 +972,7 @@ impl XsdValidator {
 
         match type_def {
             Some(TypeDef::Complex(ct)) => {
-                self.validate_complex_content(doc, node, ct, errors);
+                self.validate_complex_content(doc, node, ct, supplied, errors);
             }
             Some(TypeDef::Simple(st)) => {
                 // Simple types cannot have child elements
@@ -1056,6 +1164,7 @@ impl XsdValidator {
         doc: &Document,
         node: NodeId,
         ct: &ComplexTypeDef,
+        text: Option<&str>,
         errors: &mut Vec<ValidationError>,
     ) {
         if self.has_complex_derivation_cycle(ct) {
@@ -1263,10 +1372,50 @@ impl XsdValidator {
             .filter(|&c| matches!(doc.node_kind(c), Some(NodeKind::Element(_))))
             .collect();
 
-        // For non-mixed element-only content models, reject non-whitespace text
-        if !ct.mixed {
+        let (model, mixed) = match self.content_type(ct) {
+            ContentType::Model(model, mixed) => (model, mixed),
+            ContentType::Simple(owner) => {
+                self.validate_simple_content_of_complex(
+                    doc,
+                    node,
+                    owner,
+                    &child_elements,
+                    text,
+                    errors,
+                );
+                return;
+            }
+        };
+
+        // An empty content type admits no character children, white space
+        // included (cvc-complex-type.2.1); element-only content admits white
+        // space only (cvc-complex-type.2.3). A sequence or choice without
+        // particles keeps the element-only check: it is also what remains of
+        // a model whose group references were not resolved when read, whose
+        // content is not empty.
+        if !mixed && matches!(model.as_ref(), ContentModel::Empty) {
+            let has_character_child = doc
+                .children(node)
+                .into_iter()
+                .any(|child| doc.text_content(child).is_some_and(|text| !text.is_empty()));
+            if has_character_child {
+                let name = doc
+                    .element(node)
+                    .map(|elem| elem.name.local_name.to_string())
+                    .unwrap_or_default();
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has an empty content type and must not contain \
+                         character content, white space included",
+                        name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            }
+        } else if !mixed {
             let is_element_only = matches!(
-                ct.content,
+                model.as_ref(),
                 ContentModel::Sequence(..) | ContentModel::Choice(..) | ContentModel::All(..)
             );
             if is_element_only {
@@ -1287,34 +1436,7 @@ impl XsdValidator {
             }
         }
 
-        // For extension types, merge base type's particles with extension's particles
-        if let Some(merged_particles) = self.compute_effective_particles(ct) {
-            let consumed = self.validate_sequence(
-                doc,
-                &child_elements,
-                &merged_particles,
-                1,
-                &MaxOccurs::Bounded(1),
-                node,
-                errors,
-            );
-            // Report remaining children as unexpected
-            for &remaining in &child_elements[consumed..] {
-                if let Some(elem) = doc.element(remaining) {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "Unexpected element '{}' in sequence",
-                            elem.name.local_name
-                        ),
-                        line: Some(doc.node_line(remaining)),
-                        column: Some(doc.node_column(remaining)),
-                    });
-                }
-            }
-            return;
-        }
-
-        match &ct.content {
+        match model.as_ref() {
             ContentModel::Empty => {
                 if !child_elements.is_empty() {
                     errors.push(ValidationError {
@@ -1323,19 +1445,7 @@ impl XsdValidator {
                         column: Some(doc.node_column(node)),
                     });
                 }
-                // Check no text content (unless mixed)
-                if !ct.mixed {
-                    let text = doc.text_content_deep(node);
-                    let trimmed = trim_xml_whitespace(&text);
-                    if !trimmed.is_empty() {
-                        errors.push(ValidationError {
-                            message: "Element should have empty content but contains text"
-                                .to_string(),
-                            line: Some(doc.node_line(node)),
-                            column: Some(doc.node_column(node)),
-                        });
-                    }
-                }
+                // Character children are refused above.
             }
             ContentModel::Sequence(particles, min_occurs, max_occurs) => {
                 let consumed = self.validate_sequence(
@@ -1388,38 +1498,68 @@ impl XsdValidator {
             ContentModel::All(particles) => {
                 self.validate_all(doc, &child_elements, particles, node, errors);
             }
-            ContentModel::SimpleContent(type_ref) => {
-                match type_ref.as_ref() {
-                    TypeRef::BuiltIn(bt) => {
-                        let text = doc.text_content_deep(node);
-                        validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
-                    }
-                    TypeRef::Named(ns, local_name) => {
-                        let key = (ns.clone(), local_name.clone());
-                        if let Some(type_def) = self.types.get(&key) {
-                            match type_def {
-                                TypeDef::Simple(st) => {
-                                    self.validate_simple_content(doc, node, st, None, errors);
-                                }
-                                TypeDef::Complex(_) => {
-                                    // Complex base type for simpleContent — text validated against
-                                    // the complex type's own simpleContent base (recursively)
-                                }
-                            }
-                        }
-                    }
-                    TypeRef::Inline(inner_type_def) => {
-                        if let TypeDef::Simple(st) = inner_type_def.as_ref() {
-                            self.validate_simple_content(doc, node, st, None, errors);
-                        }
-                    }
-                    // Decided at build; never present in a built validator.
-                    TypeRef::Unqualified(_) => {}
+            // Decided by `content_type`: a model never holds simple content.
+            ContentModel::SimpleContent(_) => {}
+            ContentModel::Any => {
+                // The lax wildcard content of xs:anyType.
+                self.validate_children_against_global_decls(doc, node, errors);
+            }
+        }
+    }
+
+    /// Validate the content of an element whose complex type has simple
+    /// content, the content type of `owner`: no element children
+    /// (cvc-complex-type.2.2), and text that satisfies the base's simple
+    /// content type and, for a `simpleContent` restriction, the
+    /// restriction's facets.
+    fn validate_simple_content_of_complex(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        owner: &ComplexTypeDef,
+        child_elements: &[NodeId],
+        text: Option<&str>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Some(&child) = child_elements.first() {
+            let name = doc
+                .element(child)
+                .map(|e| e.name.local_name.to_string())
+                .unwrap_or_default();
+            errors.push(ValidationError {
+                message: format!(
+                    "Element '{}' is not allowed: the type has simple content (cvc-complex-type.2.2)",
+                    name
+                ),
+                line: Some(doc.node_line(child)),
+                column: Some(doc.node_column(child)),
+            });
+            return;
+        }
+        match self.simple_content_types(owner) {
+            Ok(types) => {
+                let content_text = match text {
+                    Some(text) => text.to_string(),
+                    None => doc.text_content_deep(node),
+                };
+                let mut memo = UnionMemo::new();
+                for type_ref in &types {
+                    self.check_type_ref_value(
+                        &content_text,
+                        type_ref,
+                        doc,
+                        node,
+                        errors,
+                        0,
+                        &mut memo,
+                    );
                 }
             }
-            ContentModel::Any => {
-                // Any content is valid
-            }
+            Err(message) => errors.push(ValidationError {
+                message,
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            }),
         }
     }
 
@@ -2013,6 +2153,21 @@ impl XsdValidator {
         }
     }
 
+    /// Whether a content model accepts no element children.
+    fn model_is_emptiable(&self, model: &ContentModel) -> bool {
+        match model {
+            ContentModel::Empty | ContentModel::Any => true,
+            ContentModel::Sequence(particles, min, _) => {
+                *min == 0 || particles.iter().all(Self::particle_is_nullable)
+            }
+            ContentModel::Choice(particles, min, _) => {
+                *min == 0 || particles.iter().any(Self::particle_is_nullable)
+            }
+            ContentModel::All(particles) => particles.iter().all(Self::particle_is_nullable),
+            ContentModel::SimpleContent(_) => false,
+        }
+    }
+
     /// Validate an `xs:all` content model.
     ///
     /// In an all group, each particle can appear at most once, and order doesn't matter.
@@ -2353,6 +2508,97 @@ impl XsdValidator {
         })
     }
 
+    /// The simple types an element's text must satisfy when the element has
+    /// a complex type with simple content: the base's simple content type
+    /// (following `simpleContent` derivations from complex types, and
+    /// `complexContent` extensions without particles of such a type) and,
+    /// for a `simpleContent` restriction, that base narrowed by the
+    /// restriction's facets. Empty for element-only, mixed or empty content.
+    fn simple_content_types(&self, ct: &ComplexTypeDef) -> Result<Vec<TypeRef>, String> {
+        match self.content_type(ct) {
+            ContentType::Simple(owner) => self.simple_content_types_inner(owner, 0),
+            ContentType::Model(..) => Ok(Vec::new()),
+        }
+    }
+
+    fn simple_content_types_inner(
+        &self,
+        ct: &ComplexTypeDef,
+        depth: usize,
+    ) -> Result<Vec<TypeRef>, String> {
+        if depth > MAX_SIMPLE_TYPE_DEPTH {
+            return Err(format!(
+                "simpleContent derivation deeper than {} levels",
+                MAX_SIMPLE_TYPE_DEPTH
+            ));
+        }
+        let ContentModel::SimpleContent(base) = &ct.content else {
+            return Ok(Vec::new());
+        };
+        let mut types = match base.as_ref() {
+            TypeRef::BuiltIn(BuiltInType::AnyType) => Vec::new(),
+            TypeRef::BuiltIn(_) => vec![base.as_ref().clone()],
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(_) => vec![base.as_ref().clone()],
+                TypeDef::Complex(inner) => self.simple_content_types_inner(inner, depth + 1)?,
+            },
+            TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
+                Some(TypeDef::Simple(_)) => vec![base.as_ref().clone()],
+                Some(TypeDef::Complex(base_ct)) => match self.content_type(base_ct) {
+                    ContentType::Simple(owner) => self.simple_content_types_inner(owner, depth + 1)?,
+                    // src-ct.2: the base of a simpleContent derivation has
+                    // simple content, or, for a restriction with its own
+                    // simpleType, mixed content that can be empty.
+                    ContentType::Model(model, mixed)
+                        if mixed
+                            && self.model_is_emptiable(&model)
+                            && ct
+                                .simple_content_restriction
+                                .as_ref()
+                                .is_some_and(|r| r.base_ref.is_some()) =>
+                    {
+                        Vec::new()
+                    }
+                    ContentType::Model(..) => {
+                        return Err(format!(
+                            "Base type '{}' of a simpleContent derivation does not have simple content (src-ct.2)",
+                            qname_display(ns, name)
+                        ))
+                    }
+                },
+                None => {
+                    return Err(format!("Base type '{}' not found", qname_display(ns, name)))
+                }
+            },
+            // Decided at build; never present in a built validator.
+            TypeRef::Unqualified(name) => {
+                return Err(format!("Base type '{}' not found", name.local))
+            }
+        };
+        if let Some(restriction) = &ct.simple_content_restriction {
+            // The restriction step: its facets on top of its anonymous
+            // simpleType when it has one, else on top of the base's content.
+            let step_base = match &restriction.base_ref {
+                Some(inline) => Some(inline.clone()),
+                None if types.is_empty() => None,
+                None => Some(types.remove(0)),
+            };
+            let mut step = restriction.as_ref().clone();
+            match step_base {
+                Some(TypeRef::BuiltIn(bt)) => {
+                    step.base = bt;
+                    step.base_ref = None;
+                }
+                Some(other) => step.base_ref = Some(other),
+                None => {}
+            }
+            if step.base_ref.is_some() || step.base != BuiltInType::AnySimpleType {
+                types.insert(0, TypeRef::Inline(Box::new(TypeDef::Simple(step))));
+            }
+        }
+        Ok(types)
+    }
+
     /// The simple type an element's value is read with, for comparing it
     /// with the element's fixed value; `None` when the element has mixed,
     /// element-only or empty content (compared character for character).
@@ -2368,6 +2614,9 @@ impl XsdValidator {
             TypeRef::BuiltIn(_) => Some(type_ref.clone()),
             _ => match self.resolve_type(type_ref)? {
                 TypeDef::Simple(_) => Some(type_ref.clone()),
+                TypeDef::Complex(ct) if !ct.mixed => {
+                    self.simple_content_types(ct).ok()?.into_iter().next()
+                }
                 TypeDef::Complex(_) => None,
             },
         }
@@ -2847,11 +3096,22 @@ pub(crate) mod test_counters {
         /// Union member selections made (not found in the memo) on this thread.
         pub(crate) static UNION_MEMBER_SELECTIONS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
+        /// Particles copied from the schema while building content types.
+        pub(crate) static CONTENT_PARTICLE_COPIES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
     }
 
     #[cfg(test)]
     pub(crate) fn note(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
         counter.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_many(
+        counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>,
+        n: usize,
+    ) {
+        counter.with(|count| count.set(count.get() + n));
     }
 
     #[cfg(test)]
@@ -2865,10 +3125,16 @@ pub(crate) mod test_counters {
     pub(crate) const UNION_LITERAL_READS: Counter = Counter;
     #[cfg(not(test))]
     pub(crate) const UNION_MEMBER_SELECTIONS: Counter = Counter;
+    #[cfg(not(test))]
+    pub(crate) const CONTENT_PARTICLE_COPIES: Counter = Counter;
 
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) fn note(_counter: &Counter) {}
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note_many(_counter: &Counter, _n: usize) {}
 }
 
 /// Cache of union member selection: (address of the union's root

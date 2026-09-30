@@ -428,8 +428,8 @@ impl XsdValidator {
         Ok(())
     }
 
-    /// Check the attribute types and local element declarations of a
-    /// complex type.
+    /// Check the attribute types, `simpleContent` base and local element
+    /// declarations of a complex type.
     fn check_complex_type_refs(
         &self,
         ct: &ComplexTypeDef,
@@ -437,6 +437,29 @@ impl XsdValidator {
     ) -> XmlResult<()> {
         for decl in &ct.attributes {
             self.check_attribute_type(decl, heights)?;
+        }
+        if let ContentModel::SimpleContent(base) = &ct.content {
+            if ct.simple_content {
+                match base.as_ref() {
+                    TypeRef::Named(ns, name)
+                        if !self.types.contains_key(&(ns.clone(), name.clone())) =>
+                    {
+                        return Err(XmlError::validation(format!(
+                            "Base type '{}' of a simpleContent derivation is not defined",
+                            qname_display(ns, name)
+                        )));
+                    }
+                    TypeRef::Inline(td) => {
+                        if let TypeDef::Simple(st) = td.as_ref() {
+                            self.check_simple_type_refs(st, &mut Vec::new(), heights, 0)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(restriction) = &ct.simple_content_restriction {
+            self.check_simple_type_refs(restriction, &mut Vec::new(), heights, 0)?;
         }
         self.check_content_model_refs(&ct.content, heights)
     }

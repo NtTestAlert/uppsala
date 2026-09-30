@@ -445,7 +445,7 @@ pub(super) fn parse_complex_type(
         .ok_or_else(|| XmlError::validation("Expected element node for complexType"))?;
 
     let name = elem.get_attribute("name").map(|s| s.to_string());
-    let mixed = elem.get_attribute("mixed") == Some("true");
+    let mut mixed = elem.get_attribute("mixed") == Some("true");
 
     // Parse block attribute on complexType (or use blockDefault)
     let (block_ext, block_rst) = if let Some(block) = elem.get_attribute("block") {
@@ -474,7 +474,10 @@ pub(super) fn parse_complex_type(
     let mut unqualified_base = None;
     let mut derived_by_extension: Option<bool> = None;
     let mut group_ref: Option<(Option<String>, String)> = None;
+    let mut group_ref_occurs = (1, MaxOccurs::Bounded(1));
     let mut attribute_group_refs: Vec<(Option<String>, String)> = Vec::new();
+    let mut simple_content = false;
+    let mut simple_content_restriction: Option<Box<SimpleTypeDef>> = None;
 
     for child in doc.children(node) {
         if let Some(NodeKind::Element(child_elem)) = doc.node_kind(child) {
@@ -557,8 +560,9 @@ pub(super) fn parse_complex_type(
                         let key = (ref_ns, local_name.to_string());
                         // Track the unresolved reference for potential re-resolution after redefine
                         group_ref = Some(key.clone());
+                        group_ref_occurs = particle_occurs(child_elem);
                         if let Some(mg) = model_groups.get(&key) {
-                            content = mg.content.clone();
+                            content = group_ref_content(&mg.content, &group_ref_occurs);
                         }
                     }
                 }
@@ -594,6 +598,16 @@ pub(super) fn parse_complex_type(
                     }
                 }
                 "simpleContent" | "complexContent" => {
+                    let is_simple_content = child_elem.name.local_name == "simpleContent";
+                    simple_content = is_simple_content;
+                    // `mixed` on complexContent overrides the complexType's.
+                    if !is_simple_content {
+                        match child_elem.get_attribute("mixed") {
+                            Some("true") | Some("1") => mixed = true,
+                            Some("false") | Some("0") => mixed = false,
+                            _ => {}
+                        }
+                    }
                     // Handle extension/restriction
                     for grandchild in doc.children(child) {
                         if let Some(NodeKind::Element(gc_elem)) = doc.node_kind(grandchild) {
@@ -635,7 +649,53 @@ pub(super) fn parse_complex_type(
                                             }
                                             _ => {}
                                         }
-                                        content = ContentModel::SimpleContent(Box::new(base_ref));
+                                        content = if is_simple_content {
+                                            ContentModel::SimpleContent(Box::new(base_ref))
+                                        } else if is_extension
+                                            && matches!(
+                                                base_ref,
+                                                TypeRef::BuiltIn(BuiltInType::AnyType)
+                                            )
+                                        {
+                                            // The content type of xs:anyType; a
+                                            // particle below replaces it.
+                                            ContentModel::Any
+                                        } else {
+                                            // The explicit content: empty unless a
+                                            // particle below sets it. Extension
+                                            // content is merged with the base's at
+                                            // validation.
+                                            ContentModel::Empty
+                                        };
+                                    }
+                                    if is_simple_content && !is_extension {
+                                        // The restriction's facets (and an optional
+                                        // anonymous <simpleType>) narrow the base's
+                                        // simple content.
+                                        let (facets, fixed_facets) = parse_facets(doc, grandchild);
+                                        let inline_base =
+                                            match first_xs_simple_type_child(doc, grandchild) {
+                                                Some(inline) => Some(TypeRef::Inline(Box::new(
+                                                    parse_simple_type(doc, inline)?,
+                                                ))),
+                                                None => None,
+                                            };
+                                        simple_content_restriction =
+                                            Some(Box::new(SimpleTypeDef {
+                                                name: None,
+                                                base: BuiltInType::AnySimpleType,
+                                                facets,
+                                                is_list: false,
+                                                item_type: None,
+                                                item_facets: Vec::new(),
+                                                _base_type_local: None,
+                                                _item_type_local: None,
+                                                base_ref: inline_base,
+                                                item_ref: None,
+                                                union_members: None,
+                                                fixed_facets,
+                                                union_enumeration: Default::default(),
+                                            }));
                                     }
                                     // Parse attributes and anyAttribute within extension/restriction
                                     let mut local_wildcard: Option<AttributeWildcard> = None;
@@ -723,6 +783,43 @@ pub(super) fn parse_complex_type(
                                                         max_occ,
                                                     );
                                                 }
+                                                "all" if !is_simple_content => {
+                                                    content = ContentModel::All(parse_particles(
+                                                        doc,
+                                                        gc_child,
+                                                        local_elem_ns,
+                                                        schema_target_ns,
+                                                        attribute_groups,
+                                                        model_groups,
+                                                        block_default_ext,
+                                                        block_default_rst,
+                                                    )?);
+                                                }
+                                                "group" if !is_simple_content => {
+                                                    // As a `group` child of the
+                                                    // complexType itself.
+                                                    if let Some(ref_name) =
+                                                        gc_child_elem.get_attribute("ref")
+                                                    {
+                                                        let local_name = strip_prefix(ref_name);
+                                                        let ref_ns = resolve_ref_namespace(
+                                                            doc,
+                                                            gc_child,
+                                                            ref_name,
+                                                            schema_target_ns,
+                                                        );
+                                                        let key = (ref_ns, local_name.to_string());
+                                                        group_ref = Some(key.clone());
+                                                        group_ref_occurs =
+                                                            particle_occurs(gc_child_elem);
+                                                        if let Some(mg) = model_groups.get(&key) {
+                                                            content = group_ref_content(
+                                                                &mg.content,
+                                                                &group_ref_occurs,
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                                 "attributeGroup" => {
                                                     if let Some(ref_name) =
                                                         gc_child_elem.get_attribute("ref")
@@ -789,9 +886,39 @@ pub(super) fn parse_complex_type(
         block_extension: block_ext,
         block_restriction: block_rst,
         group_ref,
+        group_ref_occurs,
         attribute_group_refs,
+        simple_content,
+        simple_content_restriction,
         unqualified_base,
     }))
+}
+
+/// The `minOccurs`/`maxOccurs` of a particle element (1 when absent).
+fn particle_occurs(elem: &crate::dom::Element<'_>) -> (u64, MaxOccurs) {
+    let min = elem
+        .get_attribute("minOccurs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let max = match elem.get_attribute("maxOccurs") {
+        Some("unbounded") => MaxOccurs::Unbounded,
+        Some(s) => MaxOccurs::Bounded(s.parse().unwrap_or(1)),
+        None => MaxOccurs::Bounded(1),
+    };
+    (min, max)
+}
+
+/// The content model of a type whose particle is a `group` reference: the
+/// group's compositor, occurring as the reference says.
+pub(super) fn group_ref_content(group: &ContentModel, occurs: &(u64, MaxOccurs)) -> ContentModel {
+    let (min, max) = *occurs;
+    match group {
+        ContentModel::Sequence(particles, _, _) => {
+            ContentModel::Sequence(particles.clone(), min, max)
+        }
+        ContentModel::Choice(particles, _, _) => ContentModel::Choice(particles.clone(), min, max),
+        other => other.clone(),
+    }
 }
 
 /// Parse an `xs:anyAttribute` element into an `AttributeWildcard`.
