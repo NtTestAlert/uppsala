@@ -647,6 +647,41 @@ fn is_valid(validator: &XsdValidator, instance: &str) -> bool {
     validator.validate(&doc).is_empty()
 }
 
+/// A `group` reference that is a complex type's content keeps its
+/// `minOccurs`/`maxOccurs` when `xs:redefine` replaces the group: the
+/// redefined group is re-resolved with the reference's occurrence.
+#[test]
+fn redefined_group_reference_keeps_its_occurrence() {
+    let base = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:m" xmlns:m="urn:m" elementFormDefault="qualified">
+<xs:group name="g"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence></xs:group>
+<xs:complexType name="T"><xs:group ref="m:g" minOccurs="0" maxOccurs="2"/></xs:complexType>
+<xs:element name="r" type="m:T"/>
+</xs:schema>"#;
+    let main = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:m" xmlns:m="urn:m" elementFormDefault="qualified">
+<xs:redefine schemaLocation="base.xsd">
+<xs:group name="g"><xs:sequence><xs:group ref="m:g"/><xs:element name="b" type="xs:int" minOccurs="0"/></xs:sequence></xs:group>
+</xs:redefine>
+</xs:schema>"#;
+    let validator = build_files(
+        "redefine-group-occurs",
+        &[("main.xsd", main), ("base.xsd", base)],
+    );
+    let r = |content: &str| format!(r#"<m:r xmlns:m="urn:m">{}</m:r>"#, content);
+    // The redefined group, twice.
+    assert!(is_valid(
+        &validator,
+        &r("<m:a>1</m:a><m:b>1</m:b><m:a>2</m:a>")
+    ));
+    assert!(is_valid(&validator, &r("<m:a>1</m:a><m:a>2</m:a>")));
+    // A third occurrence exceeds maxOccurs="2".
+    assert!(!is_valid(
+        &validator,
+        &r("<m:a>1</m:a><m:a>2</m:a><m:a>3</m:a>")
+    ));
+    // The redefinition applies: `c` is in neither group.
+    assert!(!is_valid(&validator, &r("<m:a>1</m:a><m:c>1</m:c>")));
+}
+
 /// A prefixed `substitutionGroup` is resolved with the namespace bindings in
 /// scope at the declaration, including those of `xs:schema`.
 #[test]

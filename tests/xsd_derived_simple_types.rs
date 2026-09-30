@@ -927,6 +927,42 @@ fn attribute_fixed_value_of_references_and_inherited_uses() {
     }
 }
 
+#[test]
+fn element_fixed_value_compares_values_after_whitespace_normalization() {
+    let xsd = schema(
+        r#"<xs:element name="root"><xs:complexType><xs:sequence>
+             <xs:element name="i" type="xs:int" fixed="5" minOccurs="0"/>
+             <xs:element name="s" type="xs:string" fixed="PL" minOccurs="0"/>
+             <xs:element name="t" type="xs:token" fixed="PL" minOccurs="0"/>
+             <xs:element name="c" minOccurs="0"><xs:complexType><xs:simpleContent>
+               <xs:extension base="xs:decimal"><xs:attribute name="a" type="xs:string"/></xs:extension>
+             </xs:simpleContent></xs:complexType></xs:element>
+           </xs:sequence></xs:complexType></xs:element>"#,
+    );
+    let validator = build(&xsd).expect("schema builds");
+    for (child, valid) in [
+        ("<i>5</i>", true),
+        ("<i> 05 </i>", true),
+        ("<i>6</i>", false),
+        ("<s>PL</s>", true),
+        ("<s> PL</s>", false),
+        ("<t> PL </t>", true),
+        ("<t>DE</t>", false),
+    ] {
+        let errs = errors(&validator, &format!("<root>{}</root>", child));
+        assert_eq!(errs.is_empty(), valid, "{}: {:?}", child, errs);
+    }
+
+    let simple_content = schema(
+        r#"<xs:element name="c" fixed="1.5"><xs:complexType><xs:simpleContent>
+             <xs:extension base="xs:decimal"><xs:attribute name="a" type="xs:string"/></xs:extension>
+           </xs:simpleContent></xs:complexType></xs:element>"#,
+    );
+    let validator = build(&simple_content).expect("schema builds");
+    assert!(errors(&validator, r#"<c a="x">1.50</c>"#).is_empty());
+    assert!(!errors(&validator, "<c>2</c>").is_empty());
+}
+
 /// An empty element with a fixed value takes that value, so it is valid
 /// even when the empty string is not a value of its type.
 #[test]
@@ -1116,6 +1152,50 @@ fn circular_union_through_another_union_is_refused() {
 }
 
 // ─── Build-time refusal of unresolved references ───────────
+
+#[test]
+fn missing_types_outside_simple_type_definitions_are_refused() {
+    for (label, body) in [
+        (
+            "attribute type",
+            r#"<xs:element name="e"><xs:complexType><xs:attribute name="a" type="Missing"/></xs:complexType></xs:element>"#,
+        ),
+        (
+            "global attribute type",
+            r#"<xs:attribute name="a" type="Missing"/>"#,
+        ),
+        (
+            "attribute of an attribute group",
+            r#"<xs:attributeGroup name="G"><xs:attribute name="a" type="Missing"/></xs:attributeGroup>"#,
+        ),
+        (
+            "simpleContent base",
+            r#"<xs:complexType name="C"><xs:simpleContent><xs:extension base="Missing"><xs:attribute name="a"/></xs:extension></xs:simpleContent></xs:complexType>"#,
+        ),
+        (
+            "anonymous element union",
+            r#"<xs:element name="e"><xs:simpleType><xs:union memberTypes="Missing xs:int"/></xs:simpleType></xs:element>"#,
+        ),
+        (
+            "anonymous element restriction",
+            r#"<xs:element name="e"><xs:simpleType><xs:restriction base="Missing"/></xs:simpleType></xs:element>"#,
+        ),
+        (
+            "anonymous attribute type",
+            r#"<xs:element name="e"><xs:complexType><xs:attribute name="a"><xs:simpleType><xs:list itemType="Missing"/></xs:simpleType></xs:attribute></xs:complexType></xs:element>"#,
+        ),
+        (
+            "local element in a content model",
+            r#"<xs:complexType name="C"><xs:sequence><xs:element name="x"><xs:simpleType><xs:restriction base="Missing"/></xs:simpleType></xs:element></xs:sequence></xs:complexType>"#,
+        ),
+        (
+            "attribute with a complex type",
+            r#"<xs:complexType name="C"/><xs:attribute name="a" type="C"/>"#,
+        ),
+    ] {
+        assert!(build(&schema(body)).is_err(), "{} is not refused", label);
+    }
+}
 
 #[test]
 fn anonymous_union_restriction_with_other_facets_is_refused() {
@@ -1382,6 +1462,46 @@ fn duration_ranges_use_the_partial_order() {
             ("P1Y", false),
         ],
     );
+}
+
+// ─── Complex types with simple content ─────────────────────
+
+#[test]
+fn simple_content_restriction_facets_apply() {
+    let xsd = schema(
+        r#"<xs:complexType name="C"><xs:simpleContent><xs:extension base="xs:string"><xs:attribute name="a" type="xs:string"/></xs:extension></xs:simpleContent></xs:complexType>
+           <xs:complexType name="D"><xs:simpleContent><xs:restriction base="C"><xs:maxLength value="3"/></xs:restriction></xs:simpleContent></xs:complexType>
+           <xs:complexType name="E"><xs:simpleContent><xs:restriction base="D"><xs:pattern value="[a-z]*"/></xs:restriction></xs:simpleContent></xs:complexType>
+           <xs:element name="root"><xs:complexType><xs:sequence>
+             <xs:element name="d" type="D" minOccurs="0"/>
+             <xs:element name="e" type="E" minOccurs="0"/>
+           </xs:sequence></xs:complexType></xs:element>"#,
+    );
+    let validator = build(&xsd).expect("schema builds");
+    for (child, valid) in [
+        (r#"<d a="x">abc</d>"#, true),
+        ("<d>abcdef</d>", false),
+        ("<e>ab</e>", true),
+        ("<e>AB</e>", false),
+        ("<e>abcd</e>", false),
+    ] {
+        let errs = errors(&validator, &format!("<root>{}</root>", child));
+        assert_eq!(errs.is_empty(), valid, "{}: {:?}", child, errs);
+    }
+}
+
+/// A `simpleContent` extension of a complex type with simple content keeps
+/// the base's simple content type.
+#[test]
+fn simple_content_extension_of_a_complex_base_checks_its_text() {
+    let xsd = schema(
+        r#"<xs:complexType name="C"><xs:simpleContent><xs:extension base="xs:int"><xs:attribute name="a" type="xs:string"/></xs:extension></xs:simpleContent></xs:complexType>
+           <xs:complexType name="D"><xs:simpleContent><xs:extension base="C"><xs:attribute name="b" type="xs:string"/></xs:extension></xs:simpleContent></xs:complexType>
+           <xs:element name="d" type="D"/>"#,
+    );
+    let validator = build(&xsd).expect("schema builds");
+    assert!(errors(&validator, r#"<d a="x" b="y">5</d>"#).is_empty());
+    assert!(!errors(&validator, "<d>x</d>").is_empty());
 }
 
 // ─── Digits ────────────────────────────────────────────────

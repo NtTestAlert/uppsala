@@ -10,6 +10,7 @@
 //! - xsi:type resolution and type substitution blocking checks
 //! - Substitution group matching for element declarations
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Document, NodeId, NodeKind};
@@ -31,6 +32,77 @@ fn attr_decl_matches(attr: &crate::dom::Attribute<'_>, decl: &AttributeDecl) -> 
         && attr.name.namespace_uri.as_deref() == decl.namespace.as_deref()
 }
 
+/// Whether an attribute is one of the four XSI attributes that any element
+/// may carry: `type`, `nil`, `schemaLocation` and `noNamespaceSchemaLocation`
+/// in the XSI namespace (XSD 1.0 Part 1 §3.2.7, cvc-complex-type.3,
+/// cvc-type.3.1.1). It is matched by namespace URI, never by prefix: a
+/// prefix `xsi` bound to another namespace names an ordinary attribute, and
+/// any other name in the XSI namespace is assessed like any other attribute.
+fn is_exempt_xsi_attribute(attr: &crate::dom::Attribute<'_>) -> bool {
+    attr.name.namespace_uri.as_deref() == Some(XSI_NAMESPACE)
+        && matches!(
+            &*attr.name.local_name,
+            "type" | "nil" | "schemaLocation" | "noNamespaceSchemaLocation"
+        )
+}
+
+/// Whether an attribute has the name of a namespace declaration: a name in
+/// the reserved xmlns namespace (Namespaces in XML §3; the infoset's
+/// [namespace attributes]) or, without a namespace URI, the unprefixed
+/// `xmlns` or a name with the prefix `xmlns`.
+///
+/// No such attribute is a declaration. The parser keeps declarations apart
+/// from the attributes, so only a tree built through the DOM API holds one,
+/// and the serializer writes it out under another name, as an ordinary
+/// attribute. It is therefore never exempt from assessment: it is refused by
+/// name, so that a built tree is never accepted where its serialized form
+/// would be refused. Any other name is an ordinary attribute, whatever its
+/// local name: `q:xmlns` with `q` bound to `urn:q` is `{urn:q}xmlns`.
+fn has_namespace_declaration_name(attr: &crate::dom::Attribute<'_>) -> bool {
+    match attr.name.namespace_uri.as_deref() {
+        Some(uri) => uri == crate::namespace::XMLNS_NAMESPACE,
+        None => match attr.name.prefix.as_deref() {
+            None => attr.name.local_name == "xmlns",
+            Some(prefix) => prefix == "xmlns",
+        },
+    }
+}
+
+/// The refusal of an attribute with the name of a namespace declaration
+/// (see [`has_namespace_declaration_name`]) on the element `element`.
+fn namespace_declaration_name_error(
+    attr: &crate::dom::Attribute<'_>,
+    element: &str,
+    doc: &Document,
+    node: NodeId,
+) -> ValidationError {
+    let name = match (
+        attr.name.namespace_uri.as_deref(),
+        attr.name.prefix.as_deref(),
+    ) {
+        (Some(_), _) => attribute_display(attr),
+        (None, Some(prefix)) => format!("{}:{}", prefix, attr.name.local_name),
+        (None, None) => attr.name.local_name.to_string(),
+    };
+    ValidationError {
+        message: format!(
+            "Attribute '{}' on element '{}' has the name of a namespace declaration, \
+             which an attribute cannot have",
+            name, element
+        ),
+        line: Some(doc.node_line(node)),
+        column: Some(doc.node_column(node)),
+    }
+}
+
+/// An attribute's expanded name for messages: `{uri}local`, or `local`.
+fn attribute_display(attr: &crate::dom::Attribute<'_>) -> String {
+    match attr.name.namespace_uri.as_deref() {
+        Some(uri) => format!("{{{}}}{}", uri, attr.name.local_name),
+        None => attr.name.local_name.to_string(),
+    }
+}
+
 /// Result of resolving an `xsi:type` attribute on an element.
 ///
 /// When an instance element carries `xsi:type`, the validator resolves it to one of:
@@ -40,10 +112,131 @@ fn attr_decl_matches(attr: &crate::dom::Attribute<'_>, decl: &AttributeDecl) -> 
 enum XsiTypeResult {
     /// A built-in XSD type like xs:string, xs:int, etc.
     BuiltIn(BuiltInType),
-    /// A named type definition from the schema.
-    Named(Box<TypeDef>),
+    /// A named type definition from the schema, with the key it was found
+    /// under.
+    Named((Option<String>, String), Box<TypeDef>),
     /// The xsi:type QName could not be resolved.
     NotFound(String),
+}
+
+/// The content type of a complex type, see [`XsdValidator::content_type`].
+enum ContentType<'a> {
+    /// Empty, element-only or mixed content: the model and whether it is
+    /// mixed.
+    Model(Cow<'a, ContentModel>, bool),
+    /// Simple content, read with `simple_content_types` of this definition.
+    Simple(&'a ComplexTypeDef),
+}
+
+/// Whether a model has no particle: the explicit content of a derivation
+/// is then empty (XSD 1.0 Part 1 §3.4.2, clause 2.1 of the complexContent
+/// mapping).
+fn model_is_empty(model: &ContentModel) -> bool {
+    match model {
+        ContentModel::Empty => true,
+        ContentModel::Sequence(particles, _, max) => {
+            particles.is_empty() || matches!(max, MaxOccurs::Bounded(0))
+        }
+        ContentModel::Choice(particles, min, max) => {
+            (particles.is_empty() && *min == 0) || matches!(max, MaxOccurs::Bounded(0))
+        }
+        ContentModel::All(particles) => particles.is_empty(),
+        ContentModel::SimpleContent(_) | ContentModel::Any => false,
+    }
+}
+
+/// The content type of `derived`, an extension, given its base's.
+///
+/// The result is `sequence(base, own)` (XSD 1.0 Part 1 §3.4.2). A base that
+/// is a sequence occurring once contributes its particles rather than one
+/// nested particle, and so does an own sequence occurring once: a (1,1)
+/// sequence inside a sequence matches exactly what its particles do in its
+/// place. Any other base (a choice, or a sequence with other occurrences) is
+/// kept whole as one particle; the result is then a (1,1) sequence, so the
+/// next extension splices it. The model therefore nests at most one level
+/// more than its root, whatever the derivation depth, and validating a child
+/// never runs one frame deeper per step. The accumulated model is moved from
+/// step to step, not copied, so building it is linear in the depth.
+fn extend_content_type<'a>(base: ContentType<'a>, derived: &'a ComplexTypeDef) -> ContentType<'a> {
+    // An extension without particles has the base's content type.
+    if model_is_empty(&derived.content) {
+        return base;
+    }
+    let own = ContentType::Model(Cow::Borrowed(&derived.content), derived.mixed);
+    let ContentType::Model(base_model, _) = base else {
+        // Particles added to simple content: not a valid schema
+        // (cos-ct-extends.1.4); the extension's own particles apply.
+        return own;
+    };
+    if model_is_empty(&base_model) {
+        return own;
+    }
+    let is_group = |model: &ContentModel| {
+        matches!(model, ContentModel::Sequence(..) | ContentModel::Choice(..))
+    };
+    if !is_group(&base_model) || !is_group(&derived.content) {
+        // An `all` group on either side (not valid in an extension of
+        // non-empty content in XSD 1.0), or the lax wildcard content of
+        // xs:anyType: the extension's own particles apply.
+        return own;
+    }
+    let base_model = match base_model {
+        Cow::Owned(model) => model,
+        Cow::Borrowed(model) => clone_model(model),
+    };
+    let mut particles = match base_model {
+        ContentModel::Sequence(particles, 1, MaxOccurs::Bounded(1)) => particles,
+        ContentModel::Sequence(particles, min, max) => vec![Particle {
+            kind: ParticleKind::Sequence(particles),
+            min_occurs: min,
+            max_occurs: max,
+        }],
+        ContentModel::Choice(particles, min, max) => vec![Particle {
+            kind: ParticleKind::Choice(particles),
+            min_occurs: min,
+            max_occurs: max,
+        }],
+        _ => return own,
+    };
+    match &derived.content {
+        ContentModel::Sequence(own_particles, 1, MaxOccurs::Bounded(1)) => {
+            particles.extend(clone_particles(own_particles));
+        }
+        ContentModel::Sequence(own_particles, min, max) => particles.push(Particle {
+            kind: ParticleKind::Sequence(clone_particles(own_particles)),
+            min_occurs: *min,
+            max_occurs: *max,
+        }),
+        ContentModel::Choice(own_particles, min, max) => particles.push(Particle {
+            kind: ParticleKind::Choice(clone_particles(own_particles)),
+            min_occurs: *min,
+            max_occurs: *max,
+        }),
+        _ => return own,
+    }
+    ContentType::Model(
+        Cow::Owned(ContentModel::Sequence(particles, 1, MaxOccurs::Bounded(1))),
+        derived.mixed,
+    )
+}
+
+/// A copy of a schema's content model, for a content type built from it.
+fn clone_model(model: &ContentModel) -> ContentModel {
+    match model {
+        ContentModel::Sequence(particles, min, max) => {
+            ContentModel::Sequence(clone_particles(particles), *min, *max)
+        }
+        ContentModel::Choice(particles, min, max) => {
+            ContentModel::Choice(clone_particles(particles), *min, *max)
+        }
+        other => other.clone(),
+    }
+}
+
+/// A copy of a schema's particles, counted for the complexity tests.
+fn clone_particles(particles: &[Particle]) -> Vec<Particle> {
+    test_counters::note_many(&test_counters::CONTENT_PARTICLE_COPIES, particles.len());
+    particles.to_vec()
 }
 
 impl XsdValidator {
@@ -178,15 +371,9 @@ impl XsdValidator {
     fn resolve_xsi_type(&self, doc: &Document, node: NodeId) -> Option<XsiTypeResult> {
         let elem = doc.element(node)?;
 
-        // Look for xsi:type attribute
-        let xsi_type_value = elem.get_attribute_ns(XSI_NAMESPACE, "type").or_else(|| {
-            // Also try by prefix match for elements where namespace resolution
-            // hasn't been applied to attributes
-            elem.attributes
-                .iter()
-                .find(|a| a.name.local_name == "type" && a.name.prefix.as_deref() == Some("xsi"))
-                .map(|a| &*a.value)
-        })?;
+        // The attribute is found by namespace URI only: a prefix `xsi` bound
+        // to another namespace names an ordinary attribute.
+        let xsi_type_value = elem.get_attribute_ns(XSI_NAMESPACE, "type")?;
 
         // Parse the QName value (may be prefixed like "xs:int")
         let (prefix, local_name) = if let Some(colon_pos) = xsi_type_value.find(':') {
@@ -200,9 +387,13 @@ impl XsdValidator {
 
         // Resolve prefix to namespace URI
         let type_ns = if let Some(pfx) = prefix {
-            // Look up prefix in namespace declarations
+            // Look up prefix in namespace declarations. A prefix without a
+            // binding names no type (cvc-elt.4.1).
             let resolver = build_resolver_for_node(doc, node);
-            resolver.resolve(pfx).map(|s| s.to_string())
+            match resolver.resolve(pfx) {
+                Some(uri) => Some(uri.to_string()),
+                None => return Some(XsiTypeResult::NotFound(xsi_type_value.to_string())),
+            }
         } else {
             // No prefix — use default namespace if present
             // Per XSD spec, an unprefixed QName in xsi:type uses the default namespace
@@ -217,15 +408,12 @@ impl XsdValidator {
             }
         }
 
-        // Try looking up in schema types
-        let key = (type_ns.clone(), local_name.to_string());
+        // Look the expanded name up in the schema types. A type of another
+        // namespace with the same local name is a different type, so there is
+        // no fallback to the no-namespace key.
+        let key = (type_ns, local_name.to_string());
         if let Some(td) = self.types.get(&key) {
-            return Some(XsiTypeResult::Named(Box::new(td.clone())));
-        }
-        // Also try without namespace
-        let key_no_ns = (None, local_name.to_string());
-        if let Some(td) = self.types.get(&key_no_ns) {
-            return Some(XsiTypeResult::Named(Box::new(td.clone())));
+            return Some(XsiTypeResult::Named(key, Box::new(td.clone())));
         }
 
         Some(XsiTypeResult::NotFound(xsi_type_value.to_string()))
@@ -314,102 +502,75 @@ impl XsdValidator {
         None
     }
 
-    /// Check if `xsi_type` is the declared type or derived from it.
-    ///
-    /// The declared element type is given as a `TypeRef`. Returns `true` if the
-    /// xsi:type is valid for substitution (ignoring block constraints).
-    fn is_type_derived_from_decl(&self, xsi_type: &TypeDef, decl_type_ref: &TypeRef) -> bool {
-        // Get the declared type's key (namespace, local_name)
+    /// Check if the `xsi:type` type found under `xsi_key` is the declared type
+    /// or derived from it (cvc-elt.4.3), ignoring block constraints.
+    fn is_type_derived_from_decl(
+        &self,
+        xsi_key: &(Option<String>, String),
+        decl_type_ref: &TypeRef,
+    ) -> bool {
         let decl_key = match decl_type_ref {
             TypeRef::Named(ns, name) => (ns.clone(), name.clone()),
-            TypeRef::BuiltIn(bt) => {
-                // xsi:type is always a named type here, AnyType allows everything
-                if *bt == BuiltInType::AnyType {
-                    return true;
-                }
-                // For other built-in types, the xsi:type must match exactly
-                // (named schema types can't derive from built-in complex types normally)
-                return false;
-            }
-            TypeRef::Inline(_) => {
-                // Inline (anonymous) type — xsi:type substitution is not meaningful
-                // since you can't name the declared type. Allow it.
-                return true;
-            }
+            // Every type derives from xs:anyType; a named schema type is not
+            // compared with the other built-in types here.
+            TypeRef::BuiltIn(bt) => return *bt == BuiltInType::AnyType,
+            // An anonymous type has no name, so no QName names it, and a
+            // named type can only derive from a named base: no `xsi:type`
+            // is validly derived from it.
+            TypeRef::Inline(_) => return false,
             // Decided at build; never present in a built validator.
             TypeRef::Unqualified(_) => return false,
         };
-
-        // Check if xsi:type IS the declared type
-        let xsi_key = match xsi_type {
-            TypeDef::Complex(ct) => {
-                if let Some(ref name) = ct.name {
-                    // Try to match: check if namespace+name matches decl_key
-                    // We need the type's namespace. Walk through the types map to find it.
-                    if let Some(found_key) = self.find_type_key_by_typedef(xsi_type) {
-                        if found_key == decl_key {
-                            return true;
-                        }
-                        found_key
-                    } else {
-                        // Anonymous type — can't be the same as a named declared type
-                        (None, name.clone())
-                    }
-                } else {
-                    return false; // anonymous type, can't match
-                }
-            }
-            TypeDef::Simple(st) => {
-                if let Some(ref name) = st.name {
-                    if let Some(found_key) = self.find_type_key_by_typedef(xsi_type) {
-                        if found_key == decl_key {
-                            return true;
-                        }
-                        found_key
-                    } else {
-                        (None, name.clone())
-                    }
-                } else {
-                    return false;
-                }
-            }
-        };
-
-        // Walk the derivation chain of xsi:type to see if it eventually derives from decl_key
-        self.is_derived_from(&xsi_key, &decl_key)
+        *xsi_key == decl_key || self.is_derived_from(xsi_key, &decl_key)
     }
 
-    /// Find the key in `self.types` that corresponds to a given `TypeDef`.
-    ///
-    /// Searches the types map by matching the type's name field against the map's
-    /// local name component. Returns the full `(Option<namespace>, name)` key.
-    fn find_type_key_by_typedef(&self, td: &TypeDef) -> Option<(Option<String>, String)> {
-        let name = match td {
-            TypeDef::Complex(ct) => ct.name.as_ref()?,
-            TypeDef::Simple(st) => st.name.as_ref()?,
+    /// Check that a built-in `xsi:type` type is the declared type or derived
+    /// from it (cvc-elt.4.3), and that no derivation step is blocked by the
+    /// element declaration. A built-in type derives only from built-in types,
+    /// so a declared schema type, named or anonymous, admits none.
+    fn builtin_xsi_type_error(&self, xsi_type: &BuiltInType, decl: &ElementDecl) -> Option<String> {
+        let not_derived = || {
+            Some(format!(
+                "xsi:type '{}' is not derived from the declared element type",
+                self.builtin_type_name(xsi_type)
+            ))
         };
-        // Look for it in the types map
-        for key in self.types.keys() {
-            if &key.1 == name {
-                return Some(key.clone());
+        let TypeRef::BuiltIn(declared) = &decl.type_ref else {
+            return not_derived();
+        };
+        let mut current = Some(xsi_type.clone());
+        let mut steps = 0;
+        while let Some(t) = current {
+            if t == *declared {
+                // Every built-in derivation step is a restriction, or a list
+                // of xs:anySimpleType, which a block on restriction also
+                // covers (cos-st-derived-ok 2.1).
+                if steps > 0 && decl.block_restriction {
+                    return Some(
+                        "Type substitution blocked: derivation chain includes restriction, which is blocked by element declaration".to_string(),
+                    );
+                }
+                return None;
             }
+            current = builtin_base_type(&t);
+            steps += 1;
         }
-        None
+        not_derived()
     }
 
     /// Check if a type identified by `type_key` is derived (directly or transitively)
     /// from a type identified by `ancestor_key`.
     ///
-    /// Walks up the derivation chain (via `base_type` links on complex types) up to
-    /// 50 levels deep to prevent infinite loops.
+    /// Walks up the derivation chain (via `base_type` links on complex types).
+    /// A built schema has no chain longer than `MAX_COMPLEX_DERIVATION_DEPTH`
+    /// steps, so the walk stops one step after that, also on a cycle.
     fn is_derived_from(
         &self,
         type_key: &(Option<String>, String),
         ancestor_key: &(Option<String>, String),
     ) -> bool {
         let mut current_key = type_key.clone();
-        // Walk up to 50 levels to avoid infinite loops
-        for _ in 0..50 {
+        for _ in 0..=MAX_COMPLEX_DERIVATION_DEPTH {
             if let Some(td) = self.types.get(&current_key) {
                 match td {
                     TypeDef::Complex(ct) => {
@@ -442,40 +603,40 @@ impl XsdValidator {
     /// effective wildcard and the derived type's own wildcard.
     /// For restriction types or types not derived, this is just the type's own wildcard.
     fn compute_effective_wildcard(&self, ct: &ComplexTypeDef) -> Option<AttributeWildcard> {
-        self.compute_effective_wildcard_inner(ct, &mut HashSet::new())
-    }
-
-    fn compute_effective_wildcard_inner(
-        &self,
-        ct: &ComplexTypeDef,
-        seen: &mut HashSet<(Option<String>, String)>,
-    ) -> Option<AttributeWildcard> {
-        if ct.derived_by_extension == Some(true) {
-            // Get the base type's effective wildcard (recursively)
-            let base_wildcard = if let Some(ref base_key) = ct.base_type {
+        // The extension chain, walked iteratively: the walk runs for every
+        // element, and its length is bounded only at build.
+        let mut chain = vec![ct];
+        let mut seen = HashSet::new();
+        // The effective wildcard of the last type in `chain`.
+        let mut wildcard = loop {
+            let current = chain[chain.len() - 1];
+            if current.derived_by_extension != Some(true) {
+                // Restriction or not derived: use the type's own wildcard
+                break current.attribute_wildcard.clone();
+            }
+            if let Some(base_key) = &current.base_type {
                 if !seen.insert(base_key.clone()) {
-                    return None;
+                    // The extension that closes a cycle has none.
+                    break None;
                 }
                 if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
-                    self.compute_effective_wildcard_inner(base_ct, seen)
-                } else {
-                    None
+                    chain.push(base_ct);
+                    continue;
                 }
-            } else {
-                None
-            };
-
-            // Union of base wildcard and derived wildcard
-            match (&base_wildcard, &ct.attribute_wildcard) {
-                (Some(base_wc), Some(derived_wc)) => Some(base_wc.union(derived_wc)),
-                (Some(base_wc), None) => Some(base_wc.clone()),
-                (None, Some(derived_wc)) => Some(derived_wc.clone()),
-                (None, None) => None,
             }
-        } else {
-            // Restriction or not derived: use the type's own wildcard
-            ct.attribute_wildcard.clone()
+            // An extension of a missing or simple base: its own wildcard.
+            break current.attribute_wildcard.clone();
+        };
+        chain.pop();
+        // Each extension: union of the base's wildcard and its own.
+        while let Some(derived) = chain.pop() {
+            wildcard = match (wildcard, &derived.attribute_wildcard) {
+                (Some(base_wc), Some(derived_wc)) => Some(base_wc.union(derived_wc)),
+                (Some(base_wc), None) => Some(base_wc),
+                (None, derived_wc) => derived_wc.clone(),
+            };
         }
+        wildcard
     }
 
     /// Compute effective attributes for a complex type, including inherited attributes
@@ -486,28 +647,37 @@ impl XsdValidator {
     ///   the restriction are inherited; prohibited attributes are removed
     /// - **Not derived**: just the type's own attributes
     fn compute_effective_attributes(&self, ct: &ComplexTypeDef) -> Vec<AttributeDecl> {
-        self.compute_effective_attributes_inner(ct, &mut HashSet::new())
+        // The derivation chain, walked iteratively: the walk runs for every
+        // element, and its length is bounded only at build.
+        let mut chain = vec![ct];
+        let mut seen = HashSet::new();
+        // The effective attributes of the last type in `chain`.
+        let mut attrs = loop {
+            let current = chain[chain.len() - 1];
+            if let Some(base_key) = &current.base_type {
+                if !seen.insert(base_key.clone()) {
+                    // The type that closes a cycle has none.
+                    break Vec::new();
+                }
+                if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
+                    chain.push(base_ct);
+                    continue;
+                }
+            }
+            break current.attributes.clone();
+        };
+        chain.pop();
+        while let Some(derived) = chain.pop() {
+            attrs = Self::derive_attributes(attrs, derived);
+        }
+        attrs
     }
 
-    fn compute_effective_attributes_inner(
-        &self,
+    /// The effective attributes of `ct` given its base's effective attributes.
+    fn derive_attributes(
+        base_attrs: Vec<AttributeDecl>,
         ct: &ComplexTypeDef,
-        seen: &mut HashSet<(Option<String>, String)>,
     ) -> Vec<AttributeDecl> {
-        // Get base type's effective attributes
-        let base_attrs = if let Some(ref base_key) = ct.base_type {
-            if !seen.insert(base_key.clone()) {
-                return Vec::new();
-            }
-            if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
-                self.compute_effective_attributes_inner(base_ct, seen)
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
         if base_attrs.is_empty() {
             return ct.attributes.clone();
         }
@@ -567,60 +737,47 @@ impl XsdValidator {
         }
     }
 
-    /// Compute the effective content model for a complex type, merging base type
-    /// particles for extension types.
+    /// The content type of a complex type (XSD 1.0 Part 1 §3.4.2).
     ///
-    /// For a type derived by extension from another complex type with a sequence
-    /// content model, the effective content is the base type's particles followed
-    /// by the extension's particles. This recursively walks the extension chain.
-    ///
-    /// Returns `None` if the type is not an extension or cannot be merged.
-    fn compute_effective_particles(&self, ct: &ComplexTypeDef) -> Option<Vec<Particle>> {
-        self.compute_effective_particles_inner(ct, &mut HashSet::new())
-    }
-
-    fn compute_effective_particles_inner(
-        &self,
-        ct: &ComplexTypeDef,
-        seen: &mut HashSet<(Option<String>, String)>,
-    ) -> Option<Vec<Particle>> {
-        if ct.derived_by_extension != Some(true) {
-            return None;
-        }
-        let (base_ns, base_name) = ct.base_type.as_ref()?;
-        let key = (base_ns.clone(), base_name.clone());
-        if !seen.insert(key.clone()) {
-            return None;
-        }
-        let base_type = self.types.get(&key)?;
-        if let TypeDef::Complex(base_ct) = base_type {
-            // Recursively get the base type's effective particles
-            let base_particles =
-                if let Some(recursive) = self.compute_effective_particles_inner(base_ct, seen) {
-                    recursive
-                } else {
-                    // No further merging needed, just get the base type's own particles
-                    match &base_ct.content {
-                        ContentModel::Sequence(particles, _, _) => particles.clone(),
-                        ContentModel::Empty => Vec::new(),
-                        _ => return None, // Can't merge non-sequence base content
-                    }
-                };
-
-            // Get the extension's own particles
-            let ext_particles = match &ct.content {
-                ContentModel::Sequence(particles, _, _) => particles.clone(),
-                ContentModel::Empty => Vec::new(),
-                _ => return None,
+    /// A `complexContent` restriction has its own explicit content (empty
+    /// when it declares no particle). An extension whose explicit content
+    /// is empty has the base's content type; otherwise, when the base's
+    /// content type is not empty, a sequence of the base's particle
+    /// followed by the extension's. A type derived through `simpleContent`
+    /// has simple content, read with [`Self::simple_content_types`].
+    fn content_type<'a>(&'a self, ct: &'a ComplexTypeDef) -> ContentType<'a> {
+        // The extension chain down to the first type that is not an
+        // extension of a known complex type.
+        let mut chain = vec![ct];
+        let mut seen = HashSet::new();
+        let mut current = ct;
+        while current.derived_by_extension == Some(true) && !current.simple_content {
+            let Some(key) = current.base_type.as_ref() else {
+                break;
             };
-
-            // Merge: base particles followed by extension particles
-            let mut merged = base_particles;
-            merged.extend(ext_particles);
-            Some(merged)
-        } else {
-            None
+            if !seen.insert(key) {
+                break; // a derivation cycle, reported by the caller
+            }
+            match self.types.get(key) {
+                Some(TypeDef::Complex(base)) => {
+                    chain.push(base);
+                    current = base;
+                }
+                // A missing base, or a simple type (not a valid
+                // complexContent base): the type's own content only.
+                _ => break,
+            }
         }
+        let root = chain.pop().unwrap_or(ct);
+        let mut content = if root.simple_content {
+            ContentType::Simple(root)
+        } else {
+            ContentType::Model(Cow::Borrowed(&root.content), root.mixed)
+        };
+        while let Some(derived) = chain.pop() {
+            content = extend_content_type(content, derived);
+        }
+        content
     }
 
     fn has_complex_derivation_cycle(&self, ct: &ComplexTypeDef) -> bool {
@@ -691,45 +848,75 @@ impl XsdValidator {
             return;
         }
 
-        // Check for xsi:nil="true"
-        if let Some(elem) = doc.element(node) {
-            let xsi_nil_value = elem.get_attribute_ns(XSI_NAMESPACE, "nil").or_else(|| {
-                elem.attributes
-                    .iter()
-                    .find(|a| a.name.local_name == "nil" && a.name.prefix.as_deref() == Some("xsi"))
-                    .map(|a| &*a.value)
-            });
-            if xsi_nil_value == Some("true") || xsi_nil_value == Some("1") {
-                if !decl.nillable {
+        // xsi:nil (cvc-elt.3), found by namespace URI. A declaration that is
+        // not nillable admits no xsi:nil at all, whatever its value (3.1);
+        // the value is a boolean. A nilled element has no content (3.2.1)
+        // and its declaration no fixed value (3.2.2); its attributes are
+        // still assessed, its content is not.
+        let mut nilled = false;
+        let nil_value = doc
+            .element(node)
+            .and_then(|elem| elem.get_attribute_ns(XSI_NAMESPACE, "nil"));
+        if let Some(nil_value) = nil_value {
+            if !decl.nillable {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Attribute xsi:nil is not allowed on element '{}', which is not nillable",
+                        decl.name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+                return;
+            }
+            match trim_xml_whitespace(nil_value) {
+                "true" | "1" => nilled = true,
+                "false" | "0" => {}
+                _ => {
                     errors.push(ValidationError {
-                        message: "xsi:nil='true' on non-nillable element".to_string(),
+                        message: format!("xsi:nil value '{}' is not a valid boolean", nil_value),
                         line: Some(doc.node_line(node)),
                         column: Some(doc.node_column(node)),
                     });
                     return;
                 }
-                // Nillable element with xsi:nil="true": must be empty
-                // (no child elements and no non-whitespace text content)
-                let has_children = self.element_has_child_elements(doc, node);
-                let text = doc.text_content_deep(node);
-                let has_text = !trim_xml_whitespace(&text).is_empty();
-                if has_children || has_text {
-                    errors.push(ValidationError {
-                        message: "Element with xsi:nil='true' must have no content".to_string(),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
-                // Skip all further content validation — nilled element is valid if empty
-                return;
+            }
+        }
+        if nilled {
+            let has_children = self.element_has_child_elements(doc, node);
+            // Any character child counts, XML white space included.
+            let has_text = !doc.text_content_deep(node).is_empty();
+            if has_children || has_text {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has xsi:nil='true' and must have no content",
+                        decl.name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            }
+            if let Some(fixed) = &decl.fixed {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has fixed value '{}' and cannot be nil",
+                        decl.name, fixed
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
             }
         }
 
         // An empty element with a fixed value takes that value (XSD 1.0
         // cvc-elt.5.1.2); the value is validated in place of the empty text.
+        // A nilled element takes none.
         let has_child_elements = self.element_has_child_elements(doc, node);
         let is_empty = !has_child_elements && doc.text_content_deep(node).is_empty();
-        let supplied = decl.fixed.as_deref().filter(|_| is_empty);
+        let supplied = decl.fixed.as_deref().filter(|_| is_empty && !nilled);
+        // The type the element is assessed against: a valid `xsi:type`
+        // replaces the declared type (cvc-elt.4.3).
+        let mut actual_type = decl.type_ref.clone();
         if decl.fixed.is_some() {
             let is_id = self
                 .element_value_type(decl)
@@ -747,7 +934,10 @@ impl XsdValidator {
             }
         }
 
-        // Check for xsi:type override
+        // Check for xsi:type override. A valid substitution replaces the
+        // declared type for the element's content (cvc-elt.4.3); the
+        // declaration's fixed value and identity constraints still apply
+        // after it (cvc-elt.5, cvc-elt.6).
         if let Some(xsi_type_ref) = self.resolve_xsi_type(doc, node) {
             match xsi_type_ref {
                 XsiTypeResult::BuiltIn(bt) => {
@@ -761,9 +951,18 @@ impl XsdValidator {
                         });
                         return;
                     }
+                    if let Some(message) = self.builtin_xsi_type_error(&bt, decl) {
+                        errors.push(ValidationError {
+                            message,
+                            line: Some(doc.node_line(node)),
+                            column: Some(doc.node_column(node)),
+                        });
+                        return;
+                    }
                     if bt == BuiltInType::AnyType {
                         self.validate_children_against_global_decls(doc, node, errors);
                     } else {
+                        self.check_simple_type_attributes(doc, node, errors);
                         // Simple built-in type: element must not have child elements
                         if self.element_has_child_elements(doc, node) {
                             errors.push(ValidationError {
@@ -776,17 +975,19 @@ impl XsdValidator {
                             });
                             return;
                         }
-                        let text = match supplied {
-                            Some(text) => text.to_string(),
-                            None => doc.text_content_deep(node),
-                        };
-                        validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
+                        if !nilled {
+                            let text = match supplied {
+                                Some(text) => text.to_string(),
+                                None => doc.text_content_deep(node),
+                            };
+                            validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
+                        }
                     }
-                    return;
+                    actual_type = TypeRef::BuiltIn(bt);
                 }
-                XsiTypeResult::Named(td) => {
+                XsiTypeResult::Named(xsi_key, td) => {
                     // Check that xsi:type is the declared type or derived from it
-                    if !self.is_type_derived_from_decl(&td, &decl.type_ref) {
+                    if !self.is_type_derived_from_decl(&xsi_key, &decl.type_ref) {
                         let type_name = match td.as_ref() {
                             TypeDef::Complex(ct) => ct.name.as_deref().unwrap_or("anonymous"),
                             TypeDef::Simple(st) => st.name.as_deref().unwrap_or("anonymous"),
@@ -829,10 +1030,14 @@ impl XsdValidator {
                         return;
                     }
                     match *td {
+                        TypeDef::Complex(ct) if nilled => {
+                            self.validate_attributes(doc, node, &ct, errors);
+                        }
                         TypeDef::Complex(ct) => {
-                            self.validate_complex_content(doc, node, &ct, errors);
+                            self.validate_complex_content(doc, node, &ct, supplied, errors);
                         }
                         TypeDef::Simple(st) => {
+                            self.check_simple_type_attributes(doc, node, errors);
                             // Simple type: element must not have child elements
                             if self.element_has_child_elements(doc, node) {
                                 errors.push(ValidationError {
@@ -844,10 +1049,12 @@ impl XsdValidator {
                                 });
                                 return;
                             }
-                            self.validate_simple_content(doc, node, &st, supplied, errors);
+                            if !nilled {
+                                self.validate_simple_content(doc, node, &st, supplied, errors);
+                            }
                         }
                     }
-                    return;
+                    actual_type = TypeRef::Named(xsi_key.0, xsi_key.1);
                 }
                 XsiTypeResult::NotFound(type_name) => {
                     errors.push(ValidationError {
@@ -858,49 +1065,55 @@ impl XsdValidator {
                     return;
                 }
             }
-        }
+        } else {
+            let type_def = self.resolve_type(&decl.type_ref);
 
-        let type_def = self.resolve_type(&decl.type_ref);
-
-        match type_def {
-            Some(TypeDef::Complex(ct)) => {
-                self.validate_complex_content(doc, node, ct, errors);
-            }
-            Some(TypeDef::Simple(st)) => {
-                // Simple types cannot have child elements
-                if self.element_has_child_elements(doc, node) {
-                    let elem_name = doc
-                        .element(node)
-                        .map(|e| &*e.name.local_name)
-                        .unwrap_or("?");
-                    errors.push(ValidationError {
-                        message: format!(
-                            "Element '{}' has simple type but contains child elements",
-                            elem_name
-                        ),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
+            match type_def {
+                Some(TypeDef::Complex(ct)) if nilled => {
+                    self.validate_attributes(doc, node, ct, errors);
                 }
-                self.validate_simple_content(doc, node, st, supplied, errors);
-            }
-            None => {
-                // If type can't be resolved, check if it's a built-in
-                match &decl.type_ref {
-                    TypeRef::BuiltIn(bt) => match bt {
-                        BuiltInType::AnyType => {
-                            // AnyType allows any content, but we should still
-                            // validate child elements against their own declarations.
-                            self.validate_children_against_global_decls(doc, node, errors);
-                        }
-                        _ => {
-                            // Built-in simple types cannot have child elements
-                            if self.element_has_child_elements(doc, node) {
-                                let elem_name = doc
-                                    .element(node)
-                                    .map(|e| &*e.name.local_name)
-                                    .unwrap_or("?");
-                                errors.push(ValidationError {
+                Some(TypeDef::Complex(ct)) => {
+                    self.validate_complex_content(doc, node, ct, supplied, errors);
+                }
+                Some(TypeDef::Simple(st)) => {
+                    self.check_simple_type_attributes(doc, node, errors);
+                    // Simple types cannot have child elements
+                    if self.element_has_child_elements(doc, node) {
+                        let elem_name = doc
+                            .element(node)
+                            .map(|e| &*e.name.local_name)
+                            .unwrap_or("?");
+                        errors.push(ValidationError {
+                            message: format!(
+                                "Element '{}' has simple type but contains child elements",
+                                elem_name
+                            ),
+                            line: Some(doc.node_line(node)),
+                            column: Some(doc.node_column(node)),
+                        });
+                    }
+                    if !nilled {
+                        self.validate_simple_content(doc, node, st, supplied, errors);
+                    }
+                }
+                None => {
+                    // If type can't be resolved, check if it's a built-in
+                    match &decl.type_ref {
+                        TypeRef::BuiltIn(bt) => match bt {
+                            BuiltInType::AnyType => {
+                                // AnyType allows any content, but we should still
+                                // validate child elements against their own declarations.
+                                self.validate_children_against_global_decls(doc, node, errors);
+                            }
+                            _ => {
+                                self.check_simple_type_attributes(doc, node, errors);
+                                // Built-in simple types cannot have child elements
+                                if self.element_has_child_elements(doc, node) {
+                                    let elem_name = doc
+                                        .element(node)
+                                        .map(|e| &*e.name.local_name)
+                                        .unwrap_or("?");
+                                    errors.push(ValidationError {
                                     message: format!(
                                         "Element '{}' has simple type '{:?}' but contains child elements",
                                         elem_name, bt
@@ -908,32 +1121,42 @@ impl XsdValidator {
                                     line: Some(doc.node_line(node)),
                                     column: Some(doc.node_column(node)),
                                 });
+                                }
+                                if !nilled {
+                                    let text = match supplied {
+                                        Some(text) => text.to_string(),
+                                        None => doc.text_content_deep(node),
+                                    };
+                                    validate_builtin_value(
+                                        &text,
+                                        bt,
+                                        doc,
+                                        node,
+                                        errors,
+                                        self.lenient,
+                                    );
+                                }
                             }
-                            let text = match supplied {
-                                Some(text) => text.to_string(),
-                                None => doc.text_content_deep(node),
-                            };
-                            validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
+                        },
+                        TypeRef::Named(ns, name) => {
+                            let display = ns
+                                .as_ref()
+                                .map(|uri| format!("{{{}}}{}", uri, name))
+                                .unwrap_or_else(|| name.clone());
+                            errors.push(ValidationError {
+                                message: format!("Type '{}' not found", display),
+                                line: Some(doc.node_line(node)),
+                                column: Some(doc.node_column(node)),
+                            });
                         }
-                    },
-                    TypeRef::Named(ns, name) => {
-                        let display = ns
-                            .as_ref()
-                            .map(|uri| format!("{{{}}}{}", uri, name))
-                            .unwrap_or_else(|| name.clone());
-                        errors.push(ValidationError {
-                            message: format!("Type '{}' not found", display),
+                        // Decided at build; never present in a built validator.
+                        TypeRef::Unqualified(name) => errors.push(ValidationError {
+                            message: format!("Type '{}' not found", name.local),
                             line: Some(doc.node_line(node)),
                             column: Some(doc.node_column(node)),
-                        });
+                        }),
+                        TypeRef::Inline(_) => {}
                     }
-                    // Decided at build; never present in a built validator.
-                    TypeRef::Unqualified(name) => errors.push(ValidationError {
-                        message: format!("Type '{}' not found", name.local),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    }),
-                    TypeRef::Inline(_) => {}
                 }
             }
         }
@@ -941,7 +1164,8 @@ impl XsdValidator {
         // Check the fixed-value constraint of a non-empty element
         // (cvc-elt.5.2.2). The element must have no element children
         // (5.2.2.1), whatever its content type, mixed included; then its
-        // text is compared by value with the fixed value, read in the
+        // text, read in the actual type (the `xsi:type` type when one
+        // applies), is compared by value with the fixed value, read in the
         // declared type, or character for character for mixed content
         // (5.2.2.2); see `element_matches_fixed_value`.
         if let Some(ref fixed_value) = decl.fixed.as_ref().filter(|_| has_child_elements) {
@@ -959,7 +1183,7 @@ impl XsdValidator {
                 &text,
                 fixed_value,
                 &decl.type_ref,
-                &decl.type_ref,
+                &actual_type,
                 doc,
                 node,
             );
@@ -1041,17 +1265,13 @@ impl XsdValidator {
         }
     }
 
-    /// Validate the complex content of an element against a complex type definition.
-    ///
-    /// This handles:
-    /// - Required/optional attribute checking
-    /// - Attribute value validation against declared types
-    /// - Attribute wildcard processing (processContents=skip/lax/strict)
-    /// - Rejecting undeclared attributes when no wildcard is present
-    /// - Element-only text content rejection (non-mixed types)
-    /// - Content model validation (sequence/choice/all/empty/simpleContent/any)
-    /// - Extension type particle merging
-    fn validate_complex_content(
+    /// Validate the attributes of an element against a complex type definition:
+    /// required and declared attributes, the attribute wildcard, and the
+    /// refusal of any other attribute. The four XSI attributes are exempt
+    /// (cvc-complex-type.3); every other attribute in the XSI namespace is
+    /// assessed like any other. Namespace declarations are not attributes;
+    /// an attribute with a declaration's name is refused by name.
+    fn validate_attributes(
         &self,
         doc: &Document,
         node: NodeId,
@@ -1136,17 +1356,16 @@ impl XsdValidator {
             // Validate unmatched attributes against wildcard or reject if no wildcard
             if let Some(ref wildcard) = effective_wildcard {
                 for attr in &elem.attributes {
-                    // Skip namespace declarations
-                    if attr.name.local_name == "xmlns"
-                        || attr.name.prefix.as_deref() == Some("xmlns")
-                    {
+                    if has_namespace_declaration_name(attr) {
+                        errors.push(namespace_declaration_name_error(
+                            attr,
+                            &elem.name.local_name,
+                            doc,
+                            node,
+                        ));
                         continue;
                     }
-                    // Skip xsi:* attributes
-                    if attr.name.prefix.as_deref() == Some("xsi")
-                        || attr.name.namespace_uri.as_deref()
-                            == Some("http://www.w3.org/2001/XMLSchema-instance")
-                    {
+                    if is_exempt_xsi_attribute(attr) {
                         continue;
                     }
                     // Skip if already matched by an explicit attribute declaration
@@ -1226,17 +1445,16 @@ impl XsdValidator {
             } else {
                 // No wildcard: reject any undeclared attributes
                 for attr in &elem.attributes {
-                    // Skip namespace declarations
-                    if attr.name.local_name == "xmlns"
-                        || attr.name.prefix.as_deref() == Some("xmlns")
-                    {
+                    if has_namespace_declaration_name(attr) {
+                        errors.push(namespace_declaration_name_error(
+                            attr,
+                            &elem.name.local_name,
+                            doc,
+                            node,
+                        ));
                         continue;
                     }
-                    // Skip xsi:* attributes
-                    if attr.name.prefix.as_deref() == Some("xsi")
-                        || attr.name.namespace_uri.as_deref()
-                            == Some("http://www.w3.org/2001/XMLSchema-instance")
-                    {
+                    if is_exempt_xsi_attribute(attr) {
                         continue;
                     }
                     // Check if declared
@@ -1246,7 +1464,7 @@ impl XsdValidator {
                         errors.push(ValidationError {
                             message: format!(
                                 "Attribute '{}' is not allowed (no wildcard permits additional attributes)",
-                                attr.name.local_name,
+                                attribute_display(attr),
                             ),
                             line: Some(doc.node_line(node)),
                             column: Some(doc.node_column(node)),
@@ -1255,6 +1473,36 @@ impl XsdValidator {
                 }
             }
         }
+    }
+
+    /// Validate the complex content of an element against a complex type definition.
+    ///
+    /// This handles:
+    /// - Required/optional attribute checking
+    /// - Attribute value validation against declared types
+    /// - Attribute wildcard processing (processContents=skip/lax/strict)
+    /// - Rejecting undeclared attributes when no wildcard is present
+    /// - Element-only text content rejection (non-mixed types)
+    /// - Content model validation (sequence/choice/all/empty/simpleContent/any)
+    /// - Extension type particle merging
+    fn validate_complex_content(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        ct: &ComplexTypeDef,
+        text: Option<&str>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if self.has_complex_derivation_cycle(ct) {
+            errors.push(ValidationError {
+                message: "Complex type derivation cycle detected".to_string(),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
+            return;
+        }
+
+        self.validate_attributes(doc, node, ct, errors);
 
         // Validate content model
         let child_elements: Vec<NodeId> = doc
@@ -1263,10 +1511,50 @@ impl XsdValidator {
             .filter(|&c| matches!(doc.node_kind(c), Some(NodeKind::Element(_))))
             .collect();
 
-        // For non-mixed element-only content models, reject non-whitespace text
-        if !ct.mixed {
+        let (model, mixed) = match self.content_type(ct) {
+            ContentType::Model(model, mixed) => (model, mixed),
+            ContentType::Simple(owner) => {
+                self.validate_simple_content_of_complex(
+                    doc,
+                    node,
+                    owner,
+                    &child_elements,
+                    text,
+                    errors,
+                );
+                return;
+            }
+        };
+
+        // An empty content type admits no character children, white space
+        // included (cvc-complex-type.2.1); element-only content admits white
+        // space only (cvc-complex-type.2.3). A sequence or choice without
+        // particles keeps the element-only check: it is also what remains of
+        // a model whose group references were not resolved when read, whose
+        // content is not empty.
+        if !mixed && matches!(model.as_ref(), ContentModel::Empty) {
+            let has_character_child = doc
+                .children(node)
+                .into_iter()
+                .any(|child| doc.text_content(child).is_some_and(|text| !text.is_empty()));
+            if has_character_child {
+                let name = doc
+                    .element(node)
+                    .map(|elem| elem.name.local_name.to_string())
+                    .unwrap_or_default();
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has an empty content type and must not contain \
+                         character content, white space included",
+                        name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            }
+        } else if !mixed {
             let is_element_only = matches!(
-                ct.content,
+                model.as_ref(),
                 ContentModel::Sequence(..) | ContentModel::Choice(..) | ContentModel::All(..)
             );
             if is_element_only {
@@ -1287,34 +1575,7 @@ impl XsdValidator {
             }
         }
 
-        // For extension types, merge base type's particles with extension's particles
-        if let Some(merged_particles) = self.compute_effective_particles(ct) {
-            let consumed = self.validate_sequence(
-                doc,
-                &child_elements,
-                &merged_particles,
-                1,
-                &MaxOccurs::Bounded(1),
-                node,
-                errors,
-            );
-            // Report remaining children as unexpected
-            for &remaining in &child_elements[consumed..] {
-                if let Some(elem) = doc.element(remaining) {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "Unexpected element '{}' in sequence",
-                            elem.name.local_name
-                        ),
-                        line: Some(doc.node_line(remaining)),
-                        column: Some(doc.node_column(remaining)),
-                    });
-                }
-            }
-            return;
-        }
-
-        match &ct.content {
+        match model.as_ref() {
             ContentModel::Empty => {
                 if !child_elements.is_empty() {
                     errors.push(ValidationError {
@@ -1323,19 +1584,7 @@ impl XsdValidator {
                         column: Some(doc.node_column(node)),
                     });
                 }
-                // Check no text content (unless mixed)
-                if !ct.mixed {
-                    let text = doc.text_content_deep(node);
-                    let trimmed = trim_xml_whitespace(&text);
-                    if !trimmed.is_empty() {
-                        errors.push(ValidationError {
-                            message: "Element should have empty content but contains text"
-                                .to_string(),
-                            line: Some(doc.node_line(node)),
-                            column: Some(doc.node_column(node)),
-                        });
-                    }
-                }
+                // Character children are refused above.
             }
             ContentModel::Sequence(particles, min_occurs, max_occurs) => {
                 let consumed = self.validate_sequence(
@@ -1388,38 +1637,68 @@ impl XsdValidator {
             ContentModel::All(particles) => {
                 self.validate_all(doc, &child_elements, particles, node, errors);
             }
-            ContentModel::SimpleContent(type_ref) => {
-                match type_ref.as_ref() {
-                    TypeRef::BuiltIn(bt) => {
-                        let text = doc.text_content_deep(node);
-                        validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
-                    }
-                    TypeRef::Named(ns, local_name) => {
-                        let key = (ns.clone(), local_name.clone());
-                        if let Some(type_def) = self.types.get(&key) {
-                            match type_def {
-                                TypeDef::Simple(st) => {
-                                    self.validate_simple_content(doc, node, st, None, errors);
-                                }
-                                TypeDef::Complex(_) => {
-                                    // Complex base type for simpleContent — text validated against
-                                    // the complex type's own simpleContent base (recursively)
-                                }
-                            }
-                        }
-                    }
-                    TypeRef::Inline(inner_type_def) => {
-                        if let TypeDef::Simple(st) = inner_type_def.as_ref() {
-                            self.validate_simple_content(doc, node, st, None, errors);
-                        }
-                    }
-                    // Decided at build; never present in a built validator.
-                    TypeRef::Unqualified(_) => {}
+            // Decided by `content_type`: a model never holds simple content.
+            ContentModel::SimpleContent(_) => {}
+            ContentModel::Any => {
+                // The lax wildcard content of xs:anyType.
+                self.validate_children_against_global_decls(doc, node, errors);
+            }
+        }
+    }
+
+    /// Validate the content of an element whose complex type has simple
+    /// content, the content type of `owner`: no element children
+    /// (cvc-complex-type.2.2), and text that satisfies the base's simple
+    /// content type and, for a `simpleContent` restriction, the
+    /// restriction's facets.
+    fn validate_simple_content_of_complex(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        owner: &ComplexTypeDef,
+        child_elements: &[NodeId],
+        text: Option<&str>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Some(&child) = child_elements.first() {
+            let name = doc
+                .element(child)
+                .map(|e| e.name.local_name.to_string())
+                .unwrap_or_default();
+            errors.push(ValidationError {
+                message: format!(
+                    "Element '{}' is not allowed: the type has simple content (cvc-complex-type.2.2)",
+                    name
+                ),
+                line: Some(doc.node_line(child)),
+                column: Some(doc.node_column(child)),
+            });
+            return;
+        }
+        match self.simple_content_types(owner) {
+            Ok(types) => {
+                let content_text = match text {
+                    Some(text) => text.to_string(),
+                    None => doc.text_content_deep(node),
+                };
+                let mut memo = UnionMemo::new();
+                for type_ref in &types {
+                    self.check_type_ref_value(
+                        &content_text,
+                        type_ref,
+                        doc,
+                        node,
+                        errors,
+                        0,
+                        &mut memo,
+                    );
                 }
             }
-            ContentModel::Any => {
-                // Any content is valid
-            }
+            Err(message) => errors.push(ValidationError {
+                message,
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            }),
         }
     }
 
@@ -2013,6 +2292,21 @@ impl XsdValidator {
         }
     }
 
+    /// Whether a content model accepts no element children.
+    fn model_is_emptiable(&self, model: &ContentModel) -> bool {
+        match model {
+            ContentModel::Empty | ContentModel::Any => true,
+            ContentModel::Sequence(particles, min, _) => {
+                *min == 0 || particles.iter().all(Self::particle_is_nullable)
+            }
+            ContentModel::Choice(particles, min, _) => {
+                *min == 0 || particles.iter().any(Self::particle_is_nullable)
+            }
+            ContentModel::All(particles) => particles.iter().all(Self::particle_is_nullable),
+            ContentModel::SimpleContent(_) => false,
+        }
+    }
+
     /// Validate an `xs:all` content model.
     ///
     /// In an all group, each particle can appear at most once, and order doesn't matter.
@@ -2142,6 +2436,44 @@ impl XsdValidator {
                     });
                 }
             }
+        }
+    }
+
+    /// Refuse, by name, every attribute of an element whose type is simple
+    /// (declared, built-in or given by `xsi:type`), except the four XSI
+    /// attributes (cvc-type.3.1.1). Namespace declarations are not
+    /// attributes, so none is exempt here.
+    fn check_simple_type_attributes(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let Some(elem) = doc.element(node) else {
+            return;
+        };
+        for attr in &elem.attributes {
+            if has_namespace_declaration_name(attr) {
+                errors.push(namespace_declaration_name_error(
+                    attr,
+                    &elem.name.local_name,
+                    doc,
+                    node,
+                ));
+                continue;
+            }
+            if is_exempt_xsi_attribute(attr) {
+                continue;
+            }
+            errors.push(ValidationError {
+                message: format!(
+                    "Attribute '{}' is not allowed on element '{}', which has a simple type",
+                    attribute_display(attr),
+                    elem.name.local_name
+                ),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
         }
     }
 
@@ -2353,6 +2685,97 @@ impl XsdValidator {
         })
     }
 
+    /// The simple types an element's text must satisfy when the element has
+    /// a complex type with simple content: the base's simple content type
+    /// (following `simpleContent` derivations from complex types, and
+    /// `complexContent` extensions without particles of such a type) and,
+    /// for a `simpleContent` restriction, that base narrowed by the
+    /// restriction's facets. Empty for element-only, mixed or empty content.
+    fn simple_content_types(&self, ct: &ComplexTypeDef) -> Result<Vec<TypeRef>, String> {
+        match self.content_type(ct) {
+            ContentType::Simple(owner) => self.simple_content_types_inner(owner, 0),
+            ContentType::Model(..) => Ok(Vec::new()),
+        }
+    }
+
+    fn simple_content_types_inner(
+        &self,
+        ct: &ComplexTypeDef,
+        depth: usize,
+    ) -> Result<Vec<TypeRef>, String> {
+        if depth > MAX_SIMPLE_TYPE_DEPTH {
+            return Err(format!(
+                "simpleContent derivation deeper than {} levels",
+                MAX_SIMPLE_TYPE_DEPTH
+            ));
+        }
+        let ContentModel::SimpleContent(base) = &ct.content else {
+            return Ok(Vec::new());
+        };
+        let mut types = match base.as_ref() {
+            TypeRef::BuiltIn(BuiltInType::AnyType) => Vec::new(),
+            TypeRef::BuiltIn(_) => vec![base.as_ref().clone()],
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(_) => vec![base.as_ref().clone()],
+                TypeDef::Complex(inner) => self.simple_content_types_inner(inner, depth + 1)?,
+            },
+            TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
+                Some(TypeDef::Simple(_)) => vec![base.as_ref().clone()],
+                Some(TypeDef::Complex(base_ct)) => match self.content_type(base_ct) {
+                    ContentType::Simple(owner) => self.simple_content_types_inner(owner, depth + 1)?,
+                    // src-ct.2: the base of a simpleContent derivation has
+                    // simple content, or, for a restriction with its own
+                    // simpleType, mixed content that can be empty.
+                    ContentType::Model(model, mixed)
+                        if mixed
+                            && self.model_is_emptiable(&model)
+                            && ct
+                                .simple_content_restriction
+                                .as_ref()
+                                .is_some_and(|r| r.base_ref.is_some()) =>
+                    {
+                        Vec::new()
+                    }
+                    ContentType::Model(..) => {
+                        return Err(format!(
+                            "Base type '{}' of a simpleContent derivation does not have simple content (src-ct.2)",
+                            qname_display(ns, name)
+                        ))
+                    }
+                },
+                None => {
+                    return Err(format!("Base type '{}' not found", qname_display(ns, name)))
+                }
+            },
+            // Decided at build; never present in a built validator.
+            TypeRef::Unqualified(name) => {
+                return Err(format!("Base type '{}' not found", name.local))
+            }
+        };
+        if let Some(restriction) = &ct.simple_content_restriction {
+            // The restriction step: its facets on top of its anonymous
+            // simpleType when it has one, else on top of the base's content.
+            let step_base = match &restriction.base_ref {
+                Some(inline) => Some(inline.clone()),
+                None if types.is_empty() => None,
+                None => Some(types.remove(0)),
+            };
+            let mut step = restriction.as_ref().clone();
+            match step_base {
+                Some(TypeRef::BuiltIn(bt)) => {
+                    step.base = bt;
+                    step.base_ref = None;
+                }
+                Some(other) => step.base_ref = Some(other),
+                None => {}
+            }
+            if step.base_ref.is_some() || step.base != BuiltInType::AnySimpleType {
+                types.insert(0, TypeRef::Inline(Box::new(TypeDef::Simple(step))));
+            }
+        }
+        Ok(types)
+    }
+
     /// The simple type an element's value is read with, for comparing it
     /// with the element's fixed value; `None` when the element has mixed,
     /// element-only or empty content (compared character for character).
@@ -2368,6 +2791,9 @@ impl XsdValidator {
             TypeRef::BuiltIn(_) => Some(type_ref.clone()),
             _ => match self.resolve_type(type_ref)? {
                 TypeDef::Simple(_) => Some(type_ref.clone()),
+                TypeDef::Complex(ct) if !ct.mixed => {
+                    self.simple_content_types(ct).ok()?.into_iter().next()
+                }
                 TypeDef::Complex(_) => None,
             },
         }
@@ -2847,11 +3273,22 @@ pub(crate) mod test_counters {
         /// Union member selections made (not found in the memo) on this thread.
         pub(crate) static UNION_MEMBER_SELECTIONS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
+        /// Particles copied from the schema while building content types.
+        pub(crate) static CONTENT_PARTICLE_COPIES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
     }
 
     #[cfg(test)]
     pub(crate) fn note(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
         counter.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_many(
+        counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>,
+        n: usize,
+    ) {
+        counter.with(|count| count.set(count.get() + n));
     }
 
     #[cfg(test)]
@@ -2865,10 +3302,16 @@ pub(crate) mod test_counters {
     pub(crate) const UNION_LITERAL_READS: Counter = Counter;
     #[cfg(not(test))]
     pub(crate) const UNION_MEMBER_SELECTIONS: Counter = Counter;
+    #[cfg(not(test))]
+    pub(crate) const CONTENT_PARTICLE_COPIES: Counter = Counter;
 
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) fn note(_counter: &Counter) {}
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note_many(_counter: &Counter, _n: usize) {}
 }
 
 /// Cache of union member selection: (address of the union's root
@@ -2878,6 +3321,62 @@ type UnionMemo = HashMap<(usize, String), Option<(String, BuiltInType)>>;
 /// Maximum number of restriction steps in a simple type's derivation chain,
 /// and of nested union member / list item types, followed during validation.
 pub(super) const MAX_SIMPLE_TYPE_DEPTH: usize = 64;
+
+/// Maximum number of derivation steps (`base_type` links through complex
+/// types) from a complex type to the root of its chain. A longer chain is
+/// refused at build: validation walks the chain for every element of such a
+/// type, so the limit bounds the time an instance can cost. The content
+/// model built from the chain does not nest deeper with it (see
+/// `extend_content_type`). No published schema comes near it.
+pub(super) const MAX_COMPLEX_DERIVATION_DEPTH: usize = 256;
+
+/// The base type of a built-in type in the XSD 1.0 Part 2 type hierarchy
+/// (§3, the built-in datatype hierarchy); `None` for `xs:anyType`. The list
+/// types are derived from `xs:anySimpleType`.
+fn builtin_base_type(bt: &BuiltInType) -> Option<BuiltInType> {
+    use BuiltInType as B;
+    Some(match bt {
+        B::AnyType => return None,
+        B::AnySimpleType => B::AnyType,
+        B::String
+        | B::Boolean
+        | B::Decimal
+        | B::Float
+        | B::Double
+        | B::Duration
+        | B::DateTime
+        | B::Time
+        | B::Date
+        | B::GYearMonth
+        | B::GYear
+        | B::GMonthDay
+        | B::GDay
+        | B::GMonth
+        | B::HexBinary
+        | B::Base64Binary
+        | B::AnyURI
+        | B::QName
+        | B::NOTATION
+        | B::IDREFS
+        | B::NMTOKENS
+        | B::ENTITIES => B::AnySimpleType,
+        B::NormalizedString => B::String,
+        B::Token => B::NormalizedString,
+        B::Language | B::NMTOKEN | B::Name => B::Token,
+        B::NCName => B::Name,
+        B::ID | B::IDREF | B::ENTITY => B::NCName,
+        B::Integer => B::Decimal,
+        B::NonPositiveInteger | B::Long | B::NonNegativeInteger => B::Integer,
+        B::NegativeInteger => B::NonPositiveInteger,
+        B::Int => B::Long,
+        B::Short => B::Int,
+        B::Byte => B::Short,
+        B::UnsignedLong | B::PositiveInteger => B::NonNegativeInteger,
+        B::UnsignedInt => B::UnsignedLong,
+        B::UnsignedShort => B::UnsignedInt,
+        B::UnsignedByte => B::UnsignedShort,
+    })
+}
 
 /// How a derivation step's facets are applied: to an atomic value of the
 /// given built-in type, whose step reads its enumeration literals with the

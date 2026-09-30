@@ -389,9 +389,19 @@ pub(crate) struct ComplexTypeDef {
     /// Unresolved model group reference (namespace, local_name) from xs:group ref.
     /// Used to re-resolve after xs:redefine updates the group definition.
     pub(super) group_ref: Option<(Option<String>, String)>,
+    /// The `minOccurs`/`maxOccurs` of that reference: the occurrence of
+    /// the group's compositor as the type's content.
+    pub(super) group_ref_occurs: (u64, MaxOccurs),
     /// Unresolved attribute group references (namespace, local_name) from xs:attributeGroup ref.
     /// Used to re-resolve after xs:redefine updates the attribute group definition.
     pub(super) attribute_group_refs: Vec<(Option<String>, String)>,
+    /// Whether the type is derived through `<simpleContent>` (as opposed to
+    /// `<complexContent>`, which also records its base in `content`).
+    pub(super) simple_content: bool,
+    /// For `<simpleContent><restriction>`: the facets of the restriction (and
+    /// its optional anonymous `<simpleType>` child as `base_ref`). They apply
+    /// on top of the base type's simple content.
+    pub(super) simple_content_restriction: Option<Box<SimpleTypeDef>>,
     /// A `base` written as an unprefixed QName without a default namespace:
     /// `base_type` (and a base kept in `content`) is decided after
     /// composition from this name. `None` once decided.

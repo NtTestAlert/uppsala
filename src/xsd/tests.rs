@@ -182,7 +182,9 @@ fn test_validate_enumeration() {
 // These count operations instead of measuring time, so a loaded machine
 // cannot fail them; the counters exist only in test builds.
 
-use super::validation::test_counters::{take, UNION_LITERAL_READS, UNION_MEMBER_SELECTIONS};
+use super::validation::test_counters::{
+    take, CONTENT_PARTICLE_COPIES, UNION_LITERAL_READS, UNION_MEMBER_SELECTIONS,
+};
 
 /// A restriction of a union reads its enumeration literals once per type,
 /// not once per value. A literal with a prefix is the exception: a `QName`
@@ -257,4 +259,45 @@ fn union_sharing_member_unions_selects_each_member_once() {
         selections,
         levels
     );
+}
+
+/// The content type of an extension chain is built by moving the model
+/// accumulated so far from step to step: an element of a type `depth` steps
+/// from its root copies each schema particle once, not once per step below
+/// it. Two chains: each step adds a sequence of one element (merged into the
+/// base's sequence), or an optional choice (appended to it).
+#[test]
+fn extension_chain_content_is_built_in_linear_work() {
+    let depth = 64;
+    for own in [
+        r#"<xs:sequence><xs:element name="e{k}" type="xs:string" minOccurs="0"/></xs:sequence>"#,
+        r#"<xs:choice minOccurs="0"><xs:element name="e{k}" type="xs:string"/></xs:choice>"#,
+    ] {
+        let mut body = String::from(
+            r#"<xs:complexType name="T0"><xs:sequence><xs:element name="e0" type="xs:string" minOccurs="0"/></xs:sequence></xs:complexType>"#,
+        );
+        for k in 1..=depth {
+            body.push_str(&format!(
+                r#"<xs:complexType name="T{k}"><xs:complexContent><xs:extension base="T{}">{}</xs:extension></xs:complexContent></xs:complexType>"#,
+                k - 1,
+                own.replace("{k}", &k.to_string())
+            ));
+        }
+        let schema_xml = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">{}<xs:element name="x" type="T{}"/></xs:schema>"#,
+            body, depth
+        );
+        let schema = parse(&schema_xml).unwrap();
+        let validator = XsdValidator::from_schema(&schema).unwrap();
+        let doc = parse("<x/>").unwrap();
+        take(&CONTENT_PARTICLE_COPIES);
+        assert!(validator.validate(&doc).is_empty());
+        let copies = take(&CONTENT_PARTICLE_COPIES);
+        assert!(
+            copies <= 4 * (depth + 1),
+            "{} particle copies for one element of a {}-step chain",
+            copies,
+            depth
+        );
+    }
 }

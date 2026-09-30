@@ -36,8 +36,8 @@ use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
 
 use super::parser::{
-    builtin_list_item_type, parse_attribute_group_def, parse_builtin_type, parse_complex_type,
-    parse_model_group_def, parse_simple_type,
+    builtin_list_item_type, group_ref_content, parse_attribute_group_def, parse_builtin_type,
+    parse_complex_type, parse_model_group_def, parse_simple_type,
 };
 use super::types::{
     AttributeDecl, ComplexTypeDef, ComponentKey, ContentModel, ElementDecl, Particle, ParticleKind,
@@ -740,6 +740,11 @@ fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
             }
             chameleon_fixup_attribute_decls(&mut ct.attributes, target_ns);
             chameleon_fixup_content_model(&mut ct.content, target_ns);
+            if let Some(restriction) = ct.simple_content_restriction.as_mut() {
+                if let Some(ref mut base) = restriction.base_ref {
+                    chameleon_fixup_type_ref(base, target_ns);
+                }
+            }
         }
         TypeDef::Simple(ref mut st) => {
             // Unprefixed base, item and member type names of a no-namespace
@@ -984,6 +989,12 @@ impl UnqualifiedResolver<'_> {
         }
         self.attribute_decls(&mut ct.attributes);
         self.content_model(&mut ct.content);
+        if let Some(restriction) = ct.simple_content_restriction.as_mut() {
+            // A synthetic step: only its anonymous base can hold references.
+            if let Some(base) = restriction.base_ref.as_mut() {
+                self.type_ref(base);
+            }
+        }
     }
 
     fn attribute_decls(&self, attributes: &mut [AttributeDecl]) {
@@ -1241,7 +1252,7 @@ fn reresolve_types_after_redefine(validator: &mut XsdValidator) {
             // Re-resolve model group reference
             if let Some(ref mg_key) = ct.group_ref {
                 if let Some(mg) = validator.model_groups.get(mg_key) {
-                    ct.content = mg.content.clone();
+                    ct.content = group_ref_content(&mg.content, &ct.group_ref_occurs);
                 }
             }
             // Re-resolve attribute group references
