@@ -32,11 +32,12 @@ use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
 
 use super::parser::{
-    parse_attribute_group_def, parse_complex_type, parse_model_group_def, parse_simple_type,
+    builtin_list_item_type, parse_attribute_group_def, parse_builtin_type, parse_complex_type,
+    parse_model_group_def, parse_simple_type,
 };
 use super::types::{
-    AttributeDecl, ContentModel, ElementDecl, Particle, ParticleKind, TypeDef, TypeRef,
-    XsdValidator,
+    AttributeDecl, ComplexTypeDef, ContentModel, ElementDecl, Particle, ParticleKind,
+    SimpleTypeDef, TypeDef, TypeRef, UnqualifiedTypeName, XsdValidator,
 };
 use super::XS_NAMESPACE;
 
@@ -488,6 +489,9 @@ fn merge_external_declarations(validator: &mut XsdValidator, ext: &XsdValidator,
         if chameleon && new_attr.namespace.is_none() {
             new_attr.namespace = target_ns.clone();
         }
+        if chameleon {
+            chameleon_fixup_type_ref(&mut new_attr.type_ref, &target_ns);
+        }
         validator
             .global_attributes
             .entry(new_key)
@@ -534,7 +538,19 @@ fn chameleon_fixup_type_ref(type_ref: &mut TypeRef, target_ns: &Option<String>) 
         TypeRef::Inline(ref mut td) => {
             chameleon_fixup_type_def(td, target_ns);
         }
-        _ => {}
+        TypeRef::Unqualified(ref mut name) => chameleon_fixup_unqualified(name, target_ns),
+        TypeRef::BuiltIn(_) => {}
+    }
+}
+
+/// An unprefixed name of a no-namespace module: `{absent}local` becomes a
+/// name in the including schema's target namespace.
+fn chameleon_fixup_unqualified(name: &mut UnqualifiedTypeName, target_ns: &Option<String>) {
+    if name.absent_ns.is_none() {
+        name.absent_ns = target_ns.clone();
+    }
+    if name.target_ns.is_none() {
+        name.target_ns = target_ns.clone();
     }
 }
 
@@ -550,11 +566,24 @@ fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
                     *ns = target_ns.clone();
                 }
             }
+            if let Some(name) = ct.unqualified_base.as_mut() {
+                chameleon_fixup_unqualified(name, target_ns);
+            }
             chameleon_fixup_attribute_decls(&mut ct.attributes, target_ns);
             chameleon_fixup_content_model(&mut ct.content, target_ns);
         }
-        TypeDef::Simple(_) => {
-            // Simple types don't reference namespaced components that need fixing
+        TypeDef::Simple(ref mut st) => {
+            // Unprefixed base, item and member type names of a no-namespace
+            // module move to the including schema's target namespace too.
+            if let Some(ref mut base) = st.base_ref {
+                chameleon_fixup_type_ref(base, target_ns);
+            }
+            if let Some(ref mut item) = st.item_ref {
+                chameleon_fixup_type_ref(item, target_ns);
+            }
+            for member in st.union_members.iter_mut().flatten() {
+                chameleon_fixup_type_ref(member, target_ns);
+            }
         }
     }
 }
@@ -570,6 +599,8 @@ fn chameleon_fixup_attribute_decls(attributes: &mut [AttributeDecl], target_ns: 
         if (attr.is_ref || attr.qualified) && attr.namespace.is_none() {
             attr.namespace = target_ns.clone();
         }
+        // Unprefixed type names of a no-namespace module move as well.
+        chameleon_fixup_type_ref(&mut attr.type_ref, target_ns);
     }
 }
 
@@ -607,6 +638,192 @@ fn chameleon_fixup_particles(particles: &mut [Particle], target_ns: &Option<Stri
     }
 }
 
+/// Decide every unprefixed type QName read without a default namespace
+/// (`TypeRef::Unqualified`), once the schema is composed: every included,
+/// redefined and imported document has been merged, and chameleon includes
+/// have moved their names. In order:
+///
+/// 1. `{absent}local` (XSD: an unprefixed QName with no default namespace
+///    has no namespace), when the composed schema defines that type. After
+///    a chameleon include this is the including target namespace.
+/// 2. Otherwise, as legacy leniencies for schemas that are invalid under
+///    rule 1 (src-resolve): the type `local` of the reading document's target
+///    namespace, when the composed schema defines it; else the built-in type
+///    of that name.
+/// 3. Otherwise `{target namespace}local`, which does not exist and is
+///    reported as a missing type.
+///
+/// Rule 1 is what the XSD specification and libxml2 do; rule 2 keeps
+/// schemas that reference their own target namespace types, or built-in
+/// types, without a prefix building as before. The decision looks names up
+/// in the set of defined types, so it is linear in the number of references.
+pub(super) fn resolve_unqualified_type_refs(validator: &mut XsdValidator) -> XmlResult<()> {
+    let defined: HashSet<(Option<String>, String)> = validator.types.keys().cloned().collect();
+    let resolve = |name: &UnqualifiedTypeName| -> TypeRef {
+        let absent = (name.absent_ns.clone(), name.local.clone());
+        if defined.contains(&absent) {
+            return TypeRef::Named(absent.0, absent.1);
+        }
+        let in_target = (name.target_ns.clone(), name.local.clone());
+        if defined.contains(&in_target) {
+            return TypeRef::Named(in_target.0, in_target.1);
+        }
+        match parse_builtin_type(&name.local) {
+            Some(bt) => TypeRef::BuiltIn(bt),
+            None => TypeRef::Named(in_target.0, in_target.1),
+        }
+    };
+    walk_unqualified_type_refs(validator, &resolve);
+    Ok(())
+}
+
+/// Replace every `TypeRef::Unqualified` of the validator's components with
+/// `resolve`'s decision.
+fn walk_unqualified_type_refs(
+    validator: &mut XsdValidator,
+    resolve: &dyn Fn(&UnqualifiedTypeName) -> TypeRef,
+) {
+    let resolver = UnqualifiedResolver { resolve };
+    for td in validator.types.values_mut() {
+        resolver.type_def(td);
+    }
+    for decl in validator.elements.values_mut() {
+        resolver.type_ref(&mut decl.type_ref);
+    }
+    for decl in validator.global_attributes.values_mut() {
+        resolver.type_ref(&mut decl.type_ref);
+    }
+    for group in validator.attribute_groups.values_mut() {
+        resolver.attribute_decls(&mut group.attributes);
+    }
+    for group in validator.model_groups.values_mut() {
+        resolver.content_model(&mut group.content);
+    }
+}
+
+/// Walks every type reference of a schema component for
+/// `resolve_unqualified_type_refs`.
+struct UnqualifiedResolver<'a> {
+    resolve: &'a dyn Fn(&UnqualifiedTypeName) -> TypeRef,
+}
+
+impl UnqualifiedResolver<'_> {
+    fn type_ref(&self, type_ref: &mut TypeRef) {
+        match type_ref {
+            TypeRef::Unqualified(name) => *type_ref = (self.resolve)(name),
+            TypeRef::Inline(td) => self.type_def(td),
+            TypeRef::Named(..) | TypeRef::BuiltIn(_) => {}
+        }
+    }
+
+    fn type_def(&self, td: &mut TypeDef) {
+        match td {
+            TypeDef::Simple(st) => self.simple_type(st),
+            TypeDef::Complex(ct) => self.complex_type(ct),
+        }
+    }
+
+    /// A simple type's base, item and member types. A base or item type
+    /// that turns out to be built-in is stored the way the parser stores a
+    /// built-in one (`base` / `item_type`, no reference).
+    fn simple_type(&self, st: &mut SimpleTypeDef) {
+        if let Some(TypeRef::Unqualified(name)) = &st.base_ref {
+            match (self.resolve)(name) {
+                TypeRef::BuiltIn(bt) => {
+                    if let Some(item) = builtin_list_item_type(&bt) {
+                        st.item_type = Some(item);
+                        st.is_list = true;
+                    }
+                    st.base = bt;
+                    st.base_ref = None;
+                    st._base_type_local = None;
+                }
+                other => st.base_ref = Some(other),
+            }
+        } else if let Some(TypeRef::Inline(inner)) = st.base_ref.as_mut() {
+            self.type_def(inner);
+            // A restriction of an anonymous simple type copies these from
+            // it at parse time; copy them again now that it is decided.
+            if let TypeDef::Simple(inner) = inner.as_ref() {
+                st.base = inner.base.clone();
+                st.is_list = inner.is_list;
+                st.item_type = inner.item_type.clone();
+                st._item_type_local = inner._item_type_local.clone();
+            }
+        }
+        if let Some(TypeRef::Unqualified(name)) = &st.item_ref {
+            match (self.resolve)(name) {
+                TypeRef::BuiltIn(bt) => {
+                    st.item_type = Some(bt);
+                    st.item_ref = None;
+                    st._item_type_local = None;
+                }
+                other => st.item_ref = Some(other),
+            }
+        } else if let Some(item) = st.item_ref.as_mut() {
+            self.type_ref(item);
+        }
+        for member in st.union_members.iter_mut().flatten() {
+            self.type_ref(member);
+        }
+    }
+
+    fn complex_type(&self, ct: &mut ComplexTypeDef) {
+        if let Some(name) = ct.unqualified_base.take() {
+            ct.base_type = match (self.resolve)(&name) {
+                TypeRef::Named(ns, local) => Some((ns, local)),
+                _ => None,
+            };
+        }
+        self.attribute_decls(&mut ct.attributes);
+        self.content_model(&mut ct.content);
+    }
+
+    fn attribute_decls(&self, attributes: &mut [AttributeDecl]) {
+        for attr in attributes {
+            self.type_ref(&mut attr.type_ref);
+        }
+    }
+
+    fn content_model(&self, content: &mut ContentModel) {
+        match content {
+            ContentModel::Sequence(particles, _, _)
+            | ContentModel::Choice(particles, _, _)
+            | ContentModel::All(particles) => self.particles(particles),
+            ContentModel::SimpleContent(type_ref) => self.type_ref(type_ref),
+            ContentModel::Empty | ContentModel::Any => {}
+        }
+    }
+
+    fn particles(&self, particles: &mut [Particle]) {
+        for particle in particles {
+            match &mut particle.kind {
+                ParticleKind::Element(decl) => self.type_ref(&mut decl.type_ref),
+                ParticleKind::Sequence(sub) | ParticleKind::Choice(sub) => self.particles(sub),
+                ParticleKind::Any { .. } => {}
+            }
+        }
+    }
+}
+
+/// A type key, not yet used, under which a redefinition keeps the definition
+/// it redefines. A redefined schema can itself redefine the same type, so the
+/// key gets a numeric suffix when `__redefine_base_<name>` is already taken;
+/// reusing it would make the saved definition its own base.
+fn unused_redefine_key(
+    validator: &XsdValidator,
+    target_ns: &Option<String>,
+    name: &str,
+) -> (Option<String>, String) {
+    let mut key = (target_ns.clone(), format!("__redefine_base_{}", name));
+    let mut level = 1usize;
+    while validator.types.contains_key(&key) {
+        level += 1;
+        key.1 = format!("__redefine_base_{}_{}", name, level);
+    }
+    key
+}
+
 /// Process inline redefinition children within an `xs:redefine` element.
 ///
 /// Handles `simpleType`, `complexType`, `group`, and `attributeGroup` redefinitions.
@@ -631,10 +848,28 @@ fn process_redefine_children(
 
             match child_elem.name.local_name.as_ref() {
                 "simpleType" => {
-                    let type_def = parse_simple_type(doc, child)?;
-                    if let TypeDef::Simple(ref st) = type_def {
-                        if let Some(name) = &st.name {
+                    let mut type_def = parse_simple_type(doc, child)?;
+                    if let TypeDef::Simple(ref mut st) = type_def {
+                        if let Some(name) = st.name.clone() {
                             let key = (target_ns.clone(), name.clone());
+                            // A redefinition restricts the original of the same
+                            // name: keep the old definition under a unique key
+                            // and point the new one's base at it, as for complex
+                            // types below.
+                            // An unprefixed base without a default namespace
+                            // is read in the target namespace here, as before
+                            // composition decides such names.
+                            let self_reference = st.named_base_key().as_ref() == Some(&key)
+                                || matches!(&st.base_ref, Some(TypeRef::Unqualified(base))
+                                    if base.local == name && base.target_ns == target_ns);
+                            if self_reference {
+                                let old_key = unused_redefine_key(validator, &target_ns, &name);
+                                if let Some(old_td) = validator.types.get(&key).cloned() {
+                                    validator.types.insert(old_key.clone(), old_td);
+                                }
+                                st.base_ref = Some(TypeRef::Named(old_key.0, old_key.1.clone()));
+                                st._base_type_local = Some(old_key.1);
+                            }
                             validator.types.insert(key, type_def);
                         }
                     }
@@ -673,6 +908,7 @@ fn process_redefine_children(
                                     if let TypeDef::Complex(ref mut new_ct) = new_td {
                                         new_ct.base_type =
                                             Some((old_key.0.clone(), old_key.1.clone()));
+                                        new_ct.unqualified_base = None;
                                     }
                                     validator.types.insert(key, new_td);
                                 } else {

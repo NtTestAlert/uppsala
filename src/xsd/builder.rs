@@ -18,7 +18,10 @@ use std::path::Path;
 use crate::dom::{Document, NodeKind};
 use crate::error::{XmlError, XmlResult};
 
-use super::composition::{process_schema_composition, CompositionState};
+use super::builtins::{instant_is_unrepresentable, trim_xml_whitespace, values_equal};
+use super::composition::{
+    process_schema_composition, resolve_unqualified_type_refs, CompositionState,
+};
 use super::facet_resolution::{
     resolve_content_model_list_item_facets, resolve_inline_list_item_facets, ListBasesMap,
 };
@@ -26,7 +29,11 @@ use super::parser::{
     parse_attribute_group_def, parse_complex_type, parse_element_decl, parse_model_group_def,
     parse_simple_type, resolve_type_name,
 };
-use super::types::{AttributeDecl, BuiltInType, Facet, TypeDef, TypeRef, XsdValidator};
+use super::types::{
+    AttributeDecl, BuiltInType, ComplexTypeDef, ContentModel, ElementDecl, Facet, Particle,
+    ParticleKind, SimpleTypeDef, TypeDef, TypeRef, UnqualifiedTypeName, XsdValidator,
+};
+use super::validation::{qname_display, MAX_SIMPLE_TYPE_DEPTH};
 use super::XS_NAMESPACE;
 
 impl XsdValidator {
@@ -174,7 +181,329 @@ impl XsdValidator {
         // state is what lets `xs:include` / `xs:import` chains detect
         // cycles and enforce a nesting cap.
         let mut state = CompositionState::new(base_path);
-        Self::from_schema_with_composition_state(schema_doc, base_path, &mut state)
+        let validator =
+            Self::from_schema_with_composition_state(schema_doc, base_path, &mut state)?;
+        // Included and imported declarations are merged by now, so this is
+        // the first point where every simple type reference can be checked.
+        validator.check_simple_type_references()?;
+        Ok(validator)
+    }
+
+    /// Refuse a schema whose simple types reference a missing or non-simple
+    /// type (as a restriction base, list item type or union member), whose
+    /// references form a cycle or nest deeper than `MAX_SIMPLE_TYPE_DEPTH`,
+    /// which restricts a union with facets other than `pattern` and
+    /// `enumeration`, or which gives a facet declared `fixed` in a base type
+    /// another value. Validation could otherwise only fail every value of such
+    /// a type, or not terminate on a cyclic union.
+    ///
+    /// Named simple types are checked first. The anonymous simple types of
+    /// element and attribute declarations are checked the same way, and the
+    /// named types used by attribute declarations and as `simpleContent`
+    /// bases must exist; an attribute's type must be simple.
+    fn check_simple_type_references(&self) -> XmlResult<()> {
+        let mut keys: Vec<_> = self.types.keys().cloned().collect();
+        keys.sort();
+        // Height of each named simple type checked so far: the longest chain
+        // of base / item / member references below it. Memoizing the height
+        // (not just "checked") makes the nesting limit independent of the
+        // order in which types are visited.
+        let mut heights = HashMap::new();
+        for key in &keys {
+            if let Some(TypeDef::Simple(st)) = self.types.get(key) {
+                if heights.contains_key(key) {
+                    continue;
+                }
+                let mut visiting = vec![key.clone()];
+                let height = self.check_simple_type_refs(st, &mut visiting, &mut heights, 0)?;
+                heights.insert(key.clone(), height);
+            }
+        }
+
+        let mut elements: Vec<_> = self.elements.iter().collect();
+        elements.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, decl) in elements {
+            self.check_element_decl_types(decl, &mut heights)?;
+        }
+        for key in &keys {
+            if let Some(TypeDef::Complex(ct)) = self.types.get(key) {
+                self.check_complex_type_refs(ct, &mut heights)?;
+            }
+        }
+        let mut attributes: Vec<_> = self.global_attributes.iter().collect();
+        attributes.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, decl) in attributes {
+            self.check_attribute_type(decl, &mut heights)?;
+        }
+        let mut groups: Vec<_> = self.attribute_groups.iter().collect();
+        groups.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, group) in groups {
+            for decl in &group.attributes {
+                self.check_attribute_type(decl, &mut heights)?;
+            }
+        }
+        let mut model_groups: Vec<_> = self.model_groups.iter().collect();
+        model_groups.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, group) in model_groups {
+            self.check_content_model_refs(&group.content, &mut heights)?;
+        }
+        Ok(())
+    }
+
+    /// Depth-first walk of the types a simple type references, for
+    /// `check_simple_type_references`. `visiting` holds the named types on the
+    /// current path; `heights` the named types already checked, with their
+    /// height. Returns the height of `st`.
+    fn check_simple_type_refs(
+        &self,
+        st: &SimpleTypeDef,
+        visiting: &mut Vec<(Option<String>, String)>,
+        heights: &mut HashMap<(Option<String>, String), usize>,
+        depth: usize,
+    ) -> XmlResult<usize> {
+        let too_deep = || {
+            XmlError::validation(format!(
+                "Simple type definitions nest deeper than {} levels",
+                MAX_SIMPLE_TYPE_DEPTH
+            ))
+        };
+        if depth > MAX_SIMPLE_TYPE_DEPTH {
+            return Err(too_deep());
+        }
+        let refs = st
+            .base_ref
+            .iter()
+            .chain(st.item_ref.iter())
+            .chain(st.union_members.iter().flatten());
+        let mut height = 0;
+        for type_ref in refs {
+            let below = match type_ref {
+                TypeRef::BuiltIn(_) => continue,
+                TypeRef::Unqualified(name) => return Err(unresolved_type_name(name)),
+                TypeRef::Inline(td) => match td.as_ref() {
+                    TypeDef::Simple(inner) => {
+                        self.check_simple_type_refs(inner, visiting, heights, depth + 1)?
+                    }
+                    TypeDef::Complex(_) => {
+                        return Err(XmlError::validation(
+                            "A simple type definition contains a complex type",
+                        ))
+                    }
+                },
+                TypeRef::Named(ns, name) => {
+                    let key = (ns.clone(), name.clone());
+                    if let Some(&known) = heights.get(&key) {
+                        known
+                    } else if visiting.contains(&key) {
+                        // XSD 1.0 src-simple-type.4 (union) and st-props-correct.2
+                        // (restriction, list): no definition may reference itself.
+                        return Err(XmlError::validation(format!(
+                            "Circular simple type definition involving '{}'",
+                            qname_display(ns, name)
+                        )));
+                    } else {
+                        match self.types.get(&key) {
+                            Some(TypeDef::Simple(target)) => {
+                                visiting.push(key.clone());
+                                let below = self.check_simple_type_refs(
+                                    target,
+                                    visiting,
+                                    heights,
+                                    depth + 1,
+                                )?;
+                                visiting.pop();
+                                heights.insert(key, below);
+                                below
+                            }
+                            Some(TypeDef::Complex(_)) => {
+                                return Err(XmlError::validation(format!(
+                                    "Type '{}' is used as a simple type but is a complex type",
+                                    qname_display(ns, name)
+                                )))
+                            }
+                            None => {
+                                return Err(XmlError::validation(format!(
+                                    "Type '{}' referenced by simple type '{}' is not defined",
+                                    qname_display(ns, name),
+                                    visiting
+                                        .last()
+                                        .map(|k| qname_display(&k.0, &k.1))
+                                        .unwrap_or_else(|| "(anonymous)".to_string())
+                                )))
+                            }
+                        }
+                    }
+                }
+            };
+            height = height.max(below + 1);
+        }
+        if height > MAX_SIMPLE_TYPE_DEPTH {
+            return Err(too_deep());
+        }
+        self.check_simple_type_steps(st, visiting.last())?;
+        Ok(height)
+    }
+
+    /// The per-definition checks of `check_simple_type_references`: the
+    /// derivation chain resolves, a union is restricted only by `pattern` and
+    /// `enumeration`, and no step changes a facet a base step fixed.
+    fn check_simple_type_steps(
+        &self,
+        st: &SimpleTypeDef,
+        key: Option<&(Option<String>, String)>,
+    ) -> XmlResult<()> {
+        let display = || {
+            key.map(|k| qname_display(&k.0, &k.1))
+                .or_else(|| st.name.clone())
+                .unwrap_or_else(|| "(anonymous)".to_string())
+        };
+        let chain = self.simple_type_chain(st).map_err(XmlError::validation)?;
+        let root = chain[chain.len() - 1];
+        let restricts_union_badly = root.union_members.is_some()
+            && chain.iter().any(|step| {
+                step.facets
+                    .iter()
+                    .any(|f| !matches!(f, Facet::Pattern(_) | Facet::Enumeration(_)))
+            });
+        if restricts_union_badly {
+            return Err(XmlError::validation(format!(
+                "Simple type '{}' restricts a union with a facet other than pattern or enumeration",
+                display()
+            )));
+        }
+        for (i, step) in chain.iter().enumerate() {
+            for facet in &step.facets {
+                for base in &chain[i + 1..] {
+                    if !base.fixed_facets.contains(&facet.name()) {
+                        continue;
+                    }
+                    let fixed = base.facets.iter().find(|f| f.name() == facet.name());
+                    if let Some(fixed) = fixed {
+                        let unplaceable = [facet, fixed]
+                            .into_iter()
+                            .find_map(|f| unplaceable_range_value(f, &root.base));
+                        if let Some(value) = unplaceable {
+                            return Err(XmlError::validation(format!(
+                                "Simple type '{}' cannot compare facet '{}' with the value a base type fixes: '{}' has a year too far from zero to place on the timeline",
+                                display(),
+                                facet.name(),
+                                value
+                            )));
+                        }
+                        if !facet_values_equal(facet, fixed, &root.base) {
+                            return Err(XmlError::validation(format!(
+                                "Simple type '{}' changes the value of facet '{}', which a base type fixes",
+                                display(),
+                                facet.name()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check the anonymous type of an element declaration (named element
+    /// types are resolved at validation, where a missing one is reported).
+    fn check_element_decl_types(
+        &self,
+        decl: &ElementDecl,
+        heights: &mut HashMap<(Option<String>, String), usize>,
+    ) -> XmlResult<()> {
+        if decl.is_ref {
+            return Ok(());
+        }
+        match &decl.type_ref {
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(st) => {
+                    self.check_simple_type_refs(st, &mut Vec::new(), heights, 0)?;
+                }
+                TypeDef::Complex(ct) => self.check_complex_type_refs(ct, heights)?,
+            },
+            TypeRef::Unqualified(name) => return Err(unresolved_type_name(name)),
+            TypeRef::Named(..) | TypeRef::BuiltIn(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Check the attribute types and local element declarations of a
+    /// complex type.
+    fn check_complex_type_refs(
+        &self,
+        ct: &ComplexTypeDef,
+        heights: &mut HashMap<(Option<String>, String), usize>,
+    ) -> XmlResult<()> {
+        for decl in &ct.attributes {
+            self.check_attribute_type(decl, heights)?;
+        }
+        self.check_content_model_refs(&ct.content, heights)
+    }
+
+    /// Check the local element declarations of a content model.
+    fn check_content_model_refs(
+        &self,
+        content: &ContentModel,
+        heights: &mut HashMap<(Option<String>, String), usize>,
+    ) -> XmlResult<()> {
+        match content {
+            ContentModel::Sequence(particles, ..)
+            | ContentModel::Choice(particles, ..)
+            | ContentModel::All(particles) => self.check_particle_refs(particles, heights),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_particle_refs(
+        &self,
+        particles: &[Particle],
+        heights: &mut HashMap<(Option<String>, String), usize>,
+    ) -> XmlResult<()> {
+        for particle in particles {
+            match &particle.kind {
+                ParticleKind::Element(decl) => self.check_element_decl_types(decl, heights)?,
+                ParticleKind::Sequence(inner) | ParticleKind::Choice(inner) => {
+                    self.check_particle_refs(inner, heights)?
+                }
+                ParticleKind::Any { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// An attribute's named type must be a defined simple type; an anonymous
+    /// one is checked like a named simple type.
+    fn check_attribute_type(
+        &self,
+        decl: &AttributeDecl,
+        heights: &mut HashMap<(Option<String>, String), usize>,
+    ) -> XmlResult<()> {
+        match &decl.type_ref {
+            TypeRef::BuiltIn(_) => Ok(()),
+            TypeRef::Unqualified(name) => Err(unresolved_type_name(name)),
+            TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
+                Some(TypeDef::Simple(_)) => Ok(()),
+                Some(TypeDef::Complex(_)) => Err(XmlError::validation(format!(
+                    "Type '{}' of attribute '{}' is a complex type",
+                    qname_display(ns, name),
+                    decl.name
+                ))),
+                None => Err(XmlError::validation(format!(
+                    "Type '{}' of attribute '{}' is not defined",
+                    qname_display(ns, name),
+                    decl.name
+                ))),
+            },
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(st) => self
+                    .check_simple_type_refs(st, &mut Vec::new(), heights, 0)
+                    .map(|_| ()),
+                TypeDef::Complex(_) => Err(XmlError::validation(format!(
+                    "Attribute '{}' has an anonymous complex type",
+                    decl.name
+                ))),
+            },
+        }
     }
 
     /// Internal entry used by `from_schema_with_base_path` and by
@@ -266,9 +595,8 @@ impl XsdValidator {
                                 for gc in schema_doc.children(child) {
                                     if let Some(NodeKind::Element(ge)) = schema_doc.node_kind(gc) {
                                         if ge.name.local_name == "simpleType" {
-                                            if let Ok(td) = parse_simple_type(schema_doc, gc) {
-                                                inline_type = Some(TypeRef::Inline(Box::new(td)));
-                                            }
+                                            let td = parse_simple_type(schema_doc, gc)?;
+                                            inline_type = Some(TypeRef::Inline(Box::new(td)));
                                         }
                                     }
                                 }
@@ -276,12 +604,14 @@ impl XsdValidator {
                             };
                             let required = attr_elem.get_attribute("use") == Some("required");
                             let default = attr_elem.get_attribute("default").map(|s| s.to_string());
+                            let fixed = attr_elem.get_attribute("fixed").map(|s| s.to_string());
                             let decl = AttributeDecl {
                                 name: name.to_string(),
                                 namespace: validator.target_namespace.clone(),
                                 type_ref,
                                 required,
                                 default,
+                                fixed,
                                 prohibited: false,
                                 is_ref: false,
                                 qualified: true,
@@ -438,10 +768,8 @@ impl XsdValidator {
                                             schema_doc.node_kind(gc)
                                         {
                                             if ge.name.local_name == "simpleType" {
-                                                if let Ok(td) = parse_simple_type(schema_doc, gc) {
-                                                    inline_type =
-                                                        Some(TypeRef::Inline(Box::new(td)));
-                                                }
+                                                let td = parse_simple_type(schema_doc, gc)?;
+                                                inline_type = Some(TypeRef::Inline(Box::new(td)));
                                             }
                                         }
                                     }
@@ -450,12 +778,14 @@ impl XsdValidator {
                                 let required = attr_elem.get_attribute("use") == Some("required");
                                 let default =
                                     attr_elem.get_attribute("default").map(|s| s.to_string());
+                                let fixed = attr_elem.get_attribute("fixed").map(|s| s.to_string());
                                 let decl = AttributeDecl {
                                     name: name.to_string(),
                                     namespace: validator.target_namespace.clone(),
                                     type_ref,
                                     required,
                                     default,
+                                    fixed,
                                     prohibited: false,
                                     is_ref: false,
                                     qualified: true,
@@ -470,6 +800,13 @@ impl XsdValidator {
                     }
                 }
             }
+        }
+
+        // Every document is composed by now at the top level: decide the
+        // unprefixed type names read without a default namespace. Nested
+        // documents keep them until their including schema is composed.
+        if state.depth == 0 {
+            resolve_unqualified_type_refs(&mut validator)?;
         }
 
         // Build substitution group map from element declarations.
@@ -516,16 +853,15 @@ impl XsdValidator {
         // Types that restrict a list type inherit is_list and item_type.
         let type_keys: Vec<_> = validator.types.keys().cloned().collect();
         for key in &type_keys {
-            let base_local = {
+            let base_key = {
                 if let Some(TypeDef::Simple(st)) = validator.types.get(key) {
-                    st._base_type_local.clone()
+                    st.named_base_key()
                 } else {
                     None
                 }
             };
-            if let Some(base_name) = base_local {
-                // Look up the base type in the same namespace
-                let base_key = (key.0.clone(), base_name);
+            if let Some(base_key) = base_key {
+                // Look up the base type under the namespace its QName resolved to
                 let (is_list, item_type) = {
                     if let Some(TypeDef::Simple(base_st)) = validator.types.get(&base_key) {
                         (base_st.is_list, base_st.item_type.clone())
@@ -548,16 +884,15 @@ impl XsdValidator {
         // is a user-defined simple type (not a built-in).
         let type_keys2: Vec<_> = validator.types.keys().cloned().collect();
         for key in &type_keys2 {
-            let item_local = {
+            let item_key = {
                 if let Some(TypeDef::Simple(st)) = validator.types.get(key) {
-                    st._item_type_local.clone()
+                    st.named_item_key()
                 } else {
                     None
                 }
             };
-            if let Some(item_name) = item_local {
-                // Look up the item type in the same namespace
-                let item_key = (key.0.clone(), item_name);
+            if let Some(item_key) = item_key {
+                // Look up the item type under the namespace its QName resolved to
                 let resolved = {
                     if let Some(TypeDef::Simple(item_st)) = validator.types.get(&item_key) {
                         Some((item_st.base.clone(), item_st.facets.clone()))
@@ -606,8 +941,8 @@ impl XsdValidator {
                     match validator.types.get(&cur) {
                         Some(TypeDef::Simple(st)) if st.is_list => {
                             meta = Some((st.item_type.clone(), st.item_facets.clone()));
-                            match &st._base_type_local {
-                                Some(base_local) => cur = (cur.0.clone(), base_local.clone()),
+                            match st.named_base_key() {
+                                Some(base_key) => cur = base_key,
                                 None => break,
                             }
                         }
@@ -681,5 +1016,51 @@ impl XsdValidator {
         }
 
         Ok(validator)
+    }
+}
+
+/// A type reference left undecided after composition; unreachable, since
+/// `resolve_unqualified_type_refs` decides every one, but refused rather
+/// than assumed.
+fn unresolved_type_name(name: &UnqualifiedTypeName) -> XmlError {
+    XmlError::validation(format!(
+        "Type name '{}' was not resolved",
+        qname_display(&name.absent_ns, &name.local)
+    ))
+}
+
+/// The value of a range facet that has no place on the timeline of `base`
+/// (a date or time type whose year is too far from zero). Such a value is
+/// never compared, so it can neither equal nor differ from a fixed value.
+fn unplaceable_range_value<'a>(facet: &'a Facet, base: &BuiltInType) -> Option<&'a str> {
+    match facet {
+        Facet::MinInclusive(v)
+        | Facet::MaxInclusive(v)
+        | Facet::MinExclusive(v)
+        | Facet::MaxExclusive(v) => {
+            let v = trim_xml_whitespace(v);
+            instant_is_unrepresentable(v, base).then_some(v)
+        }
+        _ => None,
+    }
+}
+
+/// Whether two facets of the same kind have the same value; range facets
+/// compare in the value space of `base`.
+fn facet_values_equal(a: &Facet, b: &Facet, base: &BuiltInType) -> bool {
+    match (a, b) {
+        (Facet::MinLength(x), Facet::MinLength(y))
+        | (Facet::MaxLength(x), Facet::MaxLength(y))
+        | (Facet::Length(x), Facet::Length(y))
+        | (Facet::TotalDigits(x), Facet::TotalDigits(y))
+        | (Facet::FractionDigits(x), Facet::FractionDigits(y)) => x == y,
+        (Facet::MinInclusive(x), Facet::MinInclusive(y))
+        | (Facet::MaxInclusive(x), Facet::MaxInclusive(y))
+        | (Facet::MinExclusive(x), Facet::MinExclusive(y))
+        | (Facet::MaxExclusive(x), Facet::MaxExclusive(y)) => {
+            values_equal(trim_xml_whitespace(x), base, trim_xml_whitespace(y), base)
+        }
+        (Facet::WhiteSpace(x), Facet::WhiteSpace(y)) => x == y,
+        _ => false,
     }
 }

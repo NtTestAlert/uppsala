@@ -25,11 +25,12 @@ use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
 use crate::namespace::build_resolver_for_node;
 
+use super::builtins::split_xml_whitespace;
 use super::types::{
     AttributeDecl, AttributeGroupDef, AttributeWildcard, BuiltInType, ComplexTypeDef, ContentModel,
     ElementDecl, Facet, IdentityConstraint, IdentityConstraintKind, MaxOccurs, ModelGroupDef,
     NamespaceConstraint, Particle, ParticleKind, ProcessContents, SimpleTypeDef, TypeDef, TypeRef,
-    WhiteSpaceHandling,
+    UnqualifiedTypeName, WhiteSpaceHandling,
 };
 use super::XS_NAMESPACE;
 
@@ -275,63 +276,80 @@ fn parse_substitution_group(
     }
 }
 
-/// Resolve a type name string (possibly with `xs:`/`xsd:` prefix) to a `TypeRef`.
+/// Resolve a type QName (a `type`, `base`, `itemType` or `memberTypes` value)
+/// to a `TypeRef`.
 ///
-/// If the name matches a built-in XSD type, returns `TypeRef::BuiltIn`.
-/// Otherwise returns `TypeRef::Named` with the appropriate namespace.
+/// The value is whitespace-collapsed first, as for any `xs:QName` attribute.
+/// A prefix is resolved with the namespace bindings in scope at `node`; the
+/// unbound prefixes `xs` and `xsd` are taken as the XSD namespace. An
+/// unprefixed name resolves to the default namespace in scope; under an XSD
+/// default namespace, a name that is not a built-in falls back to `target_ns`.
+/// Without a default namespace declaration, an unprefixed name is
+/// `TypeRef::Unqualified`: XSD reads it as `{absent}local`, and whether such
+/// a type exists is only known once every included and imported document is
+/// composed, so it is decided then (`resolve_unqualified_type_refs`).
+/// A name in the XSD namespace becomes `TypeRef::BuiltIn`; an unknown one
+/// stays a `TypeRef::Named` in the XSD namespace, which never resolves.
 pub(super) fn resolve_type_name(
     doc: &Document,
     node: NodeId,
     type_name: &str,
     target_ns: &Option<String>,
 ) -> XmlResult<TypeRef> {
-    // Check for xs: prefix
-    let (prefix, local) = if let Some(colon) = type_name.find(':') {
-        (&type_name[..colon], &type_name[colon + 1..])
-    } else {
-        ("", type_name)
+    let type_name = type_name.trim_matches(is_xml_whitespace);
+    let invalid = type_name.is_empty()
+        || type_name.contains(is_xml_whitespace)
+        || type_name.starts_with(':')
+        || type_name.ends_with(':')
+        || type_name.matches(':').count() > 1;
+    if invalid {
+        return Err(XmlError::validation(format!(
+            "Invalid type QName '{}'",
+            type_name
+        )));
+    }
+    let (prefix, local) = match type_name.find(':') {
+        Some(colon) => (&type_name[..colon], &type_name[colon + 1..]),
+        None => ("", type_name),
     };
+    let in_xs_namespace = |local: &str| match parse_builtin_type(local) {
+        Some(bt) => TypeRef::BuiltIn(bt),
+        None => TypeRef::Named(Some(XS_NAMESPACE.to_string()), local.to_string()),
+    };
+    let resolver = build_resolver_for_node(doc, node);
 
-    let is_builtin = prefix == "xs" || prefix == "xsd";
-
-    if is_builtin {
-        if let Some(bt) = parse_builtin_type(local) {
-            return Ok(TypeRef::BuiltIn(bt));
-        }
-    }
-
-    // Even without an xs:/xsd: prefix, check if the local name matches a built-in type.
-    // This handles schemas where the XSD namespace is the default namespace
-    // (e.g., xmlns="http://www.w3.org/2001/XMLSchema").
-    if prefix.is_empty() {
-        if let Some(bt) = parse_builtin_type(local) {
-            return Ok(TypeRef::BuiltIn(bt));
-        }
-    }
-
-    // Named type reference
-    if is_builtin {
-        Ok(TypeRef::Named(
-            Some(XS_NAMESPACE.to_string()),
-            local.to_string(),
-        ))
-    } else if prefix.is_empty() {
-        Ok(TypeRef::Named(target_ns.clone(), local.to_string()))
-    } else {
-        let resolver = build_resolver_for_node(doc, node);
-        let ns_uri = resolver.resolve(prefix).ok_or_else(|| {
-            XmlError::validation(format!(
+    if !prefix.is_empty() {
+        return match resolver.resolve(prefix) {
+            Some(ns_uri) if ns_uri.as_ref() == XS_NAMESPACE => Ok(in_xs_namespace(local)),
+            Some(ns_uri) => Ok(TypeRef::Named(Some(ns_uri.to_string()), local.to_string())),
+            None if prefix == "xs" || prefix == "xsd" => Ok(in_xs_namespace(local)),
+            None => Err(XmlError::validation(format!(
                 "Undeclared namespace prefix '{}' in type QName '{}'",
                 prefix, type_name
-            ))
-        })?;
-        if ns_uri.as_ref() == XS_NAMESPACE {
-            if let Some(bt) = parse_builtin_type(local) {
-                return Ok(TypeRef::BuiltIn(bt));
-            }
-        }
-        Ok(TypeRef::Named(Some(ns_uri.to_string()), local.to_string()))
+            ))),
+        };
     }
+
+    match resolver.resolve_default() {
+        // Schemas written with the XSD namespace as the default namespace
+        // commonly reference their own no-prefix types the same way; such a
+        // name that is not a built-in falls back to `target_ns`.
+        Some(ns_uri) if ns_uri.as_ref() == XS_NAMESPACE => Ok(match parse_builtin_type(local) {
+            Some(bt) => TypeRef::BuiltIn(bt),
+            None => TypeRef::Named(target_ns.clone(), local.to_string()),
+        }),
+        Some(ns_uri) => Ok(TypeRef::Named(Some(ns_uri.to_string()), local.to_string())),
+        None => Ok(TypeRef::Unqualified(Box::new(UnqualifiedTypeName {
+            absent_ns: None,
+            target_ns: target_ns.clone(),
+            local: local.to_string(),
+        }))),
+    }
+}
+
+/// XML whitespace (space, tab, carriage return, line feed).
+fn is_xml_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
 }
 
 /// Map a local type name to the corresponding `BuiltInType` variant.
@@ -437,6 +455,7 @@ pub(super) fn parse_complex_type(
     let mut attributes = Vec::new();
     let mut attribute_wildcard: Option<AttributeWildcard> = None;
     let mut base_type: Option<(Option<String>, String)> = None;
+    let mut unqualified_base = None;
     let mut derived_by_extension: Option<bool> = None;
     let mut group_ref: Option<(Option<String>, String)> = None;
     let mut attribute_group_refs: Vec<(Option<String>, String)> = Vec::new();
@@ -582,8 +601,23 @@ pub(super) fn parse_complex_type(
                                             base,
                                             schema_target_ns,
                                         )?;
-                                        if let TypeRef::Named(ns, ln) = &base_ref {
-                                            base_type = Some((ns.clone(), ln.clone()));
+                                        match &base_ref {
+                                            TypeRef::Named(ns, ln) => {
+                                                base_type = Some((ns.clone(), ln.clone()));
+                                            }
+                                            // Decided after composition. Until
+                                            // then `base_type` is the target
+                                            // namespace reading, which
+                                            // `xs:redefine` compares with the
+                                            // redefined name.
+                                            TypeRef::Unqualified(name) => {
+                                                base_type = Some((
+                                                    name.target_ns.clone(),
+                                                    name.local.clone(),
+                                                ));
+                                                unqualified_base = Some(name.clone());
+                                            }
+                                            _ => {}
                                         }
                                         content = ContentModel::SimpleContent(Box::new(base_ref));
                                     }
@@ -740,6 +774,7 @@ pub(super) fn parse_complex_type(
         block_restriction: block_rst,
         group_ref,
         attribute_group_refs,
+        unqualified_base,
     }))
 }
 
@@ -821,6 +856,10 @@ pub(super) fn parse_attribute_group_def(
                             // local overrides for use/required
                             let mut attr = global_attr.clone();
                             attr.is_ref = true;
+                            // A fixed value on the use overrides the declaration's.
+                            if let Some(fixed) = child_elem.get_attribute("fixed") {
+                                attr.fixed = Some(fixed.to_string());
+                            }
                             if child_elem.get_attribute("use") == Some("required") {
                                 attr.required = true;
                             } else if child_elem.get_attribute("use") == Some("prohibited") {
@@ -837,6 +876,7 @@ pub(super) fn parse_attribute_group_def(
                                 type_ref: TypeRef::BuiltIn(BuiltInType::String),
                                 required,
                                 default: None,
+                                fixed: child_elem.get_attribute("fixed").map(|s| s.to_string()),
                                 prohibited,
                                 is_ref: true,
                                 qualified: false,
@@ -1251,7 +1291,7 @@ fn parse_attribute_decl(
     };
 
     let type_ref = if let Some(type_name) = elem.get_attribute("type") {
-        resolve_type_name(doc, node, type_name, &None)?
+        resolve_type_name(doc, node, type_name, schema_target_ns)?
     } else {
         // Check for inline simpleType child
         let mut found_inline = None;
@@ -1272,6 +1312,7 @@ fn parse_attribute_decl(
     let required = elem.get_attribute("use") == Some("required");
     let prohibited = elem.get_attribute("use") == Some("prohibited");
     let default = elem.get_attribute("default").map(|s| s.to_string());
+    let fixed = elem.get_attribute("fixed").map(|s| s.to_string());
 
     Ok(AttributeDecl {
         name,
@@ -1279,6 +1320,7 @@ fn parse_attribute_decl(
         type_ref,
         required,
         default,
+        fixed,
         prohibited,
         is_ref,
         qualified,
@@ -1294,6 +1336,11 @@ fn parse_attribute_decl(
 /// - All facets: length, minLength, maxLength, pattern, enumeration, min/maxInclusive,
 ///   min/maxExclusive, totalDigits, fractionDigits, whiteSpace
 /// - Derived list types: NMTOKENS, IDREFS, ENTITIES
+/// - `<xs:union memberTypes="...">` and anonymous `<xs:simpleType>` members
+///
+/// A user-defined base, item or member type is recorded as a `TypeRef` whose
+/// QName is resolved with the prefix bindings in scope here (unprefixed names
+/// take the schema's target namespace, as in `resolve_type_name`).
 pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeDef> {
     let elem = doc
         .element(node)
@@ -1307,6 +1354,11 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
     let mut item_type_local: Option<String> = None;
     // Store the non-builtin base type local name for later resolution
     let mut base_type_local: Option<String> = None;
+    let mut base_ref: Option<TypeRef> = None;
+    let mut item_ref: Option<TypeRef> = None;
+    let mut union_members: Option<Vec<TypeRef>> = None;
+    let mut fixed_facets = Vec::new();
+    let target_ns = schema_target_namespace(doc, node);
 
     for child in doc.children(node) {
         if let Some(NodeKind::Element(child_elem)) = doc.node_kind(child) {
@@ -1314,142 +1366,85 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
                 // This is a list type
                 is_list = true;
                 if let Some(item_type_name) = child_elem.get_attribute("itemType") {
-                    let (_prefix, local) = if let Some(colon) = item_type_name.find(':') {
-                        (&item_type_name[..colon], &item_type_name[colon + 1..])
-                    } else {
-                        ("", item_type_name)
-                    };
-                    item_type = parse_builtin_type(local);
-                    if item_type.is_none() {
-                        // User-defined item type — store name for later resolution
-                        item_type = Some(BuiltInType::String);
-                        item_type_local = Some(local.to_string());
+                    match resolve_type_name(doc, child, item_type_name, &target_ns)? {
+                        TypeRef::BuiltIn(bt) => item_type = Some(bt),
+                        user_type => {
+                            // User-defined item type — store name for later resolution
+                            item_type = Some(BuiltInType::String);
+                            item_type_local = Some(strip_prefix(item_type_name).to_string());
+                            item_ref = Some(user_type);
+                        }
+                    }
+                } else if let Some(inline) = first_xs_simple_type_child(doc, child) {
+                    item_ref = Some(TypeRef::Inline(Box::new(parse_simple_type(doc, inline)?)));
+                } else {
+                    return Err(XmlError::validation(
+                        "xs:list needs an itemType attribute or a simpleType child",
+                    ));
+                }
+            } else if child_elem.name.local_name == "union" {
+                let mut members = Vec::new();
+                if let Some(member_names) = child_elem.get_attribute("memberTypes") {
+                    for member_name in split_xml_whitespace(member_names) {
+                        members.push(resolve_type_name(doc, child, member_name, &target_ns)?);
                     }
                 }
+                for member in doc.children(child) {
+                    if is_xs_simple_type(doc, member) {
+                        members.push(TypeRef::Inline(Box::new(parse_simple_type(doc, member)?)));
+                    }
+                }
+                if members.is_empty() {
+                    return Err(XmlError::validation(
+                        "xs:union needs memberTypes or at least one simpleType child",
+                    ));
+                }
+                union_members = Some(members);
             } else if child_elem.name.local_name == "restriction" {
                 if let Some(base_name) = child_elem.get_attribute("base") {
-                    let (prefix, local) = if let Some(colon) = base_name.find(':') {
-                        (&base_name[..colon], &base_name[colon + 1..])
-                    } else {
-                        ("", base_name)
-                    };
-                    if prefix == "xs" || prefix == "xsd" {
-                        // Explicitly XSD-prefixed: always a built-in type
-                        if matches!(local, "NMTOKENS" | "IDREFS" | "ENTITIES") {
-                            is_list = true;
-                            item_type = match local {
-                                "NMTOKENS" => Some(BuiltInType::NMTOKEN),
-                                "IDREFS" => Some(BuiltInType::IDREF),
-                                "ENTITIES" => Some(BuiltInType::ENTITY),
-                                _ => None,
-                            };
-                        }
-                        base = parse_builtin_type(local).unwrap_or(BuiltInType::String);
-                    } else if prefix.is_empty() {
-                        // Unprefixed: try built-in first, fall back to user-defined
-                        if matches!(local, "NMTOKENS" | "IDREFS" | "ENTITIES") {
-                            is_list = true;
-                            item_type = match local {
-                                "NMTOKENS" => Some(BuiltInType::NMTOKEN),
-                                "IDREFS" => Some(BuiltInType::IDREF),
-                                "ENTITIES" => Some(BuiltInType::ENTITY),
-                                _ => None,
-                            };
-                            base = parse_builtin_type(local).unwrap_or(BuiltInType::String);
-                        } else if let Some(bt) = parse_builtin_type(local) {
-                            base = bt;
-                        } else {
-                            // Not a built-in type — user-defined type
-                            base_type_local = Some(local.to_string());
-                        }
-                    } else {
-                        // Non-builtin base type — store for later resolution
-                        base_type_local = Some(local.to_string());
-                    }
-                } else {
-                    // No base attribute — check for inline <simpleType> child as base type
-                    for inner_child in doc.children(child) {
-                        if let Some(NodeKind::Element(inner_elem)) = doc.node_kind(inner_child) {
-                            let inner_is_xs = inner_elem.name.namespace_uri.as_deref()
-                                == Some(XS_NAMESPACE)
-                                || inner_elem.name.prefix.as_deref() == Some("xs")
-                                || inner_elem.name.prefix.as_deref() == Some("xsd");
-                            if inner_is_xs && inner_elem.name.local_name == "simpleType" {
-                                if let Ok(TypeDef::Simple(inner_st)) =
-                                    parse_simple_type(doc, inner_child)
-                                {
-                                    base = inner_st.base;
-                                    is_list = inner_st.is_list;
-                                    item_type = inner_st.item_type;
-                                    item_type_local = inner_st._item_type_local.clone();
-                                }
-                                break;
+                    match resolve_type_name(doc, child, base_name, &target_ns)? {
+                        TypeRef::BuiltIn(bt) => {
+                            // The built-in list types restrict as lists.
+                            if let Some(item) = builtin_list_item_type(&bt) {
+                                item_type = Some(item);
+                                is_list = true;
                             }
+                            base = bt;
+                        }
+                        user_type => {
+                            // A user-defined base (or an unknown name in the
+                            // XSD namespace, which the build refuses).
+                            match &user_type {
+                                TypeRef::Named(_, local) => base_type_local = Some(local.clone()),
+                                TypeRef::Unqualified(name) => {
+                                    base_type_local = Some(name.local.clone())
+                                }
+                                _ => {}
+                            }
+                            base_ref = Some(user_type);
                         }
                     }
+                } else if let Some(inner_child) = first_xs_simple_type_child(doc, child) {
+                    // No base attribute: the base is the inline <simpleType> child.
+                    // It is kept whole as a derivation step, so its facets apply.
+                    let inner_td = parse_simple_type(doc, inner_child)?;
+                    if let TypeDef::Simple(inner_st) = &inner_td {
+                        base = inner_st.base.clone();
+                        is_list = inner_st.is_list;
+                        item_type = inner_st.item_type.clone();
+                        item_type_local = inner_st._item_type_local.clone();
+                    }
+                    base_ref = Some(TypeRef::Inline(Box::new(inner_td)));
+                } else {
+                    return Err(XmlError::validation(
+                        "xs:restriction needs a base attribute or a simpleType child",
+                    ));
                 }
 
                 // Parse facets
-                for facet_child in doc.children(child) {
-                    if let Some(NodeKind::Element(facet_elem)) = doc.node_kind(facet_child) {
-                        let value = facet_elem.get_attribute("value").unwrap_or("").to_string();
-
-                        match facet_elem.name.local_name.as_ref() {
-                            "minLength" => {
-                                if let Ok(n) = value.parse() {
-                                    facets.push(Facet::MinLength(n));
-                                }
-                            }
-                            "maxLength" => {
-                                if let Ok(n) = value.parse() {
-                                    facets.push(Facet::MaxLength(n));
-                                }
-                            }
-                            "length" => {
-                                if let Ok(n) = value.parse() {
-                                    facets.push(Facet::Length(n));
-                                }
-                            }
-                            "pattern" => {
-                                facets.push(Facet::Pattern(value));
-                            }
-                            "enumeration" => {
-                                // Collect all enumerations
-                                if let Some(Facet::Enumeration(ref mut vals)) = facets
-                                    .iter_mut()
-                                    .find(|f| matches!(f, Facet::Enumeration(_)))
-                                {
-                                    vals.push(value);
-                                } else {
-                                    facets.push(Facet::Enumeration(vec![value]));
-                                }
-                            }
-                            "minInclusive" => facets.push(Facet::MinInclusive(value)),
-                            "maxInclusive" => facets.push(Facet::MaxInclusive(value)),
-                            "minExclusive" => facets.push(Facet::MinExclusive(value)),
-                            "maxExclusive" => facets.push(Facet::MaxExclusive(value)),
-                            "totalDigits" => {
-                                if let Ok(n) = value.parse() {
-                                    facets.push(Facet::TotalDigits(n));
-                                }
-                            }
-                            "fractionDigits" => {
-                                if let Ok(n) = value.parse() {
-                                    facets.push(Facet::FractionDigits(n));
-                                }
-                            }
-                            "whiteSpace" => {
-                                facets.push(Facet::WhiteSpace(match value.as_str() {
-                                    "preserve" => WhiteSpaceHandling::Preserve,
-                                    "replace" => WhiteSpaceHandling::Replace,
-                                    "collapse" => WhiteSpaceHandling::Collapse,
-                                    _ => WhiteSpaceHandling::Preserve,
-                                }));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                let (step_facets, step_fixed) = parse_facets(doc, child);
+                facets = step_facets;
+                fixed_facets = step_fixed;
             }
         }
     }
@@ -1463,5 +1458,137 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
         item_facets: Vec::new(),
         _base_type_local: base_type_local,
         _item_type_local: item_type_local,
+        base_ref,
+        item_ref,
+        union_members,
+        fixed_facets,
+        union_enumeration: Default::default(),
     }))
+}
+
+/// The item type of a built-in list type (`NMTOKENS`, `IDREFS`, `ENTITIES`),
+/// which restrict as lists.
+pub(super) fn builtin_list_item_type(bt: &BuiltInType) -> Option<BuiltInType> {
+    match bt {
+        BuiltInType::NMTOKENS => Some(BuiltInType::NMTOKEN),
+        BuiltInType::IDREFS => Some(BuiltInType::IDREF),
+        BuiltInType::ENTITIES => Some(BuiltInType::ENTITY),
+        _ => None,
+    }
+}
+
+/// Parse the constraining facets that are children of a `<restriction>`.
+/// Returns the facets and the names of those declared `fixed="true"`.
+/// Enumeration values are collected into one `Facet::Enumeration`.
+pub(super) fn parse_facets(doc: &Document, restriction: NodeId) -> (Vec<Facet>, Vec<&'static str>) {
+    let mut facets = Vec::new();
+    let mut fixed_facets = Vec::new();
+    for facet_child in doc.children(restriction) {
+        let Some(NodeKind::Element(facet_elem)) = doc.node_kind(facet_child) else {
+            continue;
+        };
+        let value = facet_elem.get_attribute("value").unwrap_or("").to_string();
+        let before = facets.len();
+        match facet_elem.name.local_name.as_ref() {
+            "minLength" => {
+                if let Ok(n) = value.trim().parse() {
+                    facets.push(Facet::MinLength(n));
+                }
+            }
+            "maxLength" => {
+                if let Ok(n) = value.trim().parse() {
+                    facets.push(Facet::MaxLength(n));
+                }
+            }
+            "length" => {
+                if let Ok(n) = value.trim().parse() {
+                    facets.push(Facet::Length(n));
+                }
+            }
+            "pattern" => {
+                facets.push(Facet::Pattern(value));
+            }
+            "enumeration" => {
+                // Collect all enumerations
+                if let Some(Facet::Enumeration(ref mut vals)) = facets
+                    .iter_mut()
+                    .find(|f| matches!(f, Facet::Enumeration(_)))
+                {
+                    vals.push(value);
+                } else {
+                    facets.push(Facet::Enumeration(vec![value]));
+                }
+            }
+            "minInclusive" => facets.push(Facet::MinInclusive(value)),
+            "maxInclusive" => facets.push(Facet::MaxInclusive(value)),
+            "minExclusive" => facets.push(Facet::MinExclusive(value)),
+            "maxExclusive" => facets.push(Facet::MaxExclusive(value)),
+            "totalDigits" => {
+                if let Ok(n) = value.trim().parse() {
+                    facets.push(Facet::TotalDigits(n));
+                }
+            }
+            "fractionDigits" => {
+                if let Ok(n) = value.trim().parse() {
+                    facets.push(Facet::FractionDigits(n));
+                }
+            }
+            "whiteSpace" => {
+                facets.push(Facet::WhiteSpace(match value.trim() {
+                    "preserve" => WhiteSpaceHandling::Preserve,
+                    "replace" => WhiteSpaceHandling::Replace,
+                    "collapse" => WhiteSpaceHandling::Collapse,
+                    _ => WhiteSpaceHandling::Preserve,
+                }));
+            }
+            _ => {}
+        }
+        if facets.len() > before
+            && matches!(
+                facet_elem.get_attribute("fixed").map(str::trim),
+                Some("true" | "1")
+            )
+        {
+            if let Some(facet) = facets.last() {
+                fixed_facets.push(facet.name());
+            }
+        }
+    }
+    (facets, fixed_facets)
+}
+
+/// Whether `node` is an `<xs:simpleType>` element.
+fn is_xs_simple_type(doc: &Document, node: NodeId) -> bool {
+    match doc.node_kind(node) {
+        Some(NodeKind::Element(elem)) => {
+            let is_xs = elem.name.namespace_uri.as_deref() == Some(XS_NAMESPACE)
+                || elem.name.prefix.as_deref() == Some("xs")
+                || elem.name.prefix.as_deref() == Some("xsd");
+            is_xs && elem.name.local_name == "simpleType"
+        }
+        _ => false,
+    }
+}
+
+/// The first `<xs:simpleType>` child of `node`, if any.
+fn first_xs_simple_type_child(doc: &Document, node: NodeId) -> Option<NodeId> {
+    doc.children(node)
+        .into_iter()
+        .find(|&c| is_xs_simple_type(doc, c))
+}
+
+/// The `targetNamespace` of the schema document that contains `node`.
+///
+/// Unprefixed type QNames in simple type definitions are qualified with it,
+/// the same convention `resolve_type_name` applies at its other call sites.
+fn schema_target_namespace(doc: &Document, node: NodeId) -> Option<String> {
+    doc.ancestors(node)
+        .into_iter()
+        .find_map(|id| match doc.node_kind(id) {
+            Some(NodeKind::Element(elem)) if elem.name.local_name == "schema" => {
+                Some(elem.get_attribute("targetNamespace").map(|s| s.to_string()))
+            }
+            _ => None,
+        })
+        .flatten()
 }

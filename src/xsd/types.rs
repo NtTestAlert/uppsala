@@ -8,6 +8,7 @@
 //! parsing (builder/parser) through validation.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use super::wildcard::{
     intersect_namespace_constraints, stricter_process_contents, union_namespace_constraints,
@@ -85,8 +86,10 @@ pub(crate) struct ElementDecl {
     pub(super) substitution_group: Option<(Option<String>, String)>,
     /// Whether this element is abstract (cannot appear directly in instances).
     pub(super) is_abstract: bool,
-    /// Fixed value constraint: if set, the element's text content must exactly
-    /// match this string (raw lexical comparison, no whitespace normalization).
+    /// Fixed value constraint. An empty element takes this value; otherwise
+    /// the element's value must equal it: in the value space of the element's
+    /// simple type (after whitespace normalization), or character for
+    /// character for mixed content.
     pub(super) fixed: Option<String>,
     /// Identity constraints declared on this element.
     pub(super) identity_constraints: Vec<IdentityConstraint>,
@@ -135,6 +138,28 @@ pub(crate) enum TypeRef {
     Named(Option<String>, String), // (namespace, local_name)
     Inline(Box<TypeDef>),
     BuiltIn(BuiltInType),
+    /// An unprefixed type QName in a schema document with no default
+    /// namespace declaration. Which type it names depends on the composed
+    /// schema, so it is decided after composition (see
+    /// `resolve_unqualified_type_refs`); no reference of this kind remains in
+    /// a built validator.
+    Unqualified(Box<UnqualifiedTypeName>),
+}
+
+/// An unprefixed type QName read without a default namespace. XSD names it
+/// `{absent}local`, which a chameleon include moves into the including
+/// schema's target namespace (`absent_ns`). As legacy leniencies for schemas
+/// that are invalid under that rule, it may instead name a type of the
+/// schema document's target namespace (`target_ns`) or a built-in type.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UnqualifiedTypeName {
+    /// The namespace of `{absent}local` in the composed schema: no namespace,
+    /// or the including schema's target namespace after a chameleon include.
+    pub(super) absent_ns: Option<String>,
+    /// The target namespace of the schema document the name was read in
+    /// (moved by a chameleon include like `absent_ns`).
+    pub(super) target_ns: Option<String>,
+    pub(super) local: String,
 }
 
 /// A type definition (complex or simple).
@@ -306,6 +331,10 @@ pub(crate) struct ComplexTypeDef {
     /// Unresolved attribute group references (namespace, local_name) from xs:attributeGroup ref.
     /// Used to re-resolve after xs:redefine updates the attribute group definition.
     pub(super) attribute_group_refs: Vec<(Option<String>, String)>,
+    /// A `base` written as an unprefixed QName without a default namespace:
+    /// `base_type` (and a base kept in `content`) is decided after
+    /// composition from this name. `None` once decided.
+    pub(super) unqualified_base: Option<Box<UnqualifiedTypeName>>,
 }
 
 /// Content model for a complex type.
@@ -368,6 +397,11 @@ pub(crate) struct AttributeDecl {
     /// Default value (parsed for spec completeness; not yet enforced during validation).
     #[allow(dead_code)]
     pub(super) default: Option<String>,
+    /// Fixed value constraint: when the attribute is present, its value must
+    /// equal this one in the value space of the attribute's type. For a use
+    /// that references a global declaration (`is_ref`), `None` means the
+    /// global declaration's constraint applies.
+    pub(super) fixed: Option<String>,
     pub(super) prohibited: bool,
     /// Whether this use came from `ref=` (a global attribute reference). Under
     /// chameleon include, ref'd no-namespace attributes move to the including
@@ -400,6 +434,67 @@ pub(crate) struct SimpleTypeDef {
     pub(super) _base_type_local: Option<String>,
     /// Non-builtin item type local name, for resolving in post-processing.
     pub(super) _item_type_local: Option<String>,
+    /// The base of a restriction when it is not a built-in type: a named
+    /// user-defined type (its QName resolved with the prefix bindings in scope
+    /// at the declaration) or an anonymous `<simpleType>` child. `None` when
+    /// the base is the built-in type in `base`. Validation follows this chain
+    /// and checks every step's facets.
+    pub(super) base_ref: Option<TypeRef>,
+    /// For list types whose item type is not a built-in: the named item type
+    /// or the anonymous `<simpleType>` child of `<list>`.
+    pub(super) item_ref: Option<TypeRef>,
+    /// For union types: the member types, in declaration order
+    /// (`memberTypes` first, then anonymous `<simpleType>` children).
+    pub(super) union_members: Option<Vec<TypeRef>>,
+    /// Names of the facets this restriction step declares with
+    /// `fixed="true"` (e.g. `"maxLength"`); a type derived from this one may
+    /// not give them another value.
+    pub(super) fixed_facets: Vec<&'static str>,
+    /// For a restriction step of a union type: the step's enumeration
+    /// literals as the union reads them, filled on first use during
+    /// validation. They do not depend on the instance, so they are read once
+    /// per type, not for every value.
+    pub(super) union_enumeration: OnceLock<UnionEnumeration>,
+}
+
+/// The enumeration literals of a restriction step of a union, each read by
+/// the union like a value, with the validator settings they were read with.
+#[derive(Debug, Clone)]
+pub(crate) struct UnionEnumeration {
+    pub(super) lenient: bool,
+    pub(super) enforce_qname_length_facets: bool,
+    /// One entry per literal, in the order of the facet's values.
+    pub(super) literals: Vec<UnionLiteral>,
+}
+
+/// How a union reads one enumeration literal.
+#[derive(Debug, Clone)]
+pub(crate) enum UnionLiteral {
+    /// The accepting member's normalized value and built-in type.
+    Value(String, BuiltInType),
+    /// No member accepts the literal.
+    Invalid,
+    /// The literal contains `:`; a `QName` member reads a prefix in the
+    /// scope of the element being validated, so it is read for each value.
+    Scoped,
+}
+
+impl SimpleTypeDef {
+    /// The (namespace, local_name) key of a named user-defined base type.
+    pub(super) fn named_base_key(&self) -> Option<(Option<String>, String)> {
+        match &self.base_ref {
+            Some(TypeRef::Named(ns, name)) => Some((ns.clone(), name.clone())),
+            _ => None,
+        }
+    }
+
+    /// The (namespace, local_name) key of a named user-defined list item type.
+    pub(super) fn named_item_key(&self) -> Option<(Option<String>, String)> {
+        match &self.item_ref {
+            Some(TypeRef::Named(ns, name)) => Some((ns.clone(), name.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// Built-in XSD datatypes.
@@ -479,13 +574,33 @@ pub(crate) enum Facet {
     WhiteSpace(#[allow(dead_code)] WhiteSpaceHandling),
 }
 
+impl Facet {
+    /// The facet's name as written in a schema (`"maxLength"`, ...).
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            Facet::MinLength(_) => "minLength",
+            Facet::MaxLength(_) => "maxLength",
+            Facet::Length(_) => "length",
+            Facet::Pattern(_) => "pattern",
+            Facet::Enumeration(_) => "enumeration",
+            Facet::MinInclusive(_) => "minInclusive",
+            Facet::MaxInclusive(_) => "maxInclusive",
+            Facet::MinExclusive(_) => "minExclusive",
+            Facet::MaxExclusive(_) => "maxExclusive",
+            Facet::TotalDigits(_) => "totalDigits",
+            Facet::FractionDigits(_) => "fractionDigits",
+            Facet::WhiteSpace(_) => "whiteSpace",
+        }
+    }
+}
+
 /// Whitespace handling mode for the whiteSpace facet.
 ///
 /// Controls how whitespace in text content is normalized before validation:
 /// - `Preserve`: no normalization
 /// - `Replace`: all whitespace characters replaced with spaces
 /// - `Collapse`: replace + collapse consecutive spaces + trim
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WhiteSpaceHandling {
     Preserve,
     Replace,

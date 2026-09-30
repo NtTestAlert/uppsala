@@ -10,15 +10,16 @@
 //! - xsi:type resolution and type substitution blocking checks
 //! - Substitution group matching for element declarations
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::ValidationError;
 use crate::namespace::build_resolver_for_node;
+use crate::xsd_regex::XsdRegex;
 
 use super::builtins::{
-    apply_whitespace_normalization, validate_builtin_value, validate_facet, validate_list_facet,
-    whitespace_for_type,
+    apply_whitespace_normalization, split_xml_whitespace, trim_xml_whitespace,
+    validate_builtin_value, validate_facet, validate_list_facet, values_equal, whitespace_for_type,
 };
 use super::parser::parse_builtin_type;
 use super::types::*;
@@ -335,6 +336,8 @@ impl XsdValidator {
                 // since you can't name the declared type. Allow it.
                 return true;
             }
+            // Decided at build; never present in a built validator.
+            TypeRef::Unqualified(_) => return false,
         };
 
         // Check if xsi:type IS the declared type
@@ -709,7 +712,7 @@ impl XsdValidator {
                 // (no child elements and no non-whitespace text content)
                 let has_children = self.element_has_child_elements(doc, node);
                 let text = doc.text_content_deep(node);
-                let has_text = !text.trim().is_empty();
+                let has_text = !trim_xml_whitespace(&text).is_empty();
                 if has_children || has_text {
                     errors.push(ValidationError {
                         message: "Element with xsi:nil='true' must have no content".to_string(),
@@ -719,6 +722,28 @@ impl XsdValidator {
                 }
                 // Skip all further content validation — nilled element is valid if empty
                 return;
+            }
+        }
+
+        // An empty element with a fixed value takes that value (XSD 1.0
+        // cvc-elt.5.1.2); the value is validated in place of the empty text.
+        let has_child_elements = self.element_has_child_elements(doc, node);
+        let is_empty = !has_child_elements && doc.text_content_deep(node).is_empty();
+        let supplied = decl.fixed.as_deref().filter(|_| is_empty);
+        if decl.fixed.is_some() {
+            let is_id = self
+                .element_value_type(decl)
+                .is_some_and(|value_type| self.is_id_type(&value_type));
+            if is_id {
+                // e-props-correct.4: an ID-typed element has no value constraint.
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has type ID and cannot have a fixed value",
+                        decl.name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
             }
         }
 
@@ -751,7 +776,10 @@ impl XsdValidator {
                             });
                             return;
                         }
-                        let text = doc.text_content_deep(node);
+                        let text = match supplied {
+                            Some(text) => text.to_string(),
+                            None => doc.text_content_deep(node),
+                        };
                         validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
                     }
                     return;
@@ -816,7 +844,7 @@ impl XsdValidator {
                                 });
                                 return;
                             }
-                            self.validate_simple_content(doc, node, &st, errors);
+                            self.validate_simple_content(doc, node, &st, supplied, errors);
                         }
                     }
                     return;
@@ -854,7 +882,7 @@ impl XsdValidator {
                         column: Some(doc.node_column(node)),
                     });
                 }
-                self.validate_simple_content(doc, node, st, errors);
+                self.validate_simple_content(doc, node, st, supplied, errors);
             }
             None => {
                 // If type can't be resolved, check if it's a built-in
@@ -873,15 +901,18 @@ impl XsdValidator {
                                     .map(|e| &*e.name.local_name)
                                     .unwrap_or("?");
                                 errors.push(ValidationError {
-                                message: format!(
-                                    "Element '{}' has simple type '{:?}' but contains child elements",
-                                    elem_name, bt
-                                ),
-                                line: Some(doc.node_line(node)),
-                                column: Some(doc.node_column(node)),
-                            });
+                                    message: format!(
+                                        "Element '{}' has simple type '{:?}' but contains child elements",
+                                        elem_name, bt
+                                    ),
+                                    line: Some(doc.node_line(node)),
+                                    column: Some(doc.node_column(node)),
+                                });
                             }
-                            let text = doc.text_content_deep(node);
+                            let text = match supplied {
+                                Some(text) => text.to_string(),
+                                None => doc.text_content_deep(node),
+                            };
                             validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
                         }
                     },
@@ -896,15 +927,43 @@ impl XsdValidator {
                             column: Some(doc.node_column(node)),
                         });
                     }
+                    // Decided at build; never present in a built validator.
+                    TypeRef::Unqualified(name) => errors.push(ValidationError {
+                        message: format!("Type '{}' not found", name.local),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    }),
                     TypeRef::Inline(_) => {}
                 }
             }
         }
 
-        // Check fixed-value constraint (raw lexical comparison, no whitespace normalization)
-        if let Some(ref fixed_value) = decl.fixed {
+        // Check the fixed-value constraint of a non-empty element
+        // (cvc-elt.5.2.2). The element must have no element children
+        // (5.2.2.1), whatever its content type, mixed included; then its
+        // text is compared by value with the fixed value, read in the
+        // declared type, or character for character for mixed content
+        // (5.2.2.2); see `element_matches_fixed_value`.
+        if let Some(ref fixed_value) = decl.fixed.as_ref().filter(|_| has_child_elements) {
+            errors.push(ValidationError {
+                message: format!(
+                    "Element '{}' has fixed value '{}' but contains child elements",
+                    decl.name, fixed_value
+                ),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
+        } else if let Some(ref fixed_value) = decl.fixed.as_ref().filter(|_| !is_empty) {
             let text = doc.text_content_deep(node);
-            if text != *fixed_value {
+            let matches = self.element_matches_fixed_value(
+                &text,
+                fixed_value,
+                &decl.type_ref,
+                &decl.type_ref,
+                doc,
+                node,
+            );
+            if !matches {
                 errors.push(ValidationError {
                     message: format!(
                         "Element '{}' has fixed value '{}' but content is '{}'",
@@ -934,7 +993,7 @@ impl XsdValidator {
                 self.types.get(&key)
             }
             TypeRef::Inline(td) => Some(td.as_ref()),
-            TypeRef::BuiltIn(_) => None,
+            TypeRef::BuiltIn(_) | TypeRef::Unqualified(_) => None,
         }
     }
 
@@ -1047,13 +1106,26 @@ impl XsdValidator {
                     .find(|a| attr_decl_matches(a, attr_decl))
                 {
                     let value = &attr.value;
+                    let (type_ref, fixed) = self.effective_attribute_use(attr_decl);
                     debug_log!(
                         "validating attr {}={} against {:?}",
                         attr_decl.name,
                         value,
-                        attr_decl.type_ref
+                        type_ref
                     );
-                    self.validate_attribute_value(value, &attr_decl.type_ref, doc, node, errors);
+                    let start = errors.len();
+                    self.validate_attribute_value(value, type_ref, doc, node, errors);
+                    if errors.len() == start {
+                        self.check_attribute_fixed_value(
+                            &attr_decl.name,
+                            value,
+                            type_ref,
+                            fixed,
+                            doc,
+                            node,
+                            errors,
+                        );
+                    }
                 }
             }
 
@@ -1112,6 +1184,7 @@ impl XsdValidator {
                             match global_decl {
                                 Some(decl) => {
                                     // Validate attribute value against its declared type
+                                    let start = errors.len();
                                     self.validate_attribute_value(
                                         &attr.value,
                                         &decl.type_ref,
@@ -1119,6 +1192,17 @@ impl XsdValidator {
                                         node,
                                         errors,
                                     );
+                                    if errors.len() == start {
+                                        self.check_attribute_fixed_value(
+                                            &decl.name,
+                                            &attr.value,
+                                            &decl.type_ref,
+                                            decl.fixed.as_deref(),
+                                            doc,
+                                            node,
+                                            errors,
+                                        );
+                                    }
                                 }
                                 None => {
                                     // For strict: must find a declaration
@@ -1188,7 +1272,7 @@ impl XsdValidator {
             if is_element_only {
                 for child in doc.children(node) {
                     if let Some(text) = doc.text_content(child) {
-                        if !text.trim().is_empty() {
+                        if !trim_xml_whitespace(text).is_empty() {
                             errors.push(ValidationError {
                                 message:
                                     "Non-whitespace text content is not allowed in element-only content"
@@ -1242,7 +1326,7 @@ impl XsdValidator {
                 // Check no text content (unless mixed)
                 if !ct.mixed {
                     let text = doc.text_content_deep(node);
-                    let trimmed = text.trim();
+                    let trimmed = trim_xml_whitespace(&text);
                     if !trimmed.is_empty() {
                         errors.push(ValidationError {
                             message: "Element should have empty content but contains text"
@@ -1315,7 +1399,7 @@ impl XsdValidator {
                         if let Some(type_def) = self.types.get(&key) {
                             match type_def {
                                 TypeDef::Simple(st) => {
-                                    self.validate_simple_content(doc, node, st, errors);
+                                    self.validate_simple_content(doc, node, st, None, errors);
                                 }
                                 TypeDef::Complex(_) => {
                                     // Complex base type for simpleContent — text validated against
@@ -1326,9 +1410,11 @@ impl XsdValidator {
                     }
                     TypeRef::Inline(inner_type_def) => {
                         if let TypeDef::Simple(st) = inner_type_def.as_ref() {
-                            self.validate_simple_content(doc, node, st, errors);
+                            self.validate_simple_content(doc, node, st, None, errors);
                         }
                     }
+                    // Decided at build; never present in a built validator.
+                    TypeRef::Unqualified(_) => {}
                 }
             }
             ContentModel::Any => {
@@ -2055,71 +2141,28 @@ impl XsdValidator {
 
     /// Validate simple (text) content of an element against a simple type definition.
     ///
-    /// Handles both list types (whitespace-separated items validated individually)
-    /// and atomic types. Applies XSD whiteSpace normalization before validation.
+    /// `text` replaces the element's text when given (an empty element with a
+    /// fixed value takes that value). See [`XsdValidator::validate_simple_value`]
+    /// for the derivation-chain, list and union semantics.
     fn validate_simple_content(
         &self,
         doc: &Document,
         node: NodeId,
         st: &SimpleTypeDef,
+        text: Option<&str>,
         errors: &mut Vec<ValidationError>,
     ) {
-        let raw_text = doc.text_content_deep(node);
-        // Apply XSD whiteSpace normalization before any validation.
-        let ws_mode = whitespace_for_type(&st.base);
-        let text = apply_whitespace_normalization(&raw_text, &ws_mode);
-
-        if st.is_list {
-            // List type: value is whitespace-separated items
-            let items: Vec<&str> = text.split_whitespace().collect();
-
-            // Validate each item against the item type
-            if let Some(ref item_bt) = st.item_type {
-                for item in &items {
-                    validate_builtin_value(item, item_bt, doc, node, errors, self.lenient);
-                    // Also validate item-level facets (from user-defined item types)
-                    for facet in &st.item_facets {
-                        validate_facet(
-                            item,
-                            facet,
-                            item_bt,
-                            doc,
-                            node,
-                            errors,
-                            self.enforce_qname_length_facets,
-                        );
-                    }
-                }
-            }
-
-            // Validate list-level facets (length counts items, not chars)
-            for facet in &st.facets {
-                validate_list_facet(&items, facet, &text, doc, node, errors);
-            }
-        } else {
-            validate_builtin_value(&text, &st.base, doc, node, errors, self.lenient);
-
-            // Validate facets
-            for facet in &st.facets {
-                validate_facet(
-                    &text,
-                    facet,
-                    &st.base,
-                    doc,
-                    node,
-                    errors,
-                    self.enforce_qname_length_facets,
-                );
+        match text {
+            Some(text) => self.validate_simple_value(text, st, doc, node, errors),
+            None => {
+                let raw_text = doc.text_content_deep(node);
+                self.validate_simple_value(&raw_text, st, doc, node, errors);
             }
         }
     }
 
-    /// Validate an attribute value against its declared type reference.
-    ///
-    /// Handles all three forms of type references:
-    /// - `BuiltIn` → validate directly against the built-in type
-    /// - `Inline` → resolve to simple type and validate with facets
-    /// - `Named` → look up in schema types map and validate
+    /// Validate an attribute value against its declared type reference
+    /// (built-in, anonymous or named simple type).
     fn validate_attribute_value(
         &self,
         value: &str,
@@ -2128,127 +2171,725 @@ impl XsdValidator {
         node: NodeId,
         errors: &mut Vec<ValidationError>,
     ) {
-        match type_ref {
-            TypeRef::BuiltIn(bt) => {
-                validate_builtin_value(value, bt, doc, node, errors, self.lenient);
-            }
-            TypeRef::Inline(td) => {
-                match td.as_ref() {
-                    TypeDef::Simple(st) => {
-                        if st.is_list {
-                            let items: Vec<&str> = value.split_whitespace().collect();
-                            if let Some(ref item_bt) = st.item_type {
-                                for item in &items {
-                                    validate_builtin_value(
-                                        item,
-                                        item_bt,
-                                        doc,
-                                        node,
-                                        errors,
-                                        self.lenient,
-                                    );
-                                    for facet in &st.item_facets {
-                                        validate_facet(
-                                            item,
-                                            facet,
-                                            item_bt,
-                                            doc,
-                                            node,
-                                            errors,
-                                            self.enforce_qname_length_facets,
-                                        );
-                                    }
-                                }
-                            }
-                            for facet in &st.facets {
-                                validate_list_facet(&items, facet, value, doc, node, errors);
-                            }
-                        } else {
-                            validate_builtin_value(
-                                value,
-                                &st.base,
-                                doc,
-                                node,
-                                errors,
-                                self.lenient,
-                            );
-                            for facet in &st.facets {
-                                validate_facet(
-                                    value,
-                                    facet,
-                                    &st.base,
-                                    doc,
-                                    node,
-                                    errors,
-                                    self.enforce_qname_length_facets,
-                                );
-                            }
-                        }
-                    }
-                    TypeDef::Complex(_) => {
-                        // Attributes shouldn't have complex types
-                    }
-                }
-            }
-            TypeRef::Named(ns, name) => {
-                // Try to resolve the named type
-                let key = (ns.clone(), name.clone());
-                debug_log!(
-                    "validate_attribute_value Named key={:?} found={}",
-                    key,
-                    self.types.contains_key(&key)
+        debug_log!("validate_attribute_value type_ref={:?}", type_ref);
+        self.check_type_ref_value(value, type_ref, doc, node, errors, 0, &mut UnionMemo::new());
+    }
+
+    /// The type and fixed value that govern an attribute use. A use that
+    /// references a global attribute declaration takes that declaration's
+    /// type, and its fixed value unless the use sets its own.
+    fn effective_attribute_use<'a>(
+        &'a self,
+        decl: &'a AttributeDecl,
+    ) -> (&'a TypeRef, Option<&'a str>) {
+        if decl.is_ref {
+            let key = (decl.namespace.clone(), decl.name.clone());
+            if let Some(global) = self.global_attributes.get(&key) {
+                return (
+                    &global.type_ref,
+                    decl.fixed.as_deref().or(global.fixed.as_deref()),
                 );
-                if let Some(TypeDef::Simple(st)) = self.types.get(&key) {
-                    debug_log!("SimpleTypeDef base={:?} facets={:?}", st.base, st.facets);
-                    if st.is_list {
-                        let items: Vec<&str> = value.split_whitespace().collect();
-                        if let Some(ref item_bt) = st.item_type {
-                            for item in &items {
-                                validate_builtin_value(
-                                    item,
-                                    item_bt,
-                                    doc,
-                                    node,
-                                    errors,
-                                    self.lenient,
-                                );
-                                for facet in &st.item_facets {
-                                    validate_facet(
-                                        item,
-                                        facet,
-                                        item_bt,
-                                        doc,
-                                        node,
-                                        errors,
-                                        self.enforce_qname_length_facets,
-                                    );
-                                }
-                            }
-                        }
-                        for facet in &st.facets {
-                            validate_list_facet(&items, facet, value, doc, node, errors);
-                        }
-                    } else {
-                        validate_builtin_value(value, &st.base, doc, node, errors, self.lenient);
-                        for facet in &st.facets {
-                            validate_facet(
-                                value,
-                                facet,
-                                &st.base,
-                                doc,
-                                node,
-                                errors,
-                                self.enforce_qname_length_facets,
-                            );
-                        }
-                    }
-                } else if ns.as_deref() == Some(XS_NAMESPACE) {
-                    // It's a built-in XSD type
-                    if let Some(bt) = parse_builtin_type(name) {
-                        validate_builtin_value(value, &bt, doc, node, errors, self.lenient);
-                    }
-                }
             }
         }
+        (&decl.type_ref, decl.fixed.as_deref())
+    }
+
+    /// Whether `value` equals the fixed value `fixed` as values of `type_ref`:
+    /// both are whitespace-normalized and read by the type (for a union, by
+    /// the member that accepts each), then compared as values. An invalid
+    /// value never matches.
+    fn matches_fixed_value(
+        &self,
+        value: &str,
+        fixed: &str,
+        type_ref: &TypeRef,
+        doc: &Document,
+        node: NodeId,
+    ) -> bool {
+        let mut scratch = Vec::new();
+        let mut memo = UnionMemo::new();
+        let actual =
+            self.check_type_ref_value(value, type_ref, doc, node, &mut scratch, 0, &mut memo);
+        let expected =
+            self.check_type_ref_value(fixed, type_ref, doc, node, &mut scratch, 0, &mut memo);
+        match (actual, expected) {
+            (Some((a, a_type)), Some((b, b_type))) => values_equal(&a, &a_type, &b, &b_type),
+            _ => false,
+        }
+    }
+
+    /// Whether a non-empty element's text `value` equals its declaration's
+    /// fixed value `fixed` (cvc-elt.5.2.2.2).
+    ///
+    /// The two are read in different types. The fixed value is the
+    /// declaration's value constraint, a value of the **declared** type
+    /// (XSD 1.0 Part 1 §3.3.1, {value constraint}), so its literal is
+    /// normalized and read in `declared`. The element's value is read in
+    /// the **actual** type, `actual` (the `xsi:type` type when one applies,
+    /// cvc-elt.5.2.2.2.2). A type validly derived from the declared type
+    /// shares its primitive, so the two compare by value: under `xs:token`
+    /// the text `1` is not the `xs:string` fixed value ` 1 `.
+    ///
+    /// When the declared type is `xs:anySimpleType`, the literal's value is
+    /// indeterminate: it may map to values of several primitives, and which
+    /// one is meant is not decided (XSD 1.1 Part 2 §3.2.1). An `xsi:type`
+    /// chooses the reading of an element's content, not of a schema's
+    /// literal, so only the lexical form is compared: the element's value,
+    /// normalized by the actual type, must equal the literal character for
+    /// character. When the declared type is not a
+    /// simple type and has no simple content (`xs:anyType`, which includes
+    /// a declaration without a type, or any mixed type), the fixed value is
+    /// an `xs:string` (XSD 1.0 Part 1 §3.3.2, {value constraint}), so only
+    /// an actual type derived from `xs:string` can match it. When the actual
+    /// type has mixed content, text and literal are compared character for
+    /// character (cvc-elt.5.2.2.2.1). An invalid text or literal never
+    /// matches.
+    fn element_matches_fixed_value(
+        &self,
+        value: &str,
+        fixed: &str,
+        declared: &TypeRef,
+        actual: &TypeRef,
+        doc: &Document,
+        node: NodeId,
+    ) -> bool {
+        let Some(actual_value_type) = self.value_type_of(actual) else {
+            return value == fixed;
+        };
+        let mut scratch = Vec::new();
+        let mut memo = UnionMemo::new();
+        let Some((item, item_type)) = self.check_type_ref_value(
+            value,
+            &actual_value_type,
+            doc,
+            node,
+            &mut scratch,
+            0,
+            &mut memo,
+        ) else {
+            return false;
+        };
+        let read_literal_in = |type_ref: &TypeRef, memo: &mut UnionMemo| {
+            self.check_type_ref_value(fixed, type_ref, doc, node, &mut Vec::new(), 0, memo)
+        };
+        let constraint = match self.value_type_of(declared) {
+            Some(declared_value_type) => match read_literal_in(&declared_value_type, &mut memo) {
+                Some((_, BuiltInType::AnySimpleType)) => return item == fixed,
+                other => other,
+            },
+            None => Some((fixed.to_string(), BuiltInType::String)),
+        };
+        match constraint {
+            Some((literal, literal_type)) => {
+                values_equal(&item, &item_type, &literal, &literal_type)
+            }
+            None => false,
+        }
+    }
+
+    /// Check a present attribute against the fixed value of its use, if any.
+    #[allow(clippy::too_many_arguments)]
+    fn check_attribute_fixed_value(
+        &self,
+        attr_name: &str,
+        value: &str,
+        type_ref: &TypeRef,
+        fixed: Option<&str>,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Some(fixed) = fixed {
+            if self.is_id_type(type_ref) {
+                // a-props-correct.3: an ID-typed attribute has no value constraint.
+                errors.push(ValidationError {
+                    message: format!(
+                        "Attribute '{}' has type ID and cannot have a fixed value",
+                        attr_name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            } else if !self.matches_fixed_value(value, fixed, type_ref, doc, node) {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Attribute '{}' has fixed value '{}' but its value is '{}'",
+                        attr_name, fixed, value
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            }
+        }
+    }
+
+    /// Whether a simple type is `xs:ID` or restricts it.
+    fn is_id_type(&self, type_ref: &TypeRef) -> bool {
+        let st = match type_ref {
+            TypeRef::BuiltIn(bt) => return *bt == BuiltInType::ID,
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(st) => st,
+                TypeDef::Complex(_) => return false,
+            },
+            TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
+                Some(TypeDef::Simple(st)) => st,
+                Some(TypeDef::Complex(_)) => return false,
+                None => {
+                    return ns.as_deref() == Some(XS_NAMESPACE)
+                        && parse_builtin_type(name) == Some(BuiltInType::ID)
+                }
+            },
+            TypeRef::Unqualified(_) => return false,
+        };
+        self.simple_type_chain(st).is_ok_and(|chain| {
+            let root = chain[chain.len() - 1];
+            root.union_members.is_none() && !root.is_list && root.base == BuiltInType::ID
+        })
+    }
+
+    /// The simple type an element's value is read with, for comparing it
+    /// with the element's fixed value; `None` when the element has mixed,
+    /// element-only or empty content (compared character for character).
+    fn element_value_type(&self, decl: &ElementDecl) -> Option<TypeRef> {
+        self.value_type_of(&decl.type_ref)
+    }
+
+    /// The simple type a value of `type_ref` is read with; see
+    /// [`XsdValidator::element_value_type`].
+    fn value_type_of(&self, type_ref: &TypeRef) -> Option<TypeRef> {
+        match type_ref {
+            TypeRef::BuiltIn(BuiltInType::AnyType) => None,
+            TypeRef::BuiltIn(_) => Some(type_ref.clone()),
+            _ => match self.resolve_type(type_ref)? {
+                TypeDef::Simple(_) => Some(type_ref.clone()),
+                TypeDef::Complex(_) => None,
+            },
+        }
+    }
+
+    /// Validate a value against a simple type, following its whole derivation chain.
+    ///
+    /// XSD 1.0 Part 2 semantics:
+    /// - an atomic value must be valid for the built-in type at the root of the
+    ///   chain and satisfy the facets of **every** restriction step; range facets
+    ///   compare in the root type's value space (dates, decimals, integers);
+    /// - within one step, `pattern` facets are alternatives (ORed); across steps
+    ///   they all apply (ANDed);
+    /// - the `whiteSpace` facet of the most-derived step that sets one applies,
+    ///   otherwise the root built-in type's whitespace handling; a step's
+    ///   enumeration literals are values of that step's base type, so they are
+    ///   normalized with the mode in effect for the base (not the most-derived
+    ///   one), then compared with the value as values;
+    /// - a list splits the collapsed value into items, validates each item
+    ///   against the item type and applies each step's list facets;
+    /// - a union accepts the value if any member type accepts it, tried in
+    ///   declaration order; `pattern`/`enumeration` facets of restrictions of the
+    ///   union then apply to the value as the accepting member normalized it.
+    fn validate_simple_value(
+        &self,
+        value: &str,
+        st: &SimpleTypeDef,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        self.check_simple_value(value, st, doc, node, errors, 0, &mut UnionMemo::new());
+    }
+
+    /// Validate `value` against `st`, pushing errors. On success returns the
+    /// value as normalized by the type and the built-in type whose value space
+    /// it belongs to (used to apply union facets). `memo` caches which member
+    /// of a union accepts a value, so that unions sharing members are
+    /// validated in time linear in the number of distinct types.
+    #[allow(clippy::too_many_arguments)]
+    fn check_simple_value(
+        &self,
+        value: &str,
+        st: &SimpleTypeDef,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+        depth: usize,
+        memo: &mut UnionMemo,
+    ) -> Option<(String, BuiltInType)> {
+        let error = |message: String| ValidationError {
+            message,
+            line: Some(doc.node_line(node)),
+            column: Some(doc.node_column(node)),
+        };
+        if depth > MAX_SIMPLE_TYPE_DEPTH {
+            errors.push(error(format!(
+                "Simple type nesting deeper than {} levels",
+                MAX_SIMPLE_TYPE_DEPTH
+            )));
+            return None;
+        }
+        let chain = match self.simple_type_chain(st) {
+            Ok(chain) => chain,
+            Err(message) => {
+                errors.push(error(message));
+                return None;
+            }
+        };
+        let root = chain[chain.len() - 1];
+        let start = errors.len();
+
+        let (normalized, value_type) = if root.union_members.is_some() {
+            let Some((normalized, member_type)) =
+                self.union_member_value(value, root, doc, node, depth, memo)
+            else {
+                errors.push(error(format!(
+                    "Value '{}' does not match any member type of the union",
+                    value
+                )));
+                return None;
+            };
+            for step in &chain {
+                self.validate_step_facets(
+                    &normalized,
+                    &step.facets,
+                    FacetTarget::Union(&member_type, root, step),
+                    doc,
+                    node,
+                    errors,
+                    depth,
+                    memo,
+                );
+            }
+            (normalized, member_type)
+        } else if root.is_list {
+            let normalized = apply_whitespace_normalization(value, &WhiteSpaceHandling::Collapse);
+            let items: Vec<&str> = split_xml_whitespace(&normalized).collect();
+            if let Some(item_ref) = &root.item_ref {
+                // User-defined or anonymous item type: validate each item
+                // against the whole item type (its chain, a union, ...).
+                for item in &items {
+                    self.check_type_ref_value(item, item_ref, doc, node, errors, depth + 1, memo);
+                }
+            } else if let Some((item_bt, item_facets)) = [st, root]
+                .into_iter()
+                .find_map(|s| s.item_type.as_ref().map(|bt| (bt, &s.item_facets)))
+            {
+                for item in &items {
+                    validate_builtin_value(item, item_bt, doc, node, errors, self.lenient);
+                    // Also validate item-level facets (from user-defined item types)
+                    for facet in item_facets {
+                        validate_facet(
+                            item,
+                            facet,
+                            item_bt,
+                            None,
+                            doc,
+                            node,
+                            errors,
+                            self.enforce_qname_length_facets,
+                        );
+                    }
+                }
+            }
+            // List-level facets (length counts items, not chars), for every step.
+            for step in &chain {
+                self.validate_step_facets(
+                    &normalized,
+                    &step.facets,
+                    FacetTarget::List(&items),
+                    doc,
+                    node,
+                    errors,
+                    depth,
+                    memo,
+                );
+            }
+            (normalized, BuiltInType::String)
+        } else {
+            // `step_ws[k]`: the whitespace mode in effect for step k's
+            // *base* type, that is the most-derived whiteSpace facet among
+            // the steps after k, else the root built-in type's. Step k's
+            // enumeration literals are values of that base (XSD 1.0 Part 2
+            // 4.3.5), so they are read with it; the value itself is read
+            // with the mode of the whole chain (`step_ws` of a virtual
+            // step before the first).
+            let mut step_ws = vec![whitespace_for_type(&root.base); chain.len()];
+            let mut in_effect = whitespace_for_type(&root.base);
+            for (k, step) in chain.iter().enumerate().rev() {
+                step_ws[k] = in_effect.clone();
+                if let Some(mode) = step.facets.iter().find_map(|facet| match facet {
+                    Facet::WhiteSpace(mode) => Some(mode),
+                    _ => None,
+                }) {
+                    in_effect = mode.clone();
+                }
+            }
+            let normalized = apply_whitespace_normalization(value, &in_effect);
+            validate_builtin_value(&normalized, &root.base, doc, node, errors, self.lenient);
+            for (step, literal_ws) in chain.iter().zip(&step_ws) {
+                self.validate_step_facets(
+                    &normalized,
+                    &step.facets,
+                    FacetTarget::Atomic(&root.base, literal_ws),
+                    doc,
+                    node,
+                    errors,
+                    depth,
+                    memo,
+                );
+            }
+            (normalized, root.base.clone())
+        };
+
+        (errors.len() == start).then_some((normalized, value_type))
+    }
+
+    /// The first member of the union `root` (in declaration order) that
+    /// accepts `value`, as that member's normalized value and built-in type.
+    /// Results are cached in `memo` per union definition and value.
+    fn union_member_value(
+        &self,
+        value: &str,
+        root: &SimpleTypeDef,
+        doc: &Document,
+        node: NodeId,
+        depth: usize,
+        memo: &mut UnionMemo,
+    ) -> Option<(String, BuiltInType)> {
+        let key = (root as *const SimpleTypeDef as usize, value.to_string());
+        if let Some(cached) = memo.get(&key) {
+            return cached.clone();
+        }
+        test_counters::note(&test_counters::UNION_MEMBER_SELECTIONS);
+        let mut accepted = None;
+        for member in root.union_members.iter().flatten() {
+            let mut member_errors = Vec::new();
+            let result = self.check_type_ref_value(
+                value,
+                member,
+                doc,
+                node,
+                &mut member_errors,
+                depth + 1,
+                memo,
+            );
+            if member_errors.is_empty() && result.is_some() {
+                accepted = result;
+                break;
+            }
+        }
+        memo.insert(key, accepted.clone());
+        accepted
+    }
+
+    /// Validate a value against a type reference used as a union member or a
+    /// list item type. See [`XsdValidator::check_simple_value`].
+    #[allow(clippy::too_many_arguments)]
+    fn check_type_ref_value(
+        &self,
+        value: &str,
+        type_ref: &TypeRef,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+        depth: usize,
+        memo: &mut UnionMemo,
+    ) -> Option<(String, BuiltInType)> {
+        let error = |message: String| ValidationError {
+            message,
+            line: Some(doc.node_line(node)),
+            column: Some(doc.node_column(node)),
+        };
+        let builtin = |bt: &BuiltInType, errors: &mut Vec<ValidationError>| {
+            let start = errors.len();
+            validate_builtin_value(value, bt, doc, node, errors, self.lenient);
+            let normalized = apply_whitespace_normalization(value, &whitespace_for_type(bt));
+            (errors.len() == start).then(|| (normalized, bt.clone()))
+        };
+        match type_ref {
+            TypeRef::BuiltIn(bt) => builtin(bt, errors),
+            // Decided at build; never present in a built validator.
+            TypeRef::Unqualified(name) => {
+                errors.push(error(format!("Type '{}' not found", name.local)));
+                None
+            }
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(st) => {
+                    self.check_simple_value(value, st, doc, node, errors, depth, memo)
+                }
+                TypeDef::Complex(_) => {
+                    errors.push(error("Anonymous complex type used as a simple type".into()));
+                    None
+                }
+            },
+            TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
+                Some(TypeDef::Simple(st)) => {
+                    self.check_simple_value(value, st, doc, node, errors, depth, memo)
+                }
+                Some(TypeDef::Complex(_)) => {
+                    errors.push(error(format!(
+                        "Type '{}' is not a simple type",
+                        qname_display(ns, name)
+                    )));
+                    None
+                }
+                None => match parse_builtin_type(name) {
+                    Some(bt) if ns.as_deref() == Some(XS_NAMESPACE) => builtin(&bt, errors),
+                    _ => {
+                        errors.push(error(format!(
+                            "Type '{}' not found",
+                            qname_display(ns, name)
+                        )));
+                        None
+                    }
+                },
+            },
+        }
+    }
+
+    /// The restriction chain of a simple type: `st` first, then each base in
+    /// turn, ending with the step whose base is a built-in type (or which is a
+    /// list or union). Fails on a missing or non-simple base, and on a cyclic or
+    /// overlong chain.
+    pub(super) fn simple_type_chain<'a>(
+        &'a self,
+        st: &'a SimpleTypeDef,
+    ) -> Result<Vec<&'a SimpleTypeDef>, String> {
+        let mut chain = vec![st];
+        let mut current = st;
+        while let Some(base) = &current.base_ref {
+            let (next, display) = match base {
+                TypeRef::BuiltIn(_) => break,
+                // Decided at build; never present in a built validator.
+                TypeRef::Unqualified(name) => {
+                    return Err(format!("Base type '{}' not found", name.local))
+                }
+                TypeRef::Inline(td) => match td.as_ref() {
+                    TypeDef::Simple(base_st) => (base_st, "anonymous".to_string()),
+                    TypeDef::Complex(_) => {
+                        return Err("The base of a simple type is a complex type".to_string())
+                    }
+                },
+                TypeRef::Named(ns, name) => {
+                    let display = qname_display(ns, name);
+                    match self.types.get(&(ns.clone(), name.clone())) {
+                        Some(TypeDef::Simple(base_st)) => (base_st, display),
+                        Some(TypeDef::Complex(_)) => {
+                            return Err(format!(
+                                "Base type '{}' of a simple type is not a simple type",
+                                display
+                            ))
+                        }
+                        None => return Err(format!("Base type '{}' not found", display)),
+                    }
+                }
+            };
+            if chain.len() >= MAX_SIMPLE_TYPE_DEPTH || chain.iter().any(|s| std::ptr::eq(*s, next))
+            {
+                return Err(format!(
+                    "Simple type derivation through '{}' is circular or longer than {} steps",
+                    display, MAX_SIMPLE_TYPE_DEPTH
+                ));
+            }
+            chain.push(next);
+            current = next;
+        }
+        Ok(chain)
+    }
+
+    /// Check one restriction step's facets. The step's `pattern` facets are
+    /// alternatives: the value must match at least one of them. Every other
+    /// facet must hold.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_step_facets(
+        &self,
+        text: &str,
+        facets: &[Facet],
+        target: FacetTarget<'_>,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+        depth: usize,
+        memo: &mut UnionMemo,
+    ) {
+        let error = |message: String| ValidationError {
+            message,
+            line: Some(doc.node_line(node)),
+            column: Some(doc.node_column(node)),
+        };
+        let patterns: Vec<&String> = facets
+            .iter()
+            .filter_map(|facet| match facet {
+                Facet::Pattern(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        if patterns.len() > 1 {
+            let mut matched = false;
+            for pattern in &patterns {
+                match XsdRegex::compile(pattern) {
+                    Ok(re) => matched |= re.is_match(text),
+                    Err(e) => {
+                        errors.push(error(format!(
+                            "Pattern facet '{}' could not be compiled: {}",
+                            pattern, e
+                        )));
+                        return;
+                    }
+                }
+            }
+            if !matched {
+                errors.push(error(format!(
+                    "Value '{}' does not match any of the patterns {:?}",
+                    text, patterns
+                )));
+            }
+        }
+        for facet in facets {
+            if patterns.len() > 1 && matches!(facet, Facet::Pattern(_)) {
+                continue;
+            }
+            match target {
+                FacetTarget::Atomic(bt, ws) => validate_facet(
+                    text,
+                    facet,
+                    bt,
+                    Some(ws),
+                    doc,
+                    node,
+                    errors,
+                    self.enforce_qname_length_facets,
+                ),
+                FacetTarget::List(items) => {
+                    validate_list_facet(items, facet, text, doc, node, errors)
+                }
+                FacetTarget::Union(bt, root, step) => match facet {
+                    Facet::Pattern(_) => validate_facet(
+                        text,
+                        facet,
+                        bt,
+                        None,
+                        doc,
+                        node,
+                        errors,
+                        self.enforce_qname_length_facets,
+                    ),
+                    Facet::Enumeration(values) => {
+                        // Each literal is read by the union like a value: the
+                        // member that accepts it gives its type and value.
+                        // The readings are kept with the step, so they are
+                        // made once per type, not once per value.
+                        let mut read = |literal: &str| {
+                            test_counters::note(&test_counters::UNION_LITERAL_READS);
+                            self.union_member_value(literal, root, doc, node, depth, memo)
+                        };
+                        let cached = step.union_enumeration.get_or_init(|| UnionEnumeration {
+                            lenient: self.lenient,
+                            enforce_qname_length_facets: self.enforce_qname_length_facets,
+                            literals: values
+                                .iter()
+                                .map(|literal| {
+                                    if literal.contains(':') {
+                                        UnionLiteral::Scoped
+                                    } else {
+                                        match read(literal) {
+                                            Some((lit, lit_type)) => {
+                                                UnionLiteral::Value(lit, lit_type)
+                                            }
+                                            None => UnionLiteral::Invalid,
+                                        }
+                                    }
+                                })
+                                .collect(),
+                        });
+                        let usable = cached.lenient == self.lenient
+                            && cached.enforce_qname_length_facets
+                                == self.enforce_qname_length_facets
+                            && cached.literals.len() == values.len();
+                        let found = values.iter().enumerate().any(|(i, literal)| {
+                            let reading = match cached.literals.get(i) {
+                                Some(UnionLiteral::Value(lit, lit_type)) if usable => {
+                                    return values_equal(text, bt, lit, lit_type);
+                                }
+                                Some(UnionLiteral::Invalid) if usable => return false,
+                                _ => read(literal),
+                            };
+                            reading.is_some_and(|(lit, lit_type)| {
+                                values_equal(text, bt, &lit, &lit_type)
+                            })
+                        });
+                        if !found {
+                            errors.push(error(format!(
+                                "'{}' is not one of the allowed values: {:?}",
+                                text, values
+                            )));
+                        }
+                    }
+                    other => errors.push(error(format!(
+                        "Facet {:?} does not apply to a union type",
+                        other
+                    ))),
+                },
+            }
+        }
+    }
+}
+
+/// Operation counters for the complexity tests; empty outside `cfg(test)`.
+pub(crate) mod test_counters {
+    #[cfg(test)]
+    thread_local! {
+        /// Union enumeration literals read by the union on this thread.
+        pub(crate) static UNION_LITERAL_READS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+        /// Union member selections made (not found in the memo) on this thread.
+        pub(crate) static UNION_MEMBER_SELECTIONS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+        counter.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) -> usize {
+        counter.with(|count| count.replace(0))
+    }
+
+    #[cfg(not(test))]
+    pub(crate) struct Counter;
+    #[cfg(not(test))]
+    pub(crate) const UNION_LITERAL_READS: Counter = Counter;
+    #[cfg(not(test))]
+    pub(crate) const UNION_MEMBER_SELECTIONS: Counter = Counter;
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note(_counter: &Counter) {}
+}
+
+/// Cache of union member selection: (address of the union's root
+/// definition, value) to the accepting member's normalized value and type.
+type UnionMemo = HashMap<(usize, String), Option<(String, BuiltInType)>>;
+
+/// Maximum number of restriction steps in a simple type's derivation chain,
+/// and of nested union member / list item types, followed during validation.
+pub(super) const MAX_SIMPLE_TYPE_DEPTH: usize = 64;
+
+/// How a derivation step's facets are applied: to an atomic value of the
+/// given built-in type, whose step reads its enumeration literals with the
+/// given whitespace mode (the one in effect for the step's base); to the
+/// items of a list; or to a union value that the member of the given
+/// built-in type accepted (the union's root definition reads enumeration
+/// literals, and the step, the last field, keeps them read).
+#[derive(Clone, Copy)]
+enum FacetTarget<'a> {
+    Atomic(&'a BuiltInType, &'a WhiteSpaceHandling),
+    List(&'a [&'a str]),
+    Union(&'a BuiltInType, &'a SimpleTypeDef, &'a SimpleTypeDef),
+}
+
+/// `{namespace}local` for messages, or just `local` without a namespace.
+pub(super) fn qname_display(ns: &Option<String>, name: &str) -> String {
+    match ns {
+        Some(uri) => format!("{{{}}}{}", uri, name),
+        None => name.to_string(),
     }
 }
