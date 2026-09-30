@@ -9,14 +9,29 @@ use std::cmp::Ordering;
 use crate::dom::{Document, NodeId};
 use crate::error::ValidationError;
 use crate::namespace::build_resolver_for_node;
+use crate::parser::is_xml_whitespace;
 use crate::xsd_regex::XsdRegex;
 
 use super::datetime::{
     is_valid_date, is_valid_datetime, is_valid_duration, is_valid_gday, is_valid_gmonth,
     is_valid_gmonthday, is_valid_gyear, is_valid_gyearmonth, is_valid_time, normalize_datetime_tz,
 };
-use super::decimal::compare_values;
+use super::decimal::{compare_decimal_strings, compare_values};
 use super::types::{BuiltInType, Facet, WhiteSpaceHandling};
+
+/// Strip leading and trailing XML white space (`#x20`, `#x9`, `#xD`, `#xA`)
+/// and nothing else. `str::trim` also strips Unicode white space such as
+/// U+00A0, which is an ordinary character in an XML value: a value padded
+/// with it is not in the lexical space of a numeric or temporal type.
+pub(crate) fn trim_xml_whitespace(s: &str) -> &str {
+    s.trim_matches(is_xml_whitespace)
+}
+
+/// Split a value at XML white space only (see `trim_xml_whitespace`),
+/// dropping empty pieces.
+pub(crate) fn split_xml_whitespace(s: &str) -> impl Iterator<Item = &str> {
+    s.split(is_xml_whitespace).filter(|t| !t.is_empty())
+}
 
 /// Check if a string is a valid NCName (non-colonized name).
 pub(crate) fn is_valid_ncname(s: &str) -> bool {
@@ -80,6 +95,26 @@ fn is_valid_date_like(s: &str, base_type: &BuiltInType) -> bool {
     }
 }
 
+/// Whether `value`, a lexically valid value of the date or time primitive
+/// `primitive`, lies so far from year zero that its instant cannot be
+/// represented. Such a value is never compared: it equals nothing, and a
+/// range or enumeration facet refuses it by name. The lexical space of
+/// `gYear` and `gYearMonth` has no bound on the year's digits.
+pub(crate) fn instant_is_unrepresentable(value: &str, primitive: &BuiltInType) -> bool {
+    match primitive {
+        BuiltInType::DateTime => is_valid_datetime(value) && datetime_to_instant(value).is_none(),
+        BuiltInType::Date
+        | BuiltInType::GYear
+        | BuiltInType::GYearMonth
+        | BuiltInType::GMonth
+        | BuiltInType::GMonthDay
+        | BuiltInType::GDay => {
+            is_valid_date_like(value, primitive) && date_like_to_instant(value, primitive).is_none()
+        }
+        _ => false,
+    }
+}
+
 /// A temporal value placed on the timeline: `seconds` is UTC-normalized when
 /// the lexical form carries a timezone, otherwise local. Local vs UTC-normalized
 /// instants are only partially ordered (see `compare_temporal_instants`).
@@ -124,8 +159,300 @@ fn compare_facet_values(
             let right = date_like_to_instant(facet_value, base_type)?;
             compare_temporal_instants(&left, &right)
         }
+        BuiltInType::Float => compare_float_values(value, facet_value, true),
+        BuiltInType::Double => compare_float_values(value, facet_value, false),
+        BuiltInType::Duration => compare_duration_values(value, facet_value),
         _ => Some(compare_values(value, facet_value)),
     }
+}
+
+/// `float` / `double` semantics. Values compare as in **XSD 1.1** Part 2
+/// (3.3.4, 3.3.5), which the crate targets: `NaN` is incomparable, so it
+/// satisfies no range facet, and is identical to itself, so it matches a
+/// `NaN` enumeration or fixed value; `-0` equals `0`. XSD 1.0 instead
+/// ordered `NaN` above every value and `-0` below `0`. The lexical space
+/// (see `validate_builtin_value`) is XSD 1.0's: `+INF` is refused, as the
+/// W3C 2006 test suite requires, although XSD 1.1 accepts it. That is a
+/// known inconsistency, kept on purpose from 0.10.1 because it fails closed.
+///
+/// Parse an XSD `float`/`double` lexical form (`INF`, `-INF`, `NaN` or a
+/// decimal/scientific number). A `float` is parsed directly to the nearest
+/// single-precision value, its value space (round-half-even), and then
+/// widened exactly; going through `f64` first would round twice. Forms Rust
+/// accepts but XSD does not (`inf`, `infinity`, ...) are rejected.
+fn parse_xsd_float(s: &str, single: bool) -> Option<f64> {
+    let s = trim_xml_whitespace(s);
+    let value = match s {
+        "INF" => f64::INFINITY,
+        "-INF" => f64::NEG_INFINITY,
+        "NaN" => f64::NAN,
+        _ => {
+            let numeric = s
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'));
+            if s.is_empty() || !numeric {
+                return None;
+            }
+            if single {
+                f64::from(s.parse::<f32>().ok()?)
+            } else {
+                s.parse::<f64>().ok()?
+            }
+        }
+    };
+    Some(value)
+}
+
+/// Order two `float`/`double` values. `NaN` is incomparable (`None`) and
+/// `-0` equals `0` (XSD 1.1; see `parse_xsd_float`).
+fn compare_float_values(value: &str, facet_value: &str, single: bool) -> Option<Ordering> {
+    parse_xsd_float(value, single)?.partial_cmp(&parse_xsd_float(facet_value, single)?)
+}
+
+/// A duration split into months and seconds: `whole_seconds` plus the
+/// fractional digits `fraction` (trailing zeros dropped).
+struct DurationParts {
+    negative: bool,
+    months: i128,
+    whole_seconds: i128,
+    fraction: String,
+}
+
+/// Parse `-?PnYnMnDTnHnMnS` into months and seconds.
+fn parse_duration_parts(s: &str) -> Option<DurationParts> {
+    let s = trim_xml_whitespace(s);
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let rest = rest.strip_prefix('P')?;
+    let (date_part, time_part) = match rest.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (rest, None),
+    };
+    let mut months: i128 = 0;
+    let mut days: i128 = 0;
+    let mut seconds: i128 = 0;
+    let mut fraction = String::new();
+    let mut number = String::new();
+    for c in date_part.chars() {
+        match c {
+            '0'..='9' => number.push(c),
+            'Y' | 'M' | 'D' => {
+                let n: i128 = number.parse().ok()?;
+                number.clear();
+                match c {
+                    'Y' => months = months.checked_add(n.checked_mul(12)?)?,
+                    'M' => months = months.checked_add(n)?,
+                    _ => days = days.checked_add(n)?,
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !number.is_empty() {
+        return None;
+    }
+    for c in time_part.unwrap_or("").chars() {
+        match c {
+            '0'..='9' | '.' => number.push(c),
+            'H' | 'M' | 'S' => {
+                let (whole, frac) = match number.split_once('.') {
+                    Some((w, f)) if c == 'S' => (w.to_string(), f.to_string()),
+                    Some(_) => return None,
+                    None => (number.clone(), String::new()),
+                };
+                number.clear();
+                let n: i128 = if whole.is_empty() && !frac.is_empty() {
+                    0
+                } else {
+                    whole.parse().ok()?
+                };
+                let unit = match c {
+                    'H' => 3_600,
+                    'M' => 60,
+                    _ => 1,
+                };
+                seconds = seconds.checked_add(n.checked_mul(unit)?)?;
+                if c == 'S' {
+                    if !frac.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    fraction = frac.trim_end_matches('0').to_string();
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !number.is_empty() {
+        return None;
+    }
+    Some(DurationParts {
+        negative,
+        months,
+        whole_seconds: days.checked_mul(86_400)?.checked_add(seconds)?,
+        fraction,
+    })
+}
+
+/// Order two durations per XSD 1.0 Part 2 section 3.2.6.2: each is added to
+/// the four reference dateTimes 1696-09-01, 1697-02-01, 1903-03-01 and
+/// 1903-07-01 (UTC); the order holds only if it is the same for all four.
+/// Otherwise the durations are incomparable (`None`), for example `P1M`
+/// against `P30D`. Durations too large to place, or with more than 18
+/// fractional second digits, are treated as incomparable too.
+fn compare_duration_values(value: &str, facet_value: &str) -> Option<Ordering> {
+    const REFERENCES: [(i128, i128); 4] = [(1696, 9), (1697, 2), (1903, 3), (1903, 7)];
+    const MAX_YEAR: i128 = 1_000_000_000_000;
+    let left = parse_duration_parts(value)?;
+    let right = parse_duration_parts(facet_value)?;
+    let scale = left.fraction.len().max(right.fraction.len());
+    if scale > 18 {
+        return None;
+    }
+    let factor = 10i128.checked_pow(scale as u32)?;
+    let instant = |d: &DurationParts, year: i128, month: i128| -> Option<i128> {
+        let sign = if d.negative { -1 } else { 1 };
+        let month_index = (month - 1).checked_add(sign * d.months)?;
+        let y = year.checked_add(month_index.div_euclid(12))?;
+        if y.abs() > MAX_YEAR {
+            return None;
+        }
+        let m = (month_index.rem_euclid(12) + 1) as u32;
+        let start = days_from_civil(y, m, 1)?.checked_mul(86_400)?;
+        let fraction: i128 = if d.fraction.is_empty() {
+            0
+        } else {
+            let digits = format!("{:0<width$}", d.fraction, width = scale);
+            digits.parse().ok()?
+        };
+        let span = d.whole_seconds.checked_mul(factor)?.checked_add(fraction)?;
+        start.checked_mul(factor)?.checked_add(sign * span)
+    };
+    let mut result = None;
+    for (year, month) in REFERENCES {
+        let order = instant(&left, year, month)?.cmp(&instant(&right, year, month)?);
+        match result {
+            Some(previous) if previous != order => return None,
+            _ => result = Some(order),
+        }
+    }
+    result
+}
+
+/// The primitive type whose value space a built-in type's values belong to,
+/// for equality across a derivation chain or between union members.
+fn primitive_type(bt: &BuiltInType) -> BuiltInType {
+    match bt {
+        BuiltInType::Integer
+        | BuiltInType::Long
+        | BuiltInType::Int
+        | BuiltInType::Short
+        | BuiltInType::Byte
+        | BuiltInType::NonNegativeInteger
+        | BuiltInType::PositiveInteger
+        | BuiltInType::NonPositiveInteger
+        | BuiltInType::NegativeInteger
+        | BuiltInType::UnsignedLong
+        | BuiltInType::UnsignedInt
+        | BuiltInType::UnsignedShort
+        | BuiltInType::UnsignedByte => BuiltInType::Decimal,
+        BuiltInType::NormalizedString
+        | BuiltInType::Token
+        | BuiltInType::Language
+        | BuiltInType::Name
+        | BuiltInType::NCName
+        | BuiltInType::ID
+        | BuiltInType::IDREF
+        | BuiltInType::ENTITY
+        | BuiltInType::NMTOKEN
+        | BuiltInType::AnyType
+        | BuiltInType::AnySimpleType => BuiltInType::String,
+        other => other.clone(),
+    }
+}
+
+/// Whether two whitespace-normalized lexical values denote the same value.
+/// Each is read as a value of its built-in type; values of different
+/// primitive types are never equal. Numbers, booleans, dates and times,
+/// durations and binary types compare by value (`01` equals `1`, `1.0E0`
+/// equals `1`); every other type compares the normalized strings. For
+/// `float`/`double` this is XSD 1.1's "equal or identical" of enumeration
+/// and fixed values: `NaN` matches `NaN`, `-0` matches `0`.
+pub(crate) fn values_equal(
+    left: &str,
+    left_type: &BuiltInType,
+    right: &str,
+    right_type: &BuiltInType,
+) -> bool {
+    let primitive = primitive_type(left_type);
+    if primitive != primitive_type(right_type) {
+        return false;
+    }
+    match primitive {
+        BuiltInType::Decimal => compare_decimal_strings(left, right) == Some(Ordering::Equal),
+        BuiltInType::Float | BuiltInType::Double => {
+            let single = primitive == BuiltInType::Float;
+            match (
+                parse_xsd_float(left, single),
+                parse_xsd_float(right, single),
+            ) {
+                (Some(a), Some(b)) => a == b || (a.is_nan() && b.is_nan()),
+                _ => false,
+            }
+        }
+        BuiltInType::Boolean => {
+            let as_bool = |s: &str| match trim_xml_whitespace(s) {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            };
+            matches!((as_bool(left), as_bool(right)), (Some(a), Some(b)) if a == b)
+        }
+        BuiltInType::Duration => {
+            compare_facet_values(
+                trim_xml_whitespace(left),
+                trim_xml_whitespace(right),
+                &primitive,
+            ) == Some(Ordering::Equal)
+        }
+        _ if is_temporal_type(&primitive) => {
+            let (left, right) = (trim_xml_whitespace(left), trim_xml_whitespace(right));
+            if instant_is_unrepresentable(left, &primitive)
+                || instant_is_unrepresentable(right, &primitive)
+            {
+                return false;
+            }
+            compare_facet_values(left, right, &primitive) == Some(Ordering::Equal)
+                || normalize_datetime_tz(left) == normalize_datetime_tz(right)
+        }
+        BuiltInType::HexBinary => {
+            trim_xml_whitespace(left).eq_ignore_ascii_case(trim_xml_whitespace(right))
+        }
+        BuiltInType::Base64Binary => left
+            .chars()
+            .filter(|c| !is_xml_whitespace(*c))
+            .eq(right.chars().filter(|c| !is_xml_whitespace(*c))),
+        _ => left == right,
+    }
+}
+
+/// Whether an enumeration value, as written in the schema, matches `text`,
+/// an already normalized value of `base_type`. The literal is normalized
+/// with `ws`, the mode of the type the facet restricts, then both are
+/// compared as values.
+pub(crate) fn enumeration_matches(
+    text: &str,
+    literal: &str,
+    base_type: &BuiltInType,
+    ws: &WhiteSpaceHandling,
+) -> bool {
+    values_equal(
+        text,
+        base_type,
+        &apply_whitespace_normalization(literal, ws),
+        base_type,
+    )
 }
 
 fn compare_datetime_values(value: &str, facet_value: &str) -> Option<Ordering> {
@@ -156,11 +483,12 @@ fn datetime_to_instant(value: &str) -> Option<TemporalInstant> {
     let (date, time) = value.split_once('T')?;
     let (year, month, day) = parse_xsd_date_parts(date)?;
     let (hour, minute, second, fraction, offset_minutes) = parse_xsd_time_parts(time)?;
-    let days = days_from_civil(year, month, day);
-    let local_seconds =
-        days * 86_400 + i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
+    let time_of_day = i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second);
+    let local_seconds = days_from_civil(year, month, day)?
+        .checked_mul(86_400)?
+        .checked_add(time_of_day)?;
     Some(TemporalInstant {
-        seconds: local_seconds - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        seconds: local_seconds.checked_sub(i128::from(offset_minutes.unwrap_or(0)) * 60)?,
         fraction: normalize_fraction(&fraction),
         has_tz: offset_minutes.is_some(),
     })
@@ -209,8 +537,9 @@ fn date_like_to_instant(value: &str, base_type: &BuiltInType) -> Option<Temporal
         _ => return None,
     };
     Some(TemporalInstant {
-        seconds: days_from_civil(year, month, day) * 86_400
-            - i128::from(offset_minutes.unwrap_or(0)) * 60,
+        seconds: days_from_civil(year, month, day)?
+            .checked_mul(86_400)?
+            .checked_sub(i128::from(offset_minutes.unwrap_or(0)) * 60)?,
         fraction: String::new(),
         has_tz: offset_minutes.is_some(),
     })
@@ -233,16 +562,14 @@ fn compare_temporal_instants(left: &TemporalInstant, right: &TemporalInstant) ->
             // Timezone-less left could lie anywhere in [-14:00, +14:00]:
             // left < right only if even its latest interpretation is earlier,
             // and left > right only if even its earliest one is later.
-            if compare_instant_parts(
-                left.seconds + MAX_TZ_OFFSET_SECONDS,
-                &left.fraction,
-                right.seconds,
-                &right.fraction,
-            ) == Ordering::Less
+            let latest = left.seconds.checked_add(MAX_TZ_OFFSET_SECONDS)?;
+            let earliest = left.seconds.checked_sub(MAX_TZ_OFFSET_SECONDS)?;
+            if compare_instant_parts(latest, &left.fraction, right.seconds, &right.fraction)
+                == Ordering::Less
             {
                 Some(Ordering::Less)
             } else if compare_instant_parts(
-                left.seconds - MAX_TZ_OFFSET_SECONDS,
+                earliest,
                 &left.fraction,
                 right.seconds,
                 &right.fraction,
@@ -364,15 +691,20 @@ fn split_tz_suffix(s: &str) -> (&str, Option<i32>) {
     (s, None)
 }
 
-fn days_from_civil(year: i128, month: u32, day: u32) -> i128 {
-    let mut y = year;
+/// Days from 1970-01-01 to a proleptic Gregorian date, or `None` when the
+/// year is too far from zero for the count to be represented. Every step is
+/// checked: a wrapped count could equal another date's, so an overflow must
+/// never yield a number.
+fn days_from_civil(year: i128, month: u32, day: u32) -> Option<i128> {
     let m = i128::from(month);
-    y -= i128::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
+    let y = year.checked_sub(i128::from(month <= 2))?;
+    let era = if y >= 0 { y } else { y.checked_sub(399)? } / 400;
+    let yoe = y.checked_sub(era.checked_mul(400)?)?;
     let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i128::from(day) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    era.checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)
 }
 
 fn push_facet_compare_error(
@@ -512,7 +844,7 @@ pub(crate) fn validate_builtin_value(
             // Nothing further to check for plain xs:token.
         }
         BuiltInType::Boolean => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !matches!(v, "true" | "false" | "1" | "0") {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid boolean", text),
@@ -523,7 +855,7 @@ pub(crate) fn validate_builtin_value(
         }
         // MS tests: decimal019-022/025 — reject scientific notation, INF, NaN
         BuiltInType::Decimal => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             // XSD decimal lexical space: [+-]?digit+(.digit+)?
             // Must NOT accept scientific notation (E/e), INF, NaN
             let valid = {
@@ -554,9 +886,15 @@ pub(crate) fn validate_builtin_value(
                 });
             }
         }
-        // MS tests: float018/022-026, double018/022-026 — case-sensitive special values
+        // MS tests: float018/022-026, double018/022-026 — case-sensitive special values.
+        // `+INF` is refused per the XSD 1.0 lexical space, which the W3C 2006
+        // suite tests; XSD 1.1 would accept it (see `parse_xsd_float`).
+        // Deliberately unchanged from 0.10.1, and a known inconsistency with
+        // the XSD 1.1 value semantics of these types: the refusal fails
+        // closed, and accepting `+INF` would fail MS DataTypes `float018` and
+        // `double018`. Pinned by the test `plus_inf_is_refused_for_float_and_double`.
         BuiltInType::Float | BuiltInType::Double => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             let valid = if v == "INF" || v == "-INF" || v == "NaN" {
                 true
             } else if v.eq_ignore_ascii_case("inf")
@@ -583,7 +921,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Integer => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<i128>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid integer", text),
@@ -593,7 +931,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Long => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<i64>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid long", text),
@@ -603,7 +941,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Int => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<i32>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid int", text),
@@ -613,7 +951,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Short => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<i16>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid short", text),
@@ -623,7 +961,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Byte => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<i8>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid byte", text),
@@ -633,7 +971,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::NonNegativeInteger => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             match v.parse::<i128>() {
                 Ok(n) if n >= 0 => {}
                 _ => {
@@ -646,7 +984,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::PositiveInteger => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             match v.parse::<i128>() {
                 Ok(n) if n > 0 => {}
                 _ => {
@@ -659,7 +997,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::NonPositiveInteger => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             match v.parse::<i128>() {
                 Ok(n) if n <= 0 => {}
                 _ => {
@@ -672,7 +1010,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::NegativeInteger => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             match v.parse::<i128>() {
                 Ok(n) if n < 0 => {}
                 _ => {
@@ -685,7 +1023,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::UnsignedLong => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<u64>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid unsignedLong", text),
@@ -695,7 +1033,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::UnsignedInt => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<u32>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid unsignedInt", text),
@@ -705,7 +1043,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::UnsignedShort => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<u16>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid unsignedShort", text),
@@ -715,7 +1053,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::UnsignedByte => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.parse::<u8>().is_err() {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid unsignedByte", text),
@@ -725,7 +1063,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::DateTime => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_datetime(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid dateTime", text),
@@ -735,7 +1073,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Date => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_date(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid date", text),
@@ -745,7 +1083,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Time => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_time(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid time", text),
@@ -756,7 +1094,7 @@ pub(crate) fn validate_builtin_value(
         }
         // MS test: hexBinary003 — strip internal whitespace before validation
         BuiltInType::HexBinary => {
-            let v: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            let v: String = text.chars().filter(|c| !is_xml_whitespace(*c)).collect();
             if !v.len().is_multiple_of(2) || !v.chars().all(|c| c.is_ascii_hexdigit()) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not valid hexBinary", text),
@@ -766,7 +1104,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Base64Binary => {
-            let v: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            let v: String = text.chars().filter(|c| !is_xml_whitespace(*c)).collect();
             let is_valid = if v.is_empty() {
                 true
             } else if !v.len().is_multiple_of(4) {
@@ -799,7 +1137,7 @@ pub(crate) fn validate_builtin_value(
             // (this also allows whitespace-separated tokens that reach here as a single anyURI
             // value to validate). Strict mode
             // keeps the space check.
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !lenient && v.contains(' ') {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid anyURI", text),
@@ -809,7 +1147,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::NCName | BuiltInType::ID | BuiltInType::IDREF => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_ncname(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid NCName/ID/IDREF", text),
@@ -820,7 +1158,7 @@ pub(crate) fn validate_builtin_value(
         }
         // MS tests: language008/010 — enforce [a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})* pattern
         BuiltInType::Language => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             let valid = if v.is_empty() {
                 false
             } else {
@@ -847,7 +1185,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::NMTOKEN => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.is_empty()
                 || !v
                     .chars()
@@ -861,7 +1199,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::NMTOKENS => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.is_empty() {
                 errors.push(ValidationError {
                     message: "NMTOKENS must contain at least one token".to_string(),
@@ -869,7 +1207,7 @@ pub(crate) fn validate_builtin_value(
                     column: Some(doc.node_column(node)),
                 });
             } else {
-                for token in v.split_whitespace() {
+                for token in split_xml_whitespace(v) {
                     if token.is_empty()
                         || !token.chars().all(|c| {
                             c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
@@ -885,7 +1223,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::IDREFS => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.is_empty() {
                 errors.push(ValidationError {
                     message: "IDREFS must contain at least one IDREF".to_string(),
@@ -893,7 +1231,7 @@ pub(crate) fn validate_builtin_value(
                     column: Some(doc.node_column(node)),
                 });
             } else {
-                for token in v.split_whitespace() {
+                for token in split_xml_whitespace(v) {
                     if !is_valid_ncname(token) {
                         errors.push(ValidationError {
                             message: format!("'{}' is not a valid IDREF in IDREFS", token),
@@ -905,7 +1243,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::NOTATION => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_ncname(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid NOTATION value", text),
@@ -915,7 +1253,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::ENTITY => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_ncname(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid ENTITY value", text),
@@ -925,7 +1263,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::ENTITIES => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if v.is_empty() {
                 errors.push(ValidationError {
                     message: "ENTITIES must contain at least one ENTITY".to_string(),
@@ -933,7 +1271,7 @@ pub(crate) fn validate_builtin_value(
                     column: Some(doc.node_column(node)),
                 });
             } else {
-                for token in v.split_whitespace() {
+                for token in split_xml_whitespace(v) {
                     if !is_valid_ncname(token) {
                         errors.push(ValidationError {
                             message: format!("'{}' is not a valid ENTITY in ENTITIES", token),
@@ -945,7 +1283,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::Duration => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_duration(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid duration", text),
@@ -955,7 +1293,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::GYear => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_gyear(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid gYear", text),
@@ -965,7 +1303,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::GYearMonth => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_gyearmonth(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid gYearMonth", text),
@@ -975,7 +1313,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::GMonth => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_gmonth(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid gMonth", text),
@@ -985,7 +1323,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::GMonthDay => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_gmonthday(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid gMonthDay", text),
@@ -995,7 +1333,7 @@ pub(crate) fn validate_builtin_value(
             }
         }
         BuiltInType::GDay => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_gday(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid gDay", text),
@@ -1006,7 +1344,7 @@ pub(crate) fn validate_builtin_value(
         }
         // MS tests: Name001/004/005/006/014/017/018
         BuiltInType::Name => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_xml_name(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid Name", text),
@@ -1018,7 +1356,7 @@ pub(crate) fn validate_builtin_value(
         // MS tests: QName001/004/005/007/008/010/011
         // Note: NOTATION is handled above (validates as NCName, not full QName).
         BuiltInType::QName => {
-            let v = text.trim();
+            let v = trim_xml_whitespace(text);
             if !is_valid_qname(v) {
                 errors.push(ValidationError {
                     message: format!("'{}' is not a valid QName", text),
@@ -1080,7 +1418,7 @@ pub(crate) fn validate_list_facet(
         }
         Facet::Enumeration(values) => {
             // For list enumerations, the entire space-collapsed value must match
-            let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let collapsed: String = split_xml_whitespace(text).collect::<Vec<_>>().join(" ");
             if !values.contains(&collapsed) {
                 errors.push(ValidationError {
                     message: format!(
@@ -1132,12 +1470,12 @@ pub(crate) fn type_aware_length(
     match base_type {
         BuiltInType::HexBinary => {
             // Each pair of hex characters = 1 octet
-            let trimmed = text.trim();
+            let trimmed = trim_xml_whitespace(text);
             trimmed.len() / 2
         }
         BuiltInType::Base64Binary => {
             // Count decoded octets from base64
-            let stripped: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            let stripped: String = text.chars().filter(|c| !is_xml_whitespace(*c)).collect();
             if stripped.is_empty() {
                 return 0;
             }
@@ -1149,7 +1487,7 @@ pub(crate) fn type_aware_length(
         BuiltInType::QName => {
             // XSD spec: QName length = len(namespace URI) + len(local name).
             // We resolve the QName prefix against the instance document's namespace context.
-            let trimmed = text.trim();
+            let trimmed = trim_xml_whitespace(text);
             let (prefix, local_name) = if let Some(colon_pos) = trimmed.find(':') {
                 (&trimmed[..colon_pos], &trimmed[colon_pos + 1..])
             } else {
@@ -1174,10 +1512,17 @@ pub(crate) fn type_aware_length(
     }
 }
 
+/// Check one facet on `text`, a value of `base_type` that is already
+/// whitespace-normalized. `ws` is the whitespace mode of the type the
+/// enumeration facet restricts (its base; the built-in type's own when
+/// `None`): enumeration literals are values of that type, so they are
+/// normalized with it before the comparison (XSD 1.0 Part 2 4.3.5).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_facet(
     text: &str,
     facet: &Facet,
     base_type: &BuiltInType,
+    ws: Option<&WhiteSpaceHandling>,
     doc: &Document,
     node: NodeId,
     errors: &mut Vec<ValidationError>,
@@ -1226,20 +1571,30 @@ pub(crate) fn validate_facet(
             }
         }
         Facet::Enumeration(values) => {
-            let text_normalized = if is_temporal_type(base_type) {
-                normalize_datetime_tz(text.trim())
-            } else {
-                text.trim().to_string()
-            };
-            let match_found = values.iter().any(|v| {
-                let v_normalized = if is_temporal_type(base_type) {
-                    normalize_datetime_tz(v.trim())
-                } else {
-                    v.trim().to_string()
-                };
-                v_normalized == text_normalized
-            });
-            if !match_found {
+            // `text` is already whitespace-normalized for its type; the
+            // literals are normalized with the mode of the facet's base
+            // type, then compared as values. Nothing is trimmed: a string
+            // keeps its spaces.
+            let ws = ws
+                .cloned()
+                .unwrap_or_else(|| whitespace_for_type(base_type));
+            let unrepresentable =
+                instant_is_unrepresentable(trim_xml_whitespace(text), &primitive_type(base_type));
+            let match_found = !unrepresentable
+                && values
+                    .iter()
+                    .any(|v| enumeration_matches(text, v, base_type, &ws));
+            if unrepresentable {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Value '{}' cannot be compared with the allowed values: its year is too \
+                         far from zero to place on the timeline",
+                        trim_xml_whitespace(text)
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            } else if !match_found {
                 errors.push(ValidationError {
                     message: format!("'{}' is not one of the allowed values: {:?}", text, values),
                     line: Some(doc.node_line(node)),
@@ -1247,67 +1602,107 @@ pub(crate) fn validate_facet(
                 });
             }
         }
-        Facet::MinInclusive(min) => match compare_facet_values(text.trim(), min, base_type) {
-            Some(Ordering::Less) => {
-                errors.push(ValidationError {
-                    message: format!("Value '{}' is less than minInclusive {}", text.trim(), min),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
+        Facet::MinInclusive(min) => {
+            match compare_facet_values(trim_xml_whitespace(text), min, base_type) {
+                Some(Ordering::Less) => {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "Value '{}' is less than minInclusive {}",
+                            trim_xml_whitespace(text),
+                            min
+                        ),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    });
+                }
+                Some(_) => {}
+                None => push_facet_compare_error(
+                    "minInclusive",
+                    trim_xml_whitespace(text),
+                    min,
+                    doc,
+                    node,
+                    errors,
+                ),
             }
-            Some(_) => {}
-            None => push_facet_compare_error("minInclusive", text.trim(), min, doc, node, errors),
-        },
-        Facet::MaxInclusive(max) => match compare_facet_values(text.trim(), max, base_type) {
-            Some(Ordering::Greater) => {
-                errors.push(ValidationError {
-                    message: format!("Value '{}' exceeds maxInclusive {}", text.trim(), max),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
+        }
+        Facet::MaxInclusive(max) => {
+            match compare_facet_values(trim_xml_whitespace(text), max, base_type) {
+                Some(Ordering::Greater) => {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "Value '{}' exceeds maxInclusive {}",
+                            trim_xml_whitespace(text),
+                            max
+                        ),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    });
+                }
+                Some(_) => {}
+                None => push_facet_compare_error(
+                    "maxInclusive",
+                    trim_xml_whitespace(text),
+                    max,
+                    doc,
+                    node,
+                    errors,
+                ),
             }
-            Some(_) => {}
-            None => push_facet_compare_error("maxInclusive", text.trim(), max, doc, node, errors),
-        },
-        Facet::MinExclusive(min) => match compare_facet_values(text.trim(), min, base_type) {
-            Some(Ordering::Less | Ordering::Equal) => {
-                errors.push(ValidationError {
-                    message: format!(
-                        "Value '{}' is not greater than minExclusive {}",
-                        text.trim(),
-                        min
-                    ),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
+        }
+        Facet::MinExclusive(min) => {
+            match compare_facet_values(trim_xml_whitespace(text), min, base_type) {
+                Some(Ordering::Less | Ordering::Equal) => {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "Value '{}' is not greater than minExclusive {}",
+                            trim_xml_whitespace(text),
+                            min
+                        ),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    });
+                }
+                Some(_) => {}
+                None => push_facet_compare_error(
+                    "minExclusive",
+                    trim_xml_whitespace(text),
+                    min,
+                    doc,
+                    node,
+                    errors,
+                ),
             }
-            Some(_) => {}
-            None => push_facet_compare_error("minExclusive", text.trim(), min, doc, node, errors),
-        },
-        Facet::MaxExclusive(max) => match compare_facet_values(text.trim(), max, base_type) {
-            Some(Ordering::Greater | Ordering::Equal) => {
-                errors.push(ValidationError {
-                    message: format!(
-                        "Value '{}' is not less than maxExclusive {}",
-                        text.trim(),
-                        max
-                    ),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
+        }
+        Facet::MaxExclusive(max) => {
+            match compare_facet_values(trim_xml_whitespace(text), max, base_type) {
+                Some(Ordering::Greater | Ordering::Equal) => {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "Value '{}' is not less than maxExclusive {}",
+                            trim_xml_whitespace(text),
+                            max
+                        ),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    });
+                }
+                Some(_) => {}
+                None => push_facet_compare_error(
+                    "maxExclusive",
+                    trim_xml_whitespace(text),
+                    max,
+                    doc,
+                    node,
+                    errors,
+                ),
             }
-            Some(_) => {}
-            None => push_facet_compare_error("maxExclusive", text.trim(), max, doc, node, errors),
-        },
+        }
         Facet::TotalDigits(max_digits) => {
-            let digits: String = text.trim().chars().filter(|c| c.is_ascii_digit()).collect();
-            if digits.len() > *max_digits {
+            let digits = total_digits(text);
+            if digits > *max_digits {
                 errors.push(ValidationError {
-                    message: format!(
-                        "Total digits {} exceeds totalDigits {}",
-                        digits.len(),
-                        max_digits
-                    ),
+                    message: format!("Total digits {} exceeds totalDigits {}", digits, max_digits),
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
@@ -1348,4 +1743,18 @@ pub(crate) fn validate_facet(
             // White space normalization is applied during parsing
         }
     }
+}
+
+/// The number of digits `totalDigits` counts in a decimal lexical form. The
+/// value is `i × 10^-n`, with `n` the fraction digits left after dropping
+/// trailing zeros; the count is the larger of the digits of `i` (leading
+/// zeros dropped, at least one) and `n`. So `0001.5` and `1.500` count 2
+/// digits and `0.001` counts 3.
+fn total_digits(text: &str) -> usize {
+    let unsigned = trim_xml_whitespace(text).trim_start_matches(['+', '-']);
+    let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let frac_part = frac_part.trim_end_matches('0');
+    let significant = format!("{}{}", int_part, frac_part);
+    let significant = significant.trim_start_matches('0');
+    significant.len().max(1).max(frac_part.len())
 }

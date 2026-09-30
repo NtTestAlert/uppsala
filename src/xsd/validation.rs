@@ -18,8 +18,8 @@ use crate::namespace::build_resolver_for_node;
 use crate::xsd_regex::XsdRegex;
 
 use super::builtins::{
-    apply_whitespace_normalization, validate_builtin_value, validate_facet, validate_list_facet,
-    whitespace_for_type,
+    apply_whitespace_normalization, split_xml_whitespace, trim_xml_whitespace,
+    validate_builtin_value, validate_facet, validate_list_facet, whitespace_for_type,
 };
 use super::parser::parse_builtin_type;
 use super::types::*;
@@ -712,7 +712,7 @@ impl XsdValidator {
                 // (no child elements and no non-whitespace text content)
                 let has_children = self.element_has_child_elements(doc, node);
                 let text = doc.text_content_deep(node);
-                let has_text = !text.trim().is_empty();
+                let has_text = !trim_xml_whitespace(&text).is_empty();
                 if has_children || has_text {
                     errors.push(ValidationError {
                         message: "Element with xsi:nil='true' must have no content".to_string(),
@@ -1197,7 +1197,7 @@ impl XsdValidator {
             if is_element_only {
                 for child in doc.children(node) {
                     if let Some(text) = doc.text_content(child) {
-                        if !text.trim().is_empty() {
+                        if !trim_xml_whitespace(text).is_empty() {
                             errors.push(ValidationError {
                                 message:
                                     "Non-whitespace text content is not allowed in element-only content"
@@ -1251,7 +1251,7 @@ impl XsdValidator {
                 // Check no text content (unless mixed)
                 if !ct.mixed {
                     let text = doc.text_content_deep(node);
-                    let trimmed = text.trim();
+                    let trimmed = trim_xml_whitespace(&text);
                     if !trimmed.is_empty() {
                         errors.push(ValidationError {
                             message: "Element should have empty content but contains text"
@@ -2102,7 +2102,10 @@ impl XsdValidator {
     /// - within one step, `pattern` facets are alternatives (ORed); across steps
     ///   they all apply (ANDed);
     /// - the `whiteSpace` facet of the most-derived step that sets one applies,
-    ///   otherwise the root built-in type's whitespace handling;
+    ///   otherwise the root built-in type's whitespace handling; a step's
+    ///   enumeration literals are values of that step's base type, so they are
+    ///   normalized with the mode in effect for the base (not the most-derived
+    ///   one), then compared with the value as values;
     /// - a list splits the collapsed value into items, validates each item
     ///   against the item type and applies each step's list facets.
     fn validate_simple_value(
@@ -2153,7 +2156,7 @@ impl XsdValidator {
 
         let (normalized, value_type) = if root.is_list {
             let normalized = apply_whitespace_normalization(value, &WhiteSpaceHandling::Collapse);
-            let items: Vec<&str> = normalized.split_whitespace().collect();
+            let items: Vec<&str> = split_xml_whitespace(&normalized).collect();
             if let Some(item_ref) = &root.item_ref {
                 // User-defined or anonymous item type: validate each item
                 // against the whole item type, along its chain.
@@ -2172,6 +2175,7 @@ impl XsdValidator {
                             item,
                             facet,
                             item_bt,
+                            None,
                             doc,
                             node,
                             errors,
@@ -2193,10 +2197,17 @@ impl XsdValidator {
             }
             (normalized, BuiltInType::String)
         } else {
-            // The whitespace mode of the most-derived step that sets one,
-            // else the root built-in type's.
+            // `step_ws[k]`: the whitespace mode in effect for step k's
+            // *base* type, that is the most-derived whiteSpace facet among
+            // the steps after k, else the root built-in type's. Step k's
+            // enumeration literals are values of that base (XSD 1.0 Part 2
+            // 4.3.5), so they are read with it; the value itself is read
+            // with the mode of the whole chain (`step_ws` of a virtual
+            // step before the first).
+            let mut step_ws = vec![whitespace_for_type(&root.base); chain.len()];
             let mut in_effect = whitespace_for_type(&root.base);
-            for step in chain.iter().rev() {
+            for (k, step) in chain.iter().enumerate().rev() {
+                step_ws[k] = in_effect.clone();
                 if let Some(mode) = step.facets.iter().find_map(|facet| match facet {
                     Facet::WhiteSpace(mode) => Some(mode),
                     _ => None,
@@ -2206,11 +2217,11 @@ impl XsdValidator {
             }
             let normalized = apply_whitespace_normalization(value, &in_effect);
             validate_builtin_value(&normalized, &root.base, doc, node, errors, self.lenient);
-            for step in &chain {
+            for (step, literal_ws) in chain.iter().zip(&step_ws) {
                 self.validate_step_facets(
                     &normalized,
                     &step.facets,
-                    FacetTarget::Atomic(&root.base),
+                    FacetTarget::Atomic(&root.base, literal_ws),
                     doc,
                     node,
                     errors,
@@ -2385,10 +2396,11 @@ impl XsdValidator {
                 continue;
             }
             match target {
-                FacetTarget::Atomic(bt) => validate_facet(
+                FacetTarget::Atomic(bt, ws) => validate_facet(
                     text,
                     facet,
                     bt,
+                    Some(ws),
                     doc,
                     node,
                     errors,
@@ -2407,10 +2419,12 @@ impl XsdValidator {
 pub(super) const MAX_SIMPLE_TYPE_DEPTH: usize = 64;
 
 /// How a derivation step's facets are applied: to an atomic value of the
-/// given built-in type, or to the items of a list.
+/// given built-in type, whose step reads its enumeration literals with the
+/// given whitespace mode (the one in effect for the step's base); or to the
+/// items of a list.
 #[derive(Clone, Copy)]
 enum FacetTarget<'a> {
-    Atomic(&'a BuiltInType),
+    Atomic(&'a BuiltInType, &'a WhiteSpaceHandling),
     List(&'a [&'a str]),
 }
 

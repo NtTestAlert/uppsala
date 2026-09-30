@@ -495,6 +495,159 @@ fn redefined_simple_type_restricts_the_original() {
 
 // ─── Enumerations compare values after whitespace normalization ─────
 
+/// `xs:string` preserves whitespace and `xs:normalizedString` only replaces
+/// it, so a padded value is a different value and not in the enumeration.
+#[test]
+fn enumeration_keeps_string_whitespace() {
+    let string_enum = schema(
+        r#"<xs:simpleType name="A"><xs:restriction base="xs:string"><xs:enumeration value="AB"/></xs:restriction></xs:simpleType>
+           <xs:simpleType name="D"><xs:restriction base="A"/></xs:simpleType>
+           <xs:element name="e" type="D"/>"#,
+    );
+    check_element_values(
+        &string_enum,
+        &[
+            ("AB", true),
+            (" AB", false),
+            ("AB ", false),
+            ("AB\n", false),
+        ],
+    );
+
+    let normalized_enum = schema(
+        r#"<xs:simpleType name="C"><xs:restriction base="xs:normalizedString"><xs:enumeration value="PL"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="C"/>"#,
+    );
+    check_element_values(
+        &normalized_enum,
+        &[("PL", true), (" PL", false), ("PL\t", false)],
+    );
+
+    // A token collapses whitespace, so the padded value is the same value.
+    let token_enum = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:token"><xs:enumeration value="PL"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(&token_enum, &[(" PL\n", true), ("P L", false)]);
+}
+
+/// XSD 1.0 Part 2 4.3.5: an enumeration's values belong to the **base**
+/// type of the step that declares the facet, so a literal is read with the
+/// base's whitespace mode, not with a whiteSpace facet of the same or a later
+/// step. The instance value is normalized with the most-derived mode and
+/// must then be one of those values.
+#[test]
+fn enumeration_literals_are_read_with_the_base_type_whitespace() {
+    // The literal is the xs:string " a  b "; no collapsed value equals it.
+    let same_step = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:string">
+             <xs:whiteSpace value="collapse"/><xs:enumeration value=" a  b "/>
+           </xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &same_step,
+        &[
+            ("a b", false),
+            (" a  b ", false),
+            ("  a\tb ", false),
+            ("ab", false),
+        ],
+    );
+
+    // A's value is "a  b"; D collapses, so D's values are never "a  b".
+    let later_step = schema(
+        r#"<xs:simpleType name="A"><xs:restriction base="xs:string"><xs:enumeration value="a  b"/></xs:restriction></xs:simpleType>
+           <xs:simpleType name="D"><xs:restriction base="A"><xs:whiteSpace value="collapse"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="D"/>"#,
+    );
+    check_element_values(&later_step, &[("a  b", false), ("a b", false)]);
+    // A itself still accepts its literal as written.
+    let base_only = schema(
+        r#"<xs:simpleType name="A"><xs:restriction base="xs:string"><xs:enumeration value="a  b"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="A"/>"#,
+    );
+    check_element_values(&base_only, &[("a  b", true), ("a b", false)]);
+
+    // A collapsing base reads its literal collapsed; a derived step's
+    // enumeration over it is then compared with the collapsed value.
+    let collapsed_base = schema(
+        r#"<xs:simpleType name="B"><xs:restriction base="xs:string"><xs:whiteSpace value="collapse"/></xs:restriction></xs:simpleType>
+           <xs:simpleType name="E"><xs:restriction base="B"><xs:enumeration value=" a  b "/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="E"/>"#,
+    );
+    check_element_values(
+        &collapsed_base,
+        &[("a b", true), ("  a\tb ", true), ("ab", false)],
+    );
+
+    // Built-in token collapses its enumeration literals too.
+    let token = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:token"><xs:enumeration value=" PL "/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(&token, &[("PL", true), (" PL\n", true)]);
+}
+
+#[test]
+fn enumeration_compares_values_not_lexical_forms() {
+    let int_enum = schema(
+        r#"<xs:simpleType name="A"><xs:restriction base="xs:int"><xs:enumeration value="1"/></xs:restriction></xs:simpleType>
+           <xs:simpleType name="D"><xs:restriction base="A"/></xs:simpleType>
+           <xs:element name="e" type="D"/>"#,
+    );
+    check_element_values(
+        &int_enum,
+        &[
+            ("1", true),
+            ("01", true),
+            ("+1", true),
+            (" 1 ", true),
+            ("2", false),
+        ],
+    );
+
+    let decimal_enum = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:decimal"><xs:enumeration value="1.50"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &decimal_enum,
+        &[("1.5", true), ("01.500", true), ("1.51", false)],
+    );
+
+    let float_enum = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:float"><xs:enumeration value="1.0"/><xs:enumeration value="NaN"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &float_enum,
+        &[("1", true), ("1E0", true), ("NaN", true), ("1.5", false)],
+    );
+
+    let boolean_enum = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:boolean"><xs:enumeration value="true"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &boolean_enum,
+        &[("true", true), ("1", true), ("false", false)],
+    );
+
+    let datetime_enum = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:dateTime"><xs:enumeration value="2020-01-01T00:00:00Z"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &datetime_enum,
+        &[
+            ("2020-01-01T01:00:00+01:00", true),
+            ("2020-01-01T00:00:00.000Z", true),
+            ("2020-01-01T00:00:00", false),
+        ],
+    );
+}
+
 #[test]
 fn white_space_set_on_two_steps_uses_the_most_derived() {
     // A replaces whitespace, D collapses it; D's facet wins, so " a\tb "
@@ -648,7 +801,168 @@ fn derivation_chain_limit() {
     assert!(build(&chain(65)).is_err());
 }
 
+// ─── Range facets on float, double and duration ────────────
+
+#[test]
+fn float_and_double_ranges_compare_by_value() {
+    let float_min = schema(
+        r#"<xs:simpleType name="F"><xs:restriction base="xs:float"><xs:minInclusive value="0.5"/></xs:restriction></xs:simpleType>
+           <xs:simpleType name="D"><xs:restriction base="F"/></xs:simpleType>
+           <xs:element name="e" type="D"/>"#,
+    );
+    check_element_values(
+        &float_min,
+        &[
+            ("0.75", true),
+            ("1E0", true),
+            ("INF", true),
+            ("1e-5", false),
+            ("-INF", false),
+            // XSD 1.1 (which the crate follows for float/double values):
+            // NaN is not comparable, so it cannot satisfy a bound. XSD 1.0
+            // ordered NaN above every value and would accept it here.
+            ("NaN", false),
+        ],
+    );
+
+    let double_max = schema(
+        r#"<xs:simpleType name="G"><xs:restriction base="xs:double"><xs:maxInclusive value="100"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="G"/>"#,
+    );
+    check_element_values(
+        &double_max,
+        &[
+            ("5E1", true),
+            ("9e1", true),
+            ("1.0E2", true),
+            ("1e3", false),
+            ("INF", false),
+        ],
+    );
+}
+
+#[test]
+fn duration_ranges_use_the_partial_order() {
+    let max_one_day = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:duration"><xs:maxInclusive value="P1D"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &max_one_day,
+        &[
+            ("PT24H", true),
+            ("PT23H59M59.5S", true),
+            ("-P1Y", true),
+            ("P0Y2D", false),
+            ("PT24H0.1S", false),
+        ],
+    );
+
+    // P30D against P1M depends on the month, so it is not comparable.
+    let max_one_month = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:duration"><xs:maxInclusive value="P1M"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &max_one_month,
+        &[
+            ("P27D", true),
+            ("P1M", true),
+            ("P30D", false),
+            ("P32D", false),
+            ("P1Y", false),
+        ],
+    );
+}
+
+// ─── Digits ────────────────────────────────────────────────
+
+#[test]
+fn total_digits_counts_significant_digits() {
+    let xsd = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:decimal"><xs:totalDigits value="3"/></xs:restriction></xs:simpleType>
+           <xs:simpleType name="D"><xs:restriction base="T"/></xs:simpleType>
+           <xs:element name="e" type="D"/>"#,
+    );
+    check_element_values(
+        &xsd,
+        &[
+            ("1.5", true),
+            ("0001.5", true),
+            ("1.500", true),
+            ("-00.120", true),
+            ("0", true),
+            ("100", true),
+            ("1234", false),
+            ("12.34", false),
+        ],
+    );
+}
+
 // ─── Schema errors in derivations ──────────────────────────
+
+#[test]
+fn fixed_facet_cannot_be_changed_by_a_derived_type() {
+    let fixed = r#"<xs:simpleType name="A"><xs:restriction base="xs:string"><xs:maxLength value="5" fixed="true"/></xs:restriction></xs:simpleType>"#;
+    let changed = format!(
+        r#"{}<xs:simpleType name="D"><xs:restriction base="A"><xs:maxLength value="10"/></xs:restriction></xs:simpleType>"#,
+        fixed
+    );
+    let err = build(&schema(&changed))
+        .err()
+        .expect("changing a fixed facet is refused");
+    assert!(err.contains("maxLength"), "{}", err);
+
+    let repeated = format!(
+        r#"{}<xs:simpleType name="D"><xs:restriction base="A"><xs:maxLength value="5"/><xs:pattern value="[a-z]*"/></xs:restriction></xs:simpleType>"#,
+        fixed
+    );
+    assert!(build(&schema(&repeated)).is_ok());
+
+    // Range facets compare as values: 1.0 is the fixed 1.
+    let range = r#"<xs:simpleType name="A"><xs:restriction base="xs:decimal"><xs:minInclusive value="1" fixed="true"/></xs:restriction></xs:simpleType>
+                   <xs:simpleType name="D"><xs:restriction base="A"><xs:minInclusive value="1.0"/></xs:restriction></xs:simpleType>
+                   <xs:simpleType name="E"><xs:restriction base="A"><xs:minInclusive value="2"/></xs:restriction></xs:simpleType>"#;
+    let err = build(&schema(range))
+        .err()
+        .expect("E changes a fixed facet");
+    assert!(err.contains("'E'"), "{}", err);
+}
+
+/// A range facet value whose year is too far from zero to place on the
+/// timeline is never compared (see
+/// `years_too_far_from_zero_to_place_on_the_timeline_are_refused`), so it
+/// can neither restate nor change a fixed facet. The schema is refused for
+/// that reason, naming the value, and not as a change.
+#[test]
+fn fixed_range_facet_with_a_year_too_far_from_zero_is_refused_by_name() {
+    let huge = format!("1{}", "0".repeat(37));
+    let derived = |fixed: &str, restated: &str| {
+        schema(&format!(
+            r#"<xs:simpleType name="B"><xs:restriction base="xs:gYear"><xs:maxInclusive value="{fixed}" fixed="true"/></xs:restriction></xs:simpleType>
+               <xs:simpleType name="D"><xs:restriction base="B"><xs:maxInclusive value="{restated}"/></xs:restriction></xs:simpleType>
+               <xs:element name="e" type="D"/>"#
+        ))
+    };
+    for (fixed, restated) in [(&*huge, &*huge), ("2100", &*huge), (&*huge, "2100")] {
+        let err = build(&derived(fixed, restated))
+            .err()
+            .expect("an unplaceable fixed range facet is refused");
+        assert!(
+            err.contains(&format!("'{huge}' has a year too far from zero"))
+                && !err.contains("changes the value"),
+            "{fixed} / {restated}: {err}"
+        );
+    }
+    assert!(build(&derived("2100", "2100")).is_ok());
+    let err = build(&derived("2100", "2000"))
+        .err()
+        .expect("changing a fixed facet is refused");
+    assert!(
+        err.contains("changes the value of facet 'maxInclusive'"),
+        "{err}"
+    );
+}
 
 /// `from_schema` has no base path, so it does not load imports: a derived
 /// simple type whose base is in an imported schema is refused instead of
@@ -899,6 +1213,80 @@ fn many_unprefixed_built_in_names_build_in_linear_time() {
     );
 }
 
+// ─── Float literals round once ─────────────────────────────
+
+/// An `xs:float` literal maps to the nearest single-precision value.
+/// `1.0000000596046447753906250001` is just above the midpoint between 1 and
+/// the next float, so it is that next float, not 1; rounding through a
+/// double first lands on the midpoint and ties to 1.
+#[test]
+fn float_literals_round_directly_to_single_precision() {
+    let above_midpoint = "1.0000000596046447753906250001";
+    let below_midpoint = "1.0000000596046447753906249999";
+    let enumeration = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:float"><xs:enumeration value="1"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &enumeration,
+        &[("1", true), (above_midpoint, false), (below_midpoint, true)],
+    );
+    let max_one = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:float"><xs:maxInclusive value="1"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(&max_one, &[("1", true), (above_midpoint, false)]);
+    // Doubles keep their own precision: the same literal is above 1.
+    let double_max = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:double"><xs:maxInclusive value="1"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(&double_max, &[("1", true), (below_midpoint, false)]);
+}
+
+/// XSD 1.1 float/double equality for enumerations: `-0` equals `0` and `NaN`
+/// is identical to itself.
+#[test]
+fn float_enumeration_follows_xsd_1_1_equality() {
+    let xsd = schema(
+        r#"<xs:simpleType name="T"><xs:restriction base="xs:float"><xs:enumeration value="0"/><xs:enumeration value="NaN"/></xs:restriction></xs:simpleType>
+           <xs:element name="e" type="T"/>"#,
+    );
+    check_element_values(
+        &xsd,
+        &[("-0", true), ("0.0", true), ("NaN", true), ("INF", false)],
+    );
+}
+
+// ─── +INF (pinned) ─────────────────────────────────────────
+
+/// Pinned, deliberately: `+INF` is refused for `xs:float` and `xs:double`,
+/// as in 0.10.1. XSD 1.1, whose value semantics the crate follows for these
+/// types, allows it; the W3C 2006 suite (MS DataTypes `float018`,
+/// `double018`) expects the XSD 1.0 refusal. The refusal fails closed.
+#[test]
+fn plus_inf_is_refused_for_float_and_double() {
+    for ty in ["xs:float", "xs:double"] {
+        check_element_values(
+            &schema(&format!(r#"<xs:element name="e" type="{}"/>"#, ty)),
+            &[
+                ("INF", true),
+                ("-INF", true),
+                ("NaN", true),
+                ("+INF", false),
+                ("+1.5", true),
+            ],
+        );
+    }
+    check_element_values(
+        &schema(
+            r#"<xs:simpleType name="F"><xs:restriction base="xs:double"><xs:minInclusive value="0"/></xs:restriction></xs:simpleType>
+               <xs:element name="e" type="F"/>"#,
+        ),
+        &[("INF", true), ("+INF", false)],
+    );
+}
+
 // ─── Positions: LF lines, 1-based byte columns ─────────────
 
 /// Positions follow one convention on every input: only LF ends a line (a
@@ -952,4 +1340,178 @@ fn positions_count_lf_lines_and_byte_columns() {
             label
         );
     }
+}
+
+// ─── Schema documents that are not loaded ──────────────────
+
+/// Characters that Unicode calls white space but XML does not (XML white
+/// space is only `#x20`, `#x9`, `#xD` and `#xA`): no-break space, em space,
+/// ideographic space, next line.
+const NON_XML_SPACES: [char; 4] = ['\u{A0}', '\u{2003}', '\u{3000}', '\u{85}'];
+
+/// A value padded with a character that is white space in Unicode but not in
+/// XML is not in the lexical space of a numeric, temporal, boolean or name
+/// type, whether the type is the built-in or a restriction of it. XML white
+/// space around the value is still collapsed away.
+#[test]
+fn values_padded_with_non_xml_whitespace_are_refused() {
+    let types = [
+        ("decimal", "3.5"),
+        ("integer", "3"),
+        ("byte", "3"),
+        ("nonNegativeInteger", "3"),
+        ("int", "3"),
+        ("boolean", "true"),
+        ("float", "1.5"),
+        ("dateTime", "2026-09-29T10:00:00Z"),
+        ("date", "2026-09-29"),
+        ("time", "10:00:00"),
+        ("gYear", "2026"),
+        ("duration", "P1D"),
+        ("NCName", "a"),
+        ("Name", "a"),
+        ("QName", "a"),
+        ("anyURI", "a"),
+    ];
+    for (name, value) in types {
+        let direct = schema(&format!(r#"<xs:element name="e" type="xs:{}"/>"#, name));
+        let derived = schema(&format!(
+            r#"<xs:simpleType name="R"><xs:restriction base="xs:{}"/></xs:simpleType><xs:element name="e" type="R"/>"#,
+            name
+        ));
+        for xsd in [direct, derived] {
+            let validator = build(&xsd).expect("schema builds");
+            for good in [
+                value.to_string(),
+                format!(" {} ", value),
+                format!("\t{}\n", value),
+            ] {
+                let errs = errors(&validator, &format!("<e>{}</e>", good));
+                assert!(errs.is_empty(), "xs:{} {:?}: {:?}", name, good, errs);
+            }
+            if name == "anyURI" {
+                // U+00A0 is a legal anyURI character (it is escaped when the
+                // URI is used), so the padded value stays valid.
+                continue;
+            }
+            for c in NON_XML_SPACES {
+                for bad in [format!("{}{}", c, value), format!("{}{}", value, c)] {
+                    let errs = errors(&validator, &format!("<e>{}</e>", bad));
+                    assert!(!errs.is_empty(), "xs:{} {:?} was accepted", name, bad);
+                }
+            }
+        }
+    }
+}
+
+/// Range, `totalDigits` and `fractionDigits` facets see the value as it is:
+/// a padded value is refused, not trimmed and compared.
+#[test]
+fn range_facets_do_not_trim_non_xml_whitespace() {
+    check_element_values(
+        &schema(
+            r#"<xs:element name="e"><xs:simpleType><xs:restriction base="xs:decimal"><xs:totalDigits value="9"/><xs:fractionDigits value="6"/><xs:minInclusive value="0"/><xs:maxInclusive value="100"/></xs:restriction></xs:simpleType></xs:element>"#,
+        ),
+        &[
+            ("23", true),
+            ("23.5", true),
+            ("\u{A0}23", false),
+            ("23.5\u{A0}", false),
+        ],
+    );
+    check_element_values(
+        &schema(
+            r#"<xs:simpleType name="D"><xs:restriction base="xs:dateTime"><xs:whiteSpace value="collapse"/></xs:restriction></xs:simpleType>
+<xs:element name="e"><xs:simpleType><xs:restriction base="D"><xs:minInclusive value="2025-09-01T00:00:00Z"/></xs:restriction></xs:simpleType></xs:element>"#,
+        ),
+        &[
+            ("2026-09-29T10:00:00Z", true),
+            ("\u{A0}2026-09-29T10:00:00Z", false),
+            ("2026-09-29T10:00:00Z\u{A0}", false),
+        ],
+    );
+    check_element_values(
+        &schema(
+            r#"<xs:simpleType name="N"><xs:restriction base="xs:nonNegativeInteger"><xs:totalDigits value="14"/></xs:restriction></xs:simpleType>
+<xs:element name="e"><xs:simpleType><xs:restriction base="N"><xs:minExclusive value="0"/></xs:restriction></xs:simpleType></xs:element>"#,
+        ),
+        &[
+            ("1", true),
+            ("\u{A0}1", false),
+            ("\u{202F}1", false),
+            ("\u{2028}1", false),
+        ],
+    );
+}
+
+/// List items are separated by XML white space only: a no-break space is
+/// part of an item, not a separator.
+#[test]
+fn list_items_are_separated_by_xml_whitespace_only() {
+    check_element_values(
+        &schema(
+            r#"<xs:simpleType name="L"><xs:list itemType="xs:int"/></xs:simpleType>
+<xs:element name="e"><xs:simpleType><xs:restriction base="L"><xs:maxLength value="3"/></xs:restriction></xs:simpleType></xs:element>"#,
+        ),
+        &[
+            ("1 2\t3", true),
+            ("1\u{A0}2", false),
+            ("1 2\u{2003}3", false),
+        ],
+    );
+    check_element_values(
+        &schema(r#"<xs:element name="e" type="xs:NMTOKENS"/>"#),
+        &[("a b", true), ("a\u{A0}b", false)],
+    );
+    check_element_values(
+        &schema(
+            r#"<xs:simpleType name="T"><xs:restriction base="xs:NMTOKENS"/></xs:simpleType><xs:element name="e" type="T"/>"#,
+        ),
+        &[("a\tb", true), ("a\u{3000}b", false)],
+    );
+}
+
+/// Character data made of a non-XML space is not white space: element-only
+/// and empty content refuse it.
+#[test]
+fn element_only_content_refuses_non_xml_whitespace_text() {
+    let validator = build(&schema(
+        r#"<xs:element name="r"><xs:complexType><xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence></xs:complexType></xs:element>
+<xs:element name="e"><xs:complexType/></xs:element>"#,
+    ))
+    .expect("schema builds");
+    for (xml, valid) in [
+        ("<r> \n\t<a/> </r>", true),
+        ("<r>\u{A0}<a/></r>", false),
+        ("<r><a/>\u{2003}</r>", false),
+        ("<e/>", true),
+        ("<e>\u{A0}</e>", false),
+    ] {
+        let errs = errors(&validator, xml);
+        assert_eq!(errs.is_empty(), valid, "{:?}: {:?}", xml, errs);
+    }
+}
+
+/// Binary values may hold XML white space between their characters, and no
+/// other.
+#[test]
+fn binary_values_allow_only_xml_whitespace() {
+    check_element_values(
+        &schema(r#"<xs:element name="e" type="xs:base64Binary"/>"#),
+        &[
+            ("QUJD", true),
+            ("QU JD", true),
+            ("QUJD\u{A0}", false),
+            ("QU\u{A0}JD", false),
+        ],
+    );
+    check_element_values(
+        &schema(r#"<xs:element name="e" type="xs:hexBinary"/>"#),
+        &[
+            ("0F", true),
+            (" 0F ", true),
+            ("\u{A0}0F", false),
+            ("0F\u{2003}", false),
+        ],
+    );
 }

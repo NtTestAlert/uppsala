@@ -1347,6 +1347,7 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
     let mut base_type_local: Option<String> = None;
     let mut base_ref: Option<TypeRef> = None;
     let mut item_ref: Option<TypeRef> = None;
+    let mut fixed_facets = Vec::new();
     let target_ns = schema_target_namespace(doc, node);
 
     for child in doc.children(node) {
@@ -1413,7 +1414,9 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
                 }
 
                 // Parse facets
-                facets = parse_facets(doc, child);
+                let (step_facets, step_fixed) = parse_facets(doc, child);
+                facets = step_facets;
+                fixed_facets = step_fixed;
             }
         }
     }
@@ -1429,6 +1432,7 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
         _item_type_local: item_type_local,
         base_ref,
         item_ref,
+        fixed_facets,
     }))
 }
 
@@ -1444,14 +1448,17 @@ pub(super) fn builtin_list_item_type(bt: &BuiltInType) -> Option<BuiltInType> {
 }
 
 /// Parse the constraining facets that are children of a `<restriction>`.
+/// Returns the facets and the names of those declared `fixed="true"`.
 /// Enumeration values are collected into one `Facet::Enumeration`.
-pub(super) fn parse_facets(doc: &Document, restriction: NodeId) -> Vec<Facet> {
+pub(super) fn parse_facets(doc: &Document, restriction: NodeId) -> (Vec<Facet>, Vec<&'static str>) {
     let mut facets = Vec::new();
+    let mut fixed_facets = Vec::new();
     for facet_child in doc.children(restriction) {
         let Some(NodeKind::Element(facet_elem)) = doc.node_kind(facet_child) else {
             continue;
         };
         let value = facet_elem.get_attribute("value").unwrap_or("").to_string();
+        let before = facets.len();
         match facet_elem.name.local_name.as_ref() {
             "minLength" => {
                 if let Ok(n) = value.trim().parse() {
@@ -1506,8 +1513,18 @@ pub(super) fn parse_facets(doc: &Document, restriction: NodeId) -> Vec<Facet> {
             }
             _ => {}
         }
+        if facets.len() > before
+            && matches!(
+                facet_elem.get_attribute("fixed").map(str::trim),
+                Some("true" | "1")
+            )
+        {
+            if let Some(facet) = facets.last() {
+                fixed_facets.push(facet.name());
+            }
+        }
     }
-    facets
+    (facets, fixed_facets)
 }
 
 /// Whether `node` is an `<xs:simpleType>` element.

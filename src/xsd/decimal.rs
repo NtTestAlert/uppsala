@@ -7,6 +7,8 @@
 
 use std::cmp::Ordering;
 
+use super::builtins::trim_xml_whitespace;
+
 /// Compare two values for ordering. First tries numeric decimal comparison;
 /// if either value is not a pure decimal, falls back to lexicographic comparison.
 /// This handles date/time types like gMonthDay (--MM-DD), date, dateTime, etc.
@@ -19,7 +21,7 @@ pub(crate) fn compare_values(a: &str, b: &str) -> Ordering {
 /// Returns `true` for strings like "123", "-45.67", "+0.5", "0".
 /// Returns `false` for empty strings, strings with multiple dots, or non-numeric characters.
 fn is_decimal_string(s: &str) -> bool {
-    let s = s.trim();
+    let s = trim_xml_whitespace(s);
     if s.is_empty() {
         return false;
     }
@@ -52,9 +54,9 @@ fn is_decimal_string(s: &str) -> bool {
 /// - Leading zeros in integer parts
 /// - Trailing zeros in fractional parts
 /// - Negative zero equals positive zero
-fn compare_decimal_strings(a: &str, b: &str) -> Option<Ordering> {
-    let a = a.trim();
-    let b = b.trim();
+pub(crate) fn compare_decimal_strings(a: &str, b: &str) -> Option<Ordering> {
+    let a = trim_xml_whitespace(a);
+    let b = trim_xml_whitespace(b);
 
     // Validate both inputs are actual decimal numbers
     if !is_decimal_string(a) || !is_decimal_string(b) {

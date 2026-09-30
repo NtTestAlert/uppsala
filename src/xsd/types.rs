@@ -435,6 +435,10 @@ pub(crate) struct SimpleTypeDef {
     /// For list types whose item type is not a built-in: the named item type
     /// or the anonymous `<simpleType>` child of `<list>`.
     pub(super) item_ref: Option<TypeRef>,
+    /// Names of the facets this restriction step declares with
+    /// `fixed="true"` (e.g. `"maxLength"`); a type derived from this one may
+    /// not give them another value.
+    pub(super) fixed_facets: Vec<&'static str>,
 }
 
 impl SimpleTypeDef {
@@ -532,13 +536,33 @@ pub(crate) enum Facet {
     WhiteSpace(#[allow(dead_code)] WhiteSpaceHandling),
 }
 
+impl Facet {
+    /// The facet's name as written in a schema (`"maxLength"`, ...).
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            Facet::MinLength(_) => "minLength",
+            Facet::MaxLength(_) => "maxLength",
+            Facet::Length(_) => "length",
+            Facet::Pattern(_) => "pattern",
+            Facet::Enumeration(_) => "enumeration",
+            Facet::MinInclusive(_) => "minInclusive",
+            Facet::MaxInclusive(_) => "maxInclusive",
+            Facet::MinExclusive(_) => "minExclusive",
+            Facet::MaxExclusive(_) => "maxExclusive",
+            Facet::TotalDigits(_) => "totalDigits",
+            Facet::FractionDigits(_) => "fractionDigits",
+            Facet::WhiteSpace(_) => "whiteSpace",
+        }
+    }
+}
+
 /// Whitespace handling mode for the whiteSpace facet.
 ///
 /// Controls how whitespace in text content is normalized before validation:
 /// - `Preserve`: no normalization
 /// - `Replace`: all whitespace characters replaced with spaces
 /// - `Collapse`: replace + collapse consecutive spaces + trim
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WhiteSpaceHandling {
     Preserve,
     Replace,

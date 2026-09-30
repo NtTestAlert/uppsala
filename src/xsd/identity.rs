@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::ValidationError;
 
+use super::builtins::trim_xml_whitespace;
 use super::types::{IdentityConstraint, IdentityConstraintKind, XsdValidator};
 
 #[derive(Default)]
@@ -479,7 +480,7 @@ fn idc_evaluate_field(
     if field == "." {
         // Text content of the element itself — always exactly 1 match (the element itself)
         let text = doc.text_content_deep(node);
-        let trimmed = text.trim();
+        let trimmed = trim_xml_whitespace(&text);
         if trimmed.is_empty() {
             return (None, 1, Some(node));
         }
@@ -542,7 +543,7 @@ fn idc_evaluate_field(
     // Return text content of the first matching node
     if let Some(&result_node) = current_nodes.first() {
         let text = doc.text_content_deep(result_node);
-        let trimmed = text.trim();
+        let trimmed = trim_xml_whitespace(&text);
         if trimmed.is_empty() {
             // For key constraint: check if element exists even if empty
             // An empty element is still a "present" field value (empty string)
@@ -576,7 +577,7 @@ fn idc_attr_matches(
 /// source element (walking up the DOM tree). Returns `{namespace_uri}local_name`
 /// for prefixed QNames, or the original value if no prefix or prefix can't be resolved.
 fn idc_normalize_qname(doc: &Document, source_node: NodeId, value: &str) -> String {
-    let value = value.trim();
+    let value = trim_xml_whitespace(value);
     if let Some(colon) = value.find(':') {
         let prefix = &value[..colon];
         let local = &value[colon + 1..];
@@ -616,7 +617,7 @@ fn idc_resolve_prefix(doc: &Document, node: NodeId, prefix: &str) -> Option<Stri
 /// Parse a decimal string into a normalized form for comparison.
 /// Returns None if the string is not a valid decimal number.
 fn idc_parse_decimal(s: &str) -> Option<String> {
-    let s = s.trim();
+    let s = trim_xml_whitespace(s);
     if s.is_empty() {
         return None;
     }

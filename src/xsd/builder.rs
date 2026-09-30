@@ -18,6 +18,7 @@ use std::path::Path;
 use crate::dom::{Document, NodeKind};
 use crate::error::{XmlError, XmlResult};
 
+use super::builtins::{instant_is_unrepresentable, trim_xml_whitespace, values_equal};
 use super::composition::{
     process_schema_composition, resolve_unqualified_type_refs, CompositionState,
 };
@@ -189,9 +190,10 @@ impl XsdValidator {
     }
 
     /// Refuse a schema whose simple types reference a missing or non-simple
-    /// type (as a restriction base or list item type), or whose references
-    /// form a cycle or nest deeper than `MAX_SIMPLE_TYPE_DEPTH`. Validation
-    /// could otherwise only fail every value of such a type.
+    /// type (as a restriction base or list item type), whose references form
+    /// a cycle or nest deeper than `MAX_SIMPLE_TYPE_DEPTH`, or which gives a
+    /// facet declared `fixed` in a base type another value. Validation could
+    /// otherwise only fail every value of such a type.
     ///
     /// Named simple types are checked first. The anonymous simple types of
     /// element and attribute declarations are checked the same way, and the
@@ -332,14 +334,55 @@ impl XsdValidator {
         if height > MAX_SIMPLE_TYPE_DEPTH {
             return Err(too_deep());
         }
-        self.check_simple_type_steps(st)?;
+        self.check_simple_type_steps(st, visiting.last())?;
         Ok(height)
     }
 
-    /// The per-definition check of `check_simple_type_references`: the
-    /// derivation chain resolves.
-    fn check_simple_type_steps(&self, st: &SimpleTypeDef) -> XmlResult<()> {
-        self.simple_type_chain(st).map_err(XmlError::validation)?;
+    /// The per-definition checks of `check_simple_type_references`: the
+    /// derivation chain resolves, and no step changes a facet a base step
+    /// fixed.
+    fn check_simple_type_steps(
+        &self,
+        st: &SimpleTypeDef,
+        key: Option<&(Option<String>, String)>,
+    ) -> XmlResult<()> {
+        let display = || {
+            key.map(|k| qname_display(&k.0, &k.1))
+                .or_else(|| st.name.clone())
+                .unwrap_or_else(|| "(anonymous)".to_string())
+        };
+        let chain = self.simple_type_chain(st).map_err(XmlError::validation)?;
+        let root = chain[chain.len() - 1];
+        for (i, step) in chain.iter().enumerate() {
+            for facet in &step.facets {
+                for base in &chain[i + 1..] {
+                    if !base.fixed_facets.contains(&facet.name()) {
+                        continue;
+                    }
+                    let fixed = base.facets.iter().find(|f| f.name() == facet.name());
+                    if let Some(fixed) = fixed {
+                        let unplaceable = [facet, fixed]
+                            .into_iter()
+                            .find_map(|f| unplaceable_range_value(f, &root.base));
+                        if let Some(value) = unplaceable {
+                            return Err(XmlError::validation(format!(
+                                "Simple type '{}' cannot compare facet '{}' with the value a base type fixes: '{}' has a year too far from zero to place on the timeline",
+                                display(),
+                                facet.name(),
+                                value
+                            )));
+                        }
+                        if !facet_values_equal(facet, fixed, &root.base) {
+                            return Err(XmlError::validation(format!(
+                                "Simple type '{}' changes the value of facet '{}', which a base type fixes",
+                                display(),
+                                facet.name()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -962,4 +1005,40 @@ fn unresolved_type_name(name: &UnqualifiedTypeName) -> XmlError {
         "Type name '{}' was not resolved",
         qname_display(&name.absent_ns, &name.local)
     ))
+}
+
+/// The value of a range facet that has no place on the timeline of `base`
+/// (a date or time type whose year is too far from zero). Such a value is
+/// never compared, so it can neither equal nor differ from a fixed value.
+fn unplaceable_range_value<'a>(facet: &'a Facet, base: &BuiltInType) -> Option<&'a str> {
+    match facet {
+        Facet::MinInclusive(v)
+        | Facet::MaxInclusive(v)
+        | Facet::MinExclusive(v)
+        | Facet::MaxExclusive(v) => {
+            let v = trim_xml_whitespace(v);
+            instant_is_unrepresentable(v, base).then_some(v)
+        }
+        _ => None,
+    }
+}
+
+/// Whether two facets of the same kind have the same value; range facets
+/// compare in the value space of `base`.
+fn facet_values_equal(a: &Facet, b: &Facet, base: &BuiltInType) -> bool {
+    match (a, b) {
+        (Facet::MinLength(x), Facet::MinLength(y))
+        | (Facet::MaxLength(x), Facet::MaxLength(y))
+        | (Facet::Length(x), Facet::Length(y))
+        | (Facet::TotalDigits(x), Facet::TotalDigits(y))
+        | (Facet::FractionDigits(x), Facet::FractionDigits(y)) => x == y,
+        (Facet::MinInclusive(x), Facet::MinInclusive(y))
+        | (Facet::MaxInclusive(x), Facet::MaxInclusive(y))
+        | (Facet::MinExclusive(x), Facet::MinExclusive(y))
+        | (Facet::MaxExclusive(x), Facet::MaxExclusive(y)) => {
+            values_equal(trim_xml_whitespace(x), base, trim_xml_whitespace(y), base)
+        }
+        (Facet::WhiteSpace(x), Facet::WhiteSpace(y)) => x == y,
+        _ => false,
+    }
 }
