@@ -1441,6 +1441,12 @@ impl XsdValidator {
         elem_ns: Option<&str>,
         decl: &ElementDecl,
     ) -> Option<ElementDecl> {
+        // Only a reference to a global declaration has a substitution group:
+        // a local declaration with the same expanded name as a head is a
+        // different declaration, which no element substitutes for.
+        if !decl.is_ref {
+            return None;
+        }
         // Check if the instance element is a member of the substitution group
         // headed by decl.
         let head_key = (decl.namespace.clone(), decl.name.clone());

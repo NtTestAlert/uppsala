@@ -143,7 +143,7 @@ pub(super) fn parse_element_decl(
         block_extension: block_ext,
         block_restriction: block_rst,
         is_ref: false,
-        substitution_group: parse_substitution_group(elem, schema_target_ns),
+        substitution_group: parse_substitution_group(doc, node, elem)?,
         is_abstract: elem.get_attribute("abstract") == Some("true"),
         fixed,
         identity_constraints: parse_identity_constraints(doc, node),
@@ -248,31 +248,47 @@ fn identity_constraint_namespaces(doc: &Document, node: NodeId) -> HashMap<Strin
 /// Parse the `substitutionGroup` attribute from an element declaration.
 ///
 /// Returns `Some((namespace, local_name))` of the head element, or `None`
-/// if no substitution group is declared.
+/// if no substitution group is declared. The value is an `xs:QName`: it is
+/// whitespace-collapsed, a prefix is resolved with the namespace bindings in
+/// scope at the declaration (those of `xs:schema` included), and an
+/// unprefixed name takes the default namespace in scope, or no namespace
+/// when there is none (XSD 1.0 Part 1 §3.15.3). A malformed QName or an
+/// unbound prefix refuses the build (src-resolve): taking some other
+/// namespace instead could attach the member to another element's group.
 fn parse_substitution_group(
+    doc: &Document,
+    node: NodeId,
     elem: &crate::dom::Element,
-    schema_target_ns: &Option<String>,
-) -> Option<(Option<String>, String)> {
-    let sg = elem.get_attribute("substitutionGroup")?;
-    // The substitutionGroup value is a QName
-    if let Some(colon) = sg.find(':') {
-        let prefix = &sg[..colon];
-        let local = &sg[colon + 1..];
-        // Resolve the prefix to a namespace URI from the element's namespace declarations
-        let ns_uri = elem
-            .attributes
-            .iter()
-            .find(|a| a.name.prefix.as_deref() == Some("xmlns") && a.name.local_name == prefix)
-            .map(|a| a.value.to_string())
-            .or_else(|| {
-                // For elements in the schema's target namespace with a matching prefix,
-                // use the target namespace
-                schema_target_ns.clone()
-            });
-        Some((ns_uri, local.to_string()))
-    } else {
-        // Unprefixed: use the target namespace (substitution group heads are top-level elements)
-        Some((schema_target_ns.clone(), sg.to_string()))
+) -> XmlResult<Option<(Option<String>, String)>> {
+    let Some(raw) = elem.get_attribute("substitutionGroup") else {
+        return Ok(None);
+    };
+    let sg = raw.trim_matches(is_xml_whitespace);
+    // An optional prefix and a local part, each an NCName (Namespaces in
+    // XML §4): this refuses an empty value, inner white space, a stray or
+    // second colon, and any character an NCName does not allow.
+    if !crate::writer::is_valid_xml_qname(sg) {
+        return Err(XmlError::validation(format!(
+            "Invalid substitutionGroup QName '{}'",
+            sg
+        )));
+    }
+    let resolver = build_resolver_for_node(doc, node);
+    match sg.split_once(':') {
+        // The resolver binds `xmlns` for reading declarations, but the
+        // prefix is never in an element's [in-scope namespaces] (XML
+        // Infoset §2.2), so it is unbound in a QName.
+        Some((prefix, local)) => match resolver.resolve(prefix).filter(|_| prefix != "xmlns") {
+            Some(uri) => Ok(Some((Some(uri.to_string()), local.to_string()))),
+            None => Err(XmlError::validation(format!(
+                "Undeclared namespace prefix '{}' in substitutionGroup QName '{}'",
+                prefix, sg
+            ))),
+        },
+        None => Ok(Some((
+            resolver.resolve_default().map(|uri| uri.to_string()),
+            sg.to_string(),
+        ))),
     }
 }
 

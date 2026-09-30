@@ -7,7 +7,7 @@
 //! These types are used throughout the XSD validation pipeline — from schema
 //! parsing (builder/parser) through validation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use super::wildcard::{
@@ -53,6 +53,67 @@ pub struct XsdValidator {
     /// accepts values containing spaces). Default `false` (strict, spec-faithful).
     /// See [`XsdValidator::set_lenient`].
     pub(super) lenient: bool,
+    /// Which of the declarations above arrived through `xs:import`, at any
+    /// depth. A chameleon include moves only the included documents' own
+    /// components into the including target namespace, never the components
+    /// of the documents they import.
+    pub(super) imported: ImportedComponents,
+    /// Schema documents named by `xs:import`, `xs:include` or `xs:redefine`
+    /// that could not be loaded, at any depth.
+    pub(super) unloaded_documents: Vec<UnloadedDocument>,
+}
+
+/// A component key: (namespace, local name).
+pub(super) type ComponentKey = (Option<String>, String);
+
+/// Provenance of the components of one kind of an [`XsdValidator`].
+#[derive(Debug)]
+pub(crate) struct Provenance<V> {
+    /// Keys whose component in the validator's map arrived by import.
+    pub(super) imported: HashSet<ComponentKey>,
+    /// Imported components that lost their key to one of the schema's own
+    /// components. Only no-namespace names can collide this way: a
+    /// no-namespace module that reaches another no-namespace document
+    /// through an import of a namespaced one. When the module is
+    /// chameleon-included, its own component moves to the including target
+    /// namespace and the imported one keeps the key.
+    pub(super) displaced: Vec<(ComponentKey, V)>,
+}
+
+impl<V> Default for Provenance<V> {
+    fn default() -> Self {
+        Provenance {
+            imported: HashSet::new(),
+            displaced: Vec::new(),
+        }
+    }
+}
+
+/// [`Provenance`] of every kind of component of an [`XsdValidator`].
+#[derive(Debug, Default)]
+pub(crate) struct ImportedComponents {
+    pub(super) elements: Provenance<ElementDecl>,
+    pub(super) types: Provenance<TypeDef>,
+    pub(super) global_attributes: Provenance<AttributeDecl>,
+    pub(super) attribute_groups: Provenance<AttributeGroupDef>,
+    pub(super) model_groups: Provenance<ModelGroupDef>,
+}
+
+/// A schema document named by `xs:import`, `xs:include` or `xs:redefine`
+/// that was not loaded: the file is missing or unreadable, or, for an
+/// import, the location is not supported. Its components are absent, so a
+/// type name of its namespace that the schema does not define is an error
+/// (src-resolve) rather than a fallback to a built-in type.
+#[derive(Debug, Clone)]
+pub(crate) struct UnloadedDocument {
+    /// The namespace its components would have had.
+    pub(super) namespace: Option<String>,
+    /// The `schemaLocation` as written.
+    pub(super) location: String,
+    /// Whether it was named by an import (at any depth) rather than by an
+    /// include or redefine of the same schema; only the latter move with a
+    /// chameleon include.
+    pub(super) by_import: bool,
 }
 
 /// An element declaration parsed from the schema.

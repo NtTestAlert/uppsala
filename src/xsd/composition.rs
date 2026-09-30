@@ -12,15 +12,19 @@
 //! 2. For each, the external schema is loaded from disk, parsed, and built
 //!    into a sub-`XsdValidator` via `from_schema_with_base_path`.
 //! 3. **`merge_external_declarations`** copies every declaration from the
-//!    external validator into the main one.  If `chameleon` is set, all
-//!    `None`-namespace keys are re-keyed to the main schema's target namespace.
+//!    external validator into the main one.  For a chameleon include, the
+//!    `None`-namespace declarations of the included documents themselves are
+//!    re-keyed to the main schema's target namespace; the declarations they
+//!    reached through `xs:import` are merged unchanged.  A document that
+//!    cannot be loaded is recorded, so that names needing it are refused.
 //! 4. For `xs:redefine`, **`process_redefine_children`** then processes the
 //!    inline redefinition elements (simpleType, complexType, group,
 //!    attributeGroup) and replaces the previously-merged declarations.
 //! 5. **`reresolve_types_after_redefine`** updates complex types whose
 //!    group or attributeGroup references may have changed.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -36,8 +40,9 @@ use super::parser::{
     parse_model_group_def, parse_simple_type,
 };
 use super::types::{
-    AttributeDecl, ComplexTypeDef, ContentModel, ElementDecl, Particle, ParticleKind,
-    SimpleTypeDef, TypeDef, TypeRef, UnqualifiedTypeName, XsdValidator,
+    AttributeDecl, ComplexTypeDef, ComponentKey, ContentModel, ElementDecl, Particle, ParticleKind,
+    Provenance, SimpleTypeDef, TypeDef, TypeRef, UnloadedDocument, UnqualifiedTypeName,
+    XsdValidator,
 };
 use super::XS_NAMESPACE;
 
@@ -65,6 +70,22 @@ pub(super) struct CompositionState {
 struct ResolvedSchemaPath {
     path: PathBuf,
     identity: Option<FileIdentity>,
+}
+
+/// What a `schemaLocation` resolves to.
+enum SchemaLocation {
+    /// A file to load, through `read_resolved_schema`.
+    Found(ResolvedSchemaPath),
+    /// A file already loaded earlier in this build (a cycle, or a document
+    /// reached twice): it is not loaded again. Its components reach this
+    /// document only if the first load merges them into a validator this
+    /// document's components are composed with, and only in the namespace
+    /// context of that first load (an import, or a chameleon include into
+    /// one namespace). A document used both ways, or needed by a document
+    /// read before the first load is merged, lacks the second copy.
+    AlreadyLoaded,
+    /// No file: its components are absent.
+    Missing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,13 +130,17 @@ impl CompositionState {
 /// F-12 TOCTOU defense.
 ///
 /// Returns:
-/// * `Ok(Some(resolved))` — load this path through `read_resolved_schema`,
-///   not directly. The path has been canonicalized and paired with the file
-///   identity observed during resolution so the read side can detect a later
-///   symlink swap before trusting bytes from the opened handle.
-/// * `Ok(None)` — silent-skip: either the target doesn't exist (matches
-///   pre-fix behaviour for relative `schemaLocation` typos) or the file
-///   was already loaded earlier in this build (cycle short-circuit).
+/// * `Ok(SchemaLocation::Found(resolved))` — load this path through
+///   `read_resolved_schema`, not directly. The path has been canonicalized
+///   and paired with the file identity observed during resolution so the
+///   read side can detect a later symlink swap before trusting bytes from
+///   the opened handle.
+/// * `Ok(SchemaLocation::Missing)` — skip: the target doesn't exist (matches
+///   pre-fix behaviour for relative `schemaLocation` typos). The caller
+///   records the document as unloaded.
+/// * `Ok(SchemaLocation::AlreadyLoaded)` — skip: the file was already loaded
+///   earlier in this build (cycle short-circuit); see
+///   `SchemaLocation::AlreadyLoaded` for what the caller then lacks.
 /// * `Err(...)` — reject: the target escapes the schema's base directory,
 ///   or the attribute value is an absolute URI with a scheme we don't
 ///   support (`http://`, `ftp://`, ...).
@@ -125,7 +150,7 @@ fn resolve_include_path(
     canonical_base: Option<&Path>,
     state: &mut CompositionState,
     kind: &str,
-) -> XmlResult<Option<ResolvedSchemaPath>> {
+) -> XmlResult<SchemaLocation> {
     let resolved_path = match base_dir {
         Some(dir) => dir.join(schema_location),
         None => PathBuf::from(schema_location),
@@ -151,7 +176,7 @@ fn resolve_include_path(
                     kind, schema_location
                 )));
             }
-            return Ok(None);
+            return Ok(SchemaLocation::Missing);
         }
         _ => {}
     }
@@ -159,13 +184,13 @@ fn resolve_include_path(
     // F-11 cycle detection keyed on the canonical path.
     if let Some(ref c) = canonical {
         if !state.visited.insert(c.clone()) {
-            return Ok(None);
+            return Ok(SchemaLocation::AlreadyLoaded);
         }
     }
 
     let path = canonical.unwrap_or(resolved_path);
     let identity = fs::metadata(&path).ok().and_then(|m| file_identity(&m));
-    Ok(Some(ResolvedSchemaPath { path, identity }))
+    Ok(SchemaLocation::Found(ResolvedSchemaPath { path, identity }))
 }
 
 fn read_resolved_schema(
@@ -299,6 +324,13 @@ pub(super) fn process_schema_composition(
                     // the race is closed by the resolve/read pair, not by this
                     // path helper alone.
                     let kind = if is_redefine { "redefine" } else { "include" };
+                    // A document that is not loaded leaves its components
+                    // absent; the build refuses names that would need them.
+                    let unloaded = UnloadedDocument {
+                        namespace: validator.target_namespace.clone(),
+                        location: schema_location.to_string(),
+                        by_import: false,
+                    };
                     let resolved_schema = match resolve_include_path(
                         schema_location,
                         base_dir.as_deref(),
@@ -306,8 +338,12 @@ pub(super) fn process_schema_composition(
                         state,
                         kind,
                     )? {
-                        Some(p) => p,
-                        None => continue,
+                        SchemaLocation::Found(p) => p,
+                        SchemaLocation::AlreadyLoaded => continue,
+                        SchemaLocation::Missing => {
+                            validator.unloaded_documents.push(unloaded);
+                            continue;
+                        }
                     };
 
                     // Load through the resolved descriptor. Canonicalization
@@ -319,11 +355,17 @@ pub(super) fn process_schema_composition(
                     let ext_str =
                         match read_resolved_schema(&resolved_schema, schema_location, kind)? {
                             Some(s) => s,
-                            None => continue,
+                            None => {
+                                validator.unloaded_documents.push(unloaded);
+                                continue;
+                            }
                         };
                     let ext_doc = match crate::parse(&ext_str) {
                         Ok(d) => d,
-                        Err(_) => continue,
+                        Err(_) => {
+                            validator.unloaded_documents.push(unloaded);
+                            continue;
+                        }
                     };
 
                     // Build a sub-validator from the external schema,
@@ -349,7 +391,11 @@ pub(super) fn process_schema_composition(
                         && validator.target_namespace.is_some();
 
                     // Merge declarations from external schema into our validator
-                    merge_external_declarations(validator, &ext_validator, chameleon);
+                    merge_external_declarations(
+                        validator,
+                        &ext_validator,
+                        Merge::Include { chameleon },
+                    );
 
                     // For xs:redefine, process inline redefinition children
                     if is_redefine {
@@ -383,6 +429,17 @@ pub(super) fn process_schema_composition(
                     // genuinely present, so a malformed (non-well-formed) or
                     // semantically broken target is a real error and is surfaced,
                     // not silently dropped.
+                    //
+                    // A skipped document's components are absent, as the
+                    // specification has it: the build refuses a type name
+                    // that would need them (`resolve_unqualified_type_refs`),
+                    // so a skipped hint cannot turn such a name into another
+                    // type. An import nothing refers to stays harmless.
+                    let unloaded = UnloadedDocument {
+                        namespace: elem.get_attribute("namespace").map(str::to_string),
+                        location: schema_location.to_string(),
+                        by_import: true,
+                    };
                     let resolved_schema = match resolve_include_path(
                         schema_location,
                         base_dir.as_deref(),
@@ -390,8 +447,12 @@ pub(super) fn process_schema_composition(
                         state,
                         "import",
                     ) {
-                        Ok(Some(p)) => p,
-                        Ok(None) | Err(_) => continue,
+                        Ok(SchemaLocation::Found(p)) => p,
+                        Ok(SchemaLocation::AlreadyLoaded) => continue,
+                        Ok(SchemaLocation::Missing) | Err(_) => {
+                            validator.unloaded_documents.push(unloaded);
+                            continue;
+                        }
                     };
 
                     // Load the external schema, verifying after open that the
@@ -406,7 +467,10 @@ pub(super) fn process_schema_composition(
                     let ext_str =
                         match read_resolved_schema(&resolved_schema, schema_location, "import")? {
                             Some(s) => s,
-                            None => continue,
+                            None => {
+                                validator.unloaded_documents.push(unloaded);
+                                continue;
+                            }
                         };
                     // The file resolved and its bytes were read: a parse failure
                     // is a real broken-schema error, surfaced with context rather
@@ -434,7 +498,7 @@ pub(super) fn process_schema_composition(
 
                     // Import never uses chameleon fixup — the imported schema
                     // has its own targetNamespace which is preserved as-is.
-                    merge_external_declarations(validator, &ext_validator, false);
+                    merge_external_declarations(validator, &ext_validator, Merge::Import);
                 }
                 _ => {}
             }
@@ -444,76 +508,181 @@ pub(super) fn process_schema_composition(
     Ok(())
 }
 
-/// Merge declarations from an external (included) schema validator into the main validator.
-/// If `chameleon` is true, re-key declarations from `None` namespace to the main validator's
-/// target namespace (chameleon include behavior).
-fn merge_external_declarations(validator: &mut XsdValidator, ext: &XsdValidator, chameleon: bool) {
-    let target_ns = validator.target_namespace.clone();
+/// How an external schema document's declarations are merged.
+#[derive(Clone, Copy)]
+enum Merge {
+    /// `xs:include` / `xs:redefine`. With `chameleon`, the included
+    /// no-namespace declarations take the including target namespace.
+    Include { chameleon: bool },
+    /// `xs:import`: every declaration keeps its namespace.
+    Import,
+}
 
-    // Helper to re-key a (namespace, name) pair for chameleon includes
-    let rekey = |key: &(Option<String>, String)| -> (Option<String>, String) {
-        if chameleon && key.0.is_none() {
-            (target_ns.clone(), key.1.clone())
-        } else {
-            key.clone()
-        }
+/// Merge declarations from an external schema validator into the main validator.
+///
+/// A chameleon include (XSD 1.0 Part 1 §4.2.1) re-keys the `None`-namespace
+/// declarations of the included documents to the main validator's target
+/// namespace and moves their no-namespace references with them. It changes
+/// only those documents' own components: the components they reached through
+/// `xs:import` keep their namespaces and their references, since an imported
+/// document keeps its own target namespace, and its unprefixed names without
+/// a default namespace are `{absent}local`.
+fn merge_external_declarations(validator: &mut XsdValidator, ext: &XsdValidator, how: Merge) {
+    let target_ns = validator.target_namespace.clone();
+    let by_import = matches!(how, Merge::Import);
+    let chameleon_ns = match how {
+        Merge::Include { chameleon: true } => Some(&target_ns),
+        _ => None,
     };
 
-    for (key, decl) in &ext.elements {
-        let new_key = rekey(key);
-        let mut new_decl = decl.clone();
-        if chameleon && new_decl.namespace.is_none() {
-            new_decl.namespace = target_ns.clone();
-        }
-        // Chameleon: also re-namespace elements inside content models
-        if chameleon {
-            chameleon_fixup_element_decl(&mut new_decl, &target_ns);
-        }
-        validator.elements.entry(new_key).or_insert(new_decl);
-    }
+    merge_components(
+        &mut validator.elements,
+        &mut validator.imported.elements,
+        &ext.elements,
+        &ext.imported.elements,
+        by_import,
+        chameleon_ns,
+        // Also re-namespaces elements inside content models.
+        chameleon_fixup_element_decl,
+    );
+    merge_components(
+        &mut validator.types,
+        &mut validator.imported.types,
+        &ext.types,
+        &ext.imported.types,
+        by_import,
+        chameleon_ns,
+        chameleon_fixup_type_def,
+    );
+    merge_components(
+        &mut validator.global_attributes,
+        &mut validator.imported.global_attributes,
+        &ext.global_attributes,
+        &ext.imported.global_attributes,
+        by_import,
+        chameleon_ns,
+        |attr, target_ns| {
+            // Global attributes take on the including schema's target
+            // namespace, matching their re-keyed lookup entry.
+            if attr.namespace.is_none() {
+                attr.namespace = target_ns.clone();
+            }
+            chameleon_fixup_type_ref(&mut attr.type_ref, target_ns);
+        },
+    );
+    merge_components(
+        &mut validator.attribute_groups,
+        &mut validator.imported.attribute_groups,
+        &ext.attribute_groups,
+        &ext.imported.attribute_groups,
+        by_import,
+        chameleon_ns,
+        |group, target_ns| chameleon_fixup_attribute_decls(&mut group.attributes, target_ns),
+    );
+    merge_components(
+        &mut validator.model_groups,
+        &mut validator.imported.model_groups,
+        &ext.model_groups,
+        &ext.imported.model_groups,
+        by_import,
+        chameleon_ns,
+        |group, target_ns| chameleon_fixup_content_model(&mut group.content, target_ns),
+    );
 
-    for (key, type_def) in &ext.types {
-        let new_key = rekey(key);
-        let mut new_td = type_def.clone();
-        if chameleon {
-            chameleon_fixup_type_def(&mut new_td, &target_ns);
+    for unloaded in &ext.unloaded_documents {
+        let mut unloaded = unloaded.clone();
+        if by_import {
+            unloaded.by_import = true;
+        } else if let Some(target_ns) = chameleon_ns {
+            if !unloaded.by_import && unloaded.namespace.is_none() {
+                unloaded.namespace = target_ns.clone();
+            }
         }
-        validator.types.entry(new_key).or_insert(new_td);
+        validator.unloaded_documents.push(unloaded);
     }
+}
 
-    for (key, attr) in &ext.global_attributes {
-        let new_key = rekey(key);
-        let mut new_attr = attr.clone();
-        // Chameleon: global attributes take on the including schema's target
-        // namespace, matching their re-keyed lookup entry.
-        if chameleon && new_attr.namespace.is_none() {
-            new_attr.namespace = target_ns.clone();
+/// Merge one kind of component for `merge_external_declarations`. A
+/// component the external schema reached by import (or every component,
+/// `by_import`) is merged as it is; with `chameleon_ns`, the others are
+/// re-keyed and fixed up.
+fn merge_components<V: Clone>(
+    map: &mut HashMap<ComponentKey, V>,
+    provenance: &mut Provenance<V>,
+    ext_map: &HashMap<ComponentKey, V>,
+    ext_provenance: &Provenance<V>,
+    by_import: bool,
+    chameleon_ns: Option<&Option<String>>,
+    fixup: impl Fn(&mut V, &Option<String>),
+) {
+    for (key, value) in ext_map {
+        let imported = by_import || ext_provenance.imported.contains(key);
+        let mut key = key.clone();
+        let mut value = value.clone();
+        if let (Some(target_ns), false) = (chameleon_ns, imported) {
+            if key.0.is_none() {
+                key.0 = target_ns.clone();
+            }
+            fixup(&mut value, target_ns);
         }
-        if chameleon {
-            chameleon_fixup_type_ref(&mut new_attr.type_ref, &target_ns);
-        }
-        validator
-            .global_attributes
-            .entry(new_key)
-            .or_insert(new_attr);
+        merge_component(map, provenance, key, value, imported);
     }
-
-    for (key, ag) in &ext.attribute_groups {
-        let new_key = rekey(key);
-        let mut new_ag = ag.clone();
-        if chameleon {
-            chameleon_fixup_attribute_decls(&mut new_ag.attributes, &target_ns);
-        }
-        validator.attribute_groups.entry(new_key).or_insert(new_ag);
+    for (key, value) in &ext_provenance.displaced {
+        merge_component(map, provenance, key.clone(), value.clone(), true);
     }
+}
 
-    for (key, mg) in &ext.model_groups {
-        let new_key = rekey(key);
-        let mut new_mg = mg.clone();
-        if chameleon {
-            chameleon_fixup_content_model(&mut new_mg.content, &target_ns);
+/// Insert a component merged from another schema document; `by_import`
+/// says whether it arrived through `xs:import`. Of two components with one
+/// key the first stays, as before, except for a no-namespace name held by
+/// one of the schema's own components and an imported one: the own one
+/// takes the key and the imported one is kept as displaced, so that a
+/// chameleon include of this schema can separate them again.
+fn merge_component<V>(
+    map: &mut HashMap<ComponentKey, V>,
+    provenance: &mut Provenance<V>,
+    key: ComponentKey,
+    value: V,
+    by_import: bool,
+) {
+    let held_by_import = provenance.imported.contains(&key);
+    match map.entry(key) {
+        Entry::Vacant(slot) => {
+            if by_import {
+                provenance.imported.insert(slot.key().clone());
+            }
+            slot.insert(value);
         }
-        validator.model_groups.entry(new_key).or_insert(new_mg);
+        Entry::Occupied(mut slot) => {
+            if slot.key().0.is_some() || by_import == held_by_import {
+                return;
+            }
+            let key = slot.key().clone();
+            if by_import {
+                provenance.displaced.push((key, value));
+            } else {
+                let old = slot.insert(value);
+                provenance.imported.remove(&key);
+                provenance.displaced.push((key, old));
+            }
+        }
+    }
+}
+
+/// Declare one of a schema document's own components. It replaces an
+/// earlier component with the same key, as before; an imported one is kept
+/// as displaced (see `merge_component`).
+pub(super) fn declare_own<V>(
+    map: &mut HashMap<ComponentKey, V>,
+    provenance: &mut Provenance<V>,
+    key: ComponentKey,
+    value: V,
+) {
+    let was_imported = provenance.imported.remove(&key);
+    if let Some(old) = map.insert(key.clone(), value) {
+        if was_imported {
+            provenance.displaced.push((key, old));
+        }
     }
 }
 
@@ -657,15 +826,50 @@ fn chameleon_fixup_particles(particles: &mut [Particle], target_ns: &Option<Stri
 /// schemas that reference their own target namespace types, or built-in
 /// types, without a prefix building as before. The decision looks names up
 /// in the set of defined types, so it is linear in the number of references.
+///
+/// A namespace one of whose schema documents was not loaded (a missing file
+/// or a skipped import hint) has absent components. A name that rule 1 or
+/// rule 2 would look for in such a namespace and does not find is refused
+/// (src-resolve): the missing document may define it, so no fallback may
+/// stand in for it.
 pub(super) fn resolve_unqualified_type_refs(validator: &mut XsdValidator) -> XmlResult<()> {
     let defined: HashSet<(Option<String>, String)> = validator.types.keys().cloned().collect();
+    let mut unloaded: HashMap<Option<String>, String> = HashMap::new();
+    for document in &validator.unloaded_documents {
+        unloaded
+            .entry(document.namespace.clone())
+            .or_insert_with(|| document.location.clone());
+    }
+    let refused: std::cell::RefCell<Option<XmlError>> = std::cell::RefCell::new(None);
+    let refuse = |name: &UnqualifiedTypeName, namespace: &Option<String>, location: &str| {
+        let mut refused = refused.borrow_mut();
+        if refused.is_none() {
+            let namespace = match namespace {
+                Some(ns) => format!("namespace '{}'", ns),
+                None => "no namespace".to_string(),
+            };
+            *refused = Some(XmlError::validation(format!(
+                "Type '{}' is not defined in {} (src-resolve): the schema document \
+                 '{}' for that namespace could not be loaded",
+                name.local, namespace, location
+            )));
+        }
+    };
     let resolve = |name: &UnqualifiedTypeName| -> TypeRef {
         let absent = (name.absent_ns.clone(), name.local.clone());
         if defined.contains(&absent) {
             return TypeRef::Named(absent.0, absent.1);
         }
         let in_target = (name.target_ns.clone(), name.local.clone());
+        if let Some(location) = unloaded.get(&name.absent_ns) {
+            refuse(name, &name.absent_ns, location);
+            return TypeRef::Named(absent.0, absent.1);
+        }
         if defined.contains(&in_target) {
+            return TypeRef::Named(in_target.0, in_target.1);
+        }
+        if let Some(location) = unloaded.get(&name.target_ns) {
+            refuse(name, &name.target_ns, location);
             return TypeRef::Named(in_target.0, in_target.1);
         }
         match parse_builtin_type(&name.local) {
@@ -674,7 +878,10 @@ pub(super) fn resolve_unqualified_type_refs(validator: &mut XsdValidator) -> Xml
         }
     };
     walk_unqualified_type_refs(validator, &resolve);
-    Ok(())
+    match refused.into_inner() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Replace every `TypeRef::Unqualified` of the validator's components with
@@ -870,7 +1077,12 @@ fn process_redefine_children(
                                 st.base_ref = Some(TypeRef::Named(old_key.0, old_key.1.clone()));
                                 st._base_type_local = Some(old_key.1);
                             }
-                            validator.types.insert(key, type_def);
+                            declare_own(
+                                &mut validator.types,
+                                &mut validator.imported.types,
+                                key,
+                                type_def,
+                            );
                         }
                     }
                 }
@@ -898,8 +1110,7 @@ fn process_redefine_children(
                             // self-referencing redefine: save old def under a unique key.
                             if let Some(ref base) = ct.base_type {
                                 if base.1 == *name && base.0 == target_ns {
-                                    let old_key =
-                                        (target_ns.clone(), format!("__redefine_base_{}", name));
+                                    let old_key = unused_redefine_key(validator, &target_ns, name);
                                     if let Some(old_td) = validator.types.get(&key).cloned() {
                                         validator.types.insert(old_key.clone(), old_td);
                                     }
@@ -910,12 +1121,27 @@ fn process_redefine_children(
                                             Some((old_key.0.clone(), old_key.1.clone()));
                                         new_ct.unqualified_base = None;
                                     }
-                                    validator.types.insert(key, new_td);
+                                    declare_own(
+                                        &mut validator.types,
+                                        &mut validator.imported.types,
+                                        key,
+                                        new_td,
+                                    );
                                 } else {
-                                    validator.types.insert(key, type_def);
+                                    declare_own(
+                                        &mut validator.types,
+                                        &mut validator.imported.types,
+                                        key,
+                                        type_def,
+                                    );
                                 }
                             } else {
-                                validator.types.insert(key, type_def);
+                                declare_own(
+                                    &mut validator.types,
+                                    &mut validator.imported.types,
+                                    key,
+                                    type_def,
+                                );
                             }
                         }
                     }
@@ -944,7 +1170,12 @@ fn process_redefine_children(
                                 validator.block_default_restriction,
                             )?;
                             let _ = old_mg; // suppress unused warning
-                            validator.model_groups.insert(key, mg_def);
+                            declare_own(
+                                &mut validator.model_groups,
+                                &mut validator.imported.model_groups,
+                                key,
+                                mg_def,
+                            );
                         }
                     }
                 }
@@ -959,7 +1190,12 @@ fn process_redefine_children(
                                 &validator.attribute_groups,
                             )?;
                             let key = (target_ns.clone(), name.to_string());
-                            validator.attribute_groups.insert(key, ag_def);
+                            declare_own(
+                                &mut validator.attribute_groups,
+                                &mut validator.imported.attribute_groups,
+                                key,
+                                ag_def,
+                            );
                         }
                     }
                 }
