@@ -628,3 +628,214 @@ fn uncanonicalizable_base_path_fails_closed() {
         err
     );
 }
+
+/// Write `files` to a fresh directory and build from the first one.
+fn build_files(label: &str, files: &[(&str, &str)]) -> XsdValidator {
+    let dir = mkdir_unique(label);
+    for (name, text) in files {
+        fs::write(dir.join(name), text).unwrap();
+    }
+    let entry = dir.join(files[0].0);
+    let schema_doc = parse(files[0].1).expect("parse schema");
+    let built = XsdValidator::from_schema_with_base_path(&schema_doc, Some(&entry));
+    fs::remove_dir_all(&dir).ok();
+    built.expect("build validator")
+}
+
+fn is_valid(validator: &XsdValidator, instance: &str) -> bool {
+    let doc = parse(instance).expect("parse instance");
+    validator.validate(&doc).is_empty()
+}
+
+/// A prefixed `substitutionGroup` is resolved with the namespace bindings in
+/// scope at the declaration, including those of `xs:schema`.
+#[test]
+fn substitution_group_prefix_resolves_with_in_scope_bindings() {
+    let main = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:b" xmlns:b="urn:b" xmlns:a="urn:a" elementFormDefault="qualified">
+<xs:import namespace="urn:a" schemaLocation="a.xsd"/>
+<xs:element name="m" type="xs:string" substitutionGroup="a:h"/>
+<xs:element name="m2" type="xs:string" substitutionGroup="q:h" xmlns:q="urn:a"/>
+<xs:element name="h" type="xs:string"/>
+<xs:element name="t"><xs:complexType><xs:sequence><xs:element ref="b:h"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#;
+    let a = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:a" xmlns:a="urn:a" elementFormDefault="qualified">
+<xs:element name="h" type="xs:string" abstract="true"/>
+<xs:element name="s"><xs:complexType><xs:sequence><xs:element ref="a:h"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#;
+    let validator = build_files(
+        "substitution-group-prefix",
+        &[("main.xsd", main), ("a.xsd", a)],
+    );
+    let ns = r#"xmlns:a="urn:a" xmlns:b="urn:b""#;
+    // Members of a:h, the head declared on xs:schema and on the element.
+    assert!(is_valid(
+        &validator,
+        &format!("<a:s {ns}><b:m>x</b:m></a:s>")
+    ));
+    assert!(is_valid(
+        &validator,
+        &format!("<a:s {ns}><b:m2>x</b:m2></a:s>")
+    ));
+    assert!(!is_valid(&validator, &format!("<a:s {ns}/>")));
+    // Not members of the target namespace's own `h`.
+    assert!(is_valid(
+        &validator,
+        &format!("<b:t {ns}><b:h>x</b:h></b:t>")
+    ));
+    assert!(!is_valid(
+        &validator,
+        &format!("<b:t {ns}><b:m>x</b:m></b:t>")
+    ));
+}
+
+/// Only a reference to a global element declaration admits the members of
+/// its substitution group; a local declaration with the head's expanded name
+/// is another declaration (XSTS elemZ021f shape).
+#[test]
+fn local_element_named_like_a_head_admits_no_substitution() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:m" xmlns:m="urn:m" elementFormDefault="qualified">
+<xs:element name="e"/>
+<xs:element name="e1" type="xs:int" substitutionGroup="m:e"/>
+<xs:element name="local"><xs:complexType><xs:sequence><xs:element name="e" type="xs:string"/></xs:sequence></xs:complexType></xs:element>
+<xs:element name="global"><xs:complexType><xs:sequence><xs:element ref="m:e"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#;
+    let validator =
+        XsdValidator::from_schema(&parse(schema).expect("parse schema")).expect("build validator");
+    let doc = |root: &str, child: &str| format!(r#"<m:{root} xmlns:m="urn:m">{child}</m:{root}>"#);
+    assert!(is_valid(&validator, &doc("local", "<m:e>x</m:e>")));
+    assert!(!is_valid(&validator, &doc("local", "<m:e1>1</m:e1>")));
+    assert!(is_valid(&validator, &doc("global", "<m:e1>1</m:e1>")));
+    assert!(!is_valid(&validator, &doc("global", "<m:e1>x</m:e1>")));
+}
+
+/// A `substitutionGroup` whose prefix has no binding names no head: the
+/// build is refused, naming the prefix, in a no-namespace schema as in a
+/// namespaced one (src-resolve).
+#[test]
+fn substitution_group_with_an_unbound_prefix_is_refused_at_build() {
+    let schemas = [
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:element name="h" type="xs:string"/>
+<xs:element name="m" type="xs:string" substitutionGroup="q:h"/>
+<xs:element name="r"><xs:complexType><xs:sequence><xs:element ref="h"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#,
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:m" xmlns:m="urn:m" elementFormDefault="qualified">
+<xs:element name="h" type="xs:string"/>
+<xs:element name="m" type="xs:string" substitutionGroup="q:h"/>
+</xs:schema>"#,
+    ];
+    for schema in schemas {
+        let err = XsdValidator::from_schema(&parse(schema).expect("parse schema"))
+            .err()
+            .expect("the build is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("'q'") && message.contains("substitutionGroup"),
+            "expected the unbound prefix to be named, got: {}",
+            message
+        );
+    }
+}
+
+/// A `substitutionGroup` value is an `xs:QName`: its prefix and its local
+/// part must each be an NCName. A part that is not, such as one ending in a
+/// no-break space or starting with a digit, refuses the build, naming the
+/// value. XML white space around the value is collapsed, and a name with
+/// non-ASCII letters is an NCName.
+#[test]
+fn substitution_group_qname_parts_must_be_ncnames() {
+    let schema = |head: &str, group: &str| {
+        format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:m" xmlns:m="urn:m" elementFormDefault="qualified">
+<xs:element name="{head}" type="xs:string"/>
+<xs:element name="p" type="xs:string" substitutionGroup="{group}"/>
+<xs:element name="r"><xs:complexType><xs:sequence><xs:element ref="m:{head}"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#
+        )
+    };
+    for group in ["m:h&#160;", "m:1h", "1m:h", "m:h&#x2003;", "m:h:i", "m:"] {
+        let err = XsdValidator::from_schema(&parse(&schema("h", group)).expect("parse schema"))
+            .err()
+            .unwrap_or_else(|| panic!("the build is refused for {:?}", group));
+        let message = err.to_string();
+        assert!(
+            message.contains("Invalid substitutionGroup QName"),
+            "expected the QName {:?} to be refused by name, got: {}",
+            group,
+            message
+        );
+    }
+    for (head, group) in [("h", " m:h "), ("h\u{e9}", "m:h\u{e9}"), ("h.-1", "m:h.-1")] {
+        let validator = XsdValidator::from_schema(&parse(&schema(head, group)).expect("parse"))
+            .unwrap_or_else(|e| panic!("{:?} builds: {}", group, e));
+        assert!(
+            is_valid(&validator, r#"<m:r xmlns:m="urn:m"><m:p>x</m:p></m:r>"#),
+            "p is a member of the head named by {:?}",
+            group
+        );
+    }
+}
+
+/// The prefix `xmlns` is never bound in a QName: it is not among an
+/// element's in-scope namespaces, although it is reserved for declarations.
+/// A `substitutionGroup` with that prefix refuses the build, naming the
+/// prefix, as any undeclared prefix does.
+#[test]
+fn substitution_group_with_the_xmlns_prefix_is_refused() {
+    let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:m" xmlns:m="urn:m" elementFormDefault="qualified">
+<xs:element name="h" type="xs:string"/>
+<xs:element name="p" type="xs:string" substitutionGroup="xmlns:h"/>
+<xs:element name="r"><xs:complexType><xs:sequence><xs:element ref="m:h"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#;
+    let err = XsdValidator::from_schema(&parse(schema).expect("parse schema"))
+        .err()
+        .expect("the build is refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("Undeclared namespace prefix 'xmlns'"),
+        "expected the prefix to be refused by name, got: {}",
+        message
+    );
+}
+
+/// An unprefixed `substitutionGroup` is a QName: it takes the default
+/// namespace in scope, or no namespace, never the target namespace by
+/// default. Here the head is a no-namespace `h`, so the member does not
+/// join the target namespace's `h`.
+#[test]
+fn unprefixed_substitution_group_uses_the_default_namespace() {
+    let main = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:t" xmlns:t="urn:t" elementFormDefault="qualified">
+<xs:import schemaLocation="n.xsd"/>
+<xs:element name="h" type="xs:string"/>
+<xs:element name="m" type="xs:string" substitutionGroup="h"/>
+<xs:element name="m2" type="xs:string" substitutionGroup="h" xmlns="urn:t"/>
+<xs:element name="r"><xs:complexType><xs:sequence><xs:element ref="t:h"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#;
+    let no_namespace = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:element name="h" type="xs:string"/>
+<xs:element name="s"><xs:complexType><xs:sequence><xs:element ref="h"/></xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#;
+    let validator = build_files(
+        "unprefixed-substitution-group",
+        &[("main.xsd", main), ("n.xsd", no_namespace)],
+    );
+    let t = r#"xmlns:t="urn:t""#;
+    // `m` is a member of the no-namespace `h` only.
+    assert!(is_valid(&validator, &format!("<s {t}><t:m>x</t:m></s>")));
+    assert!(!is_valid(
+        &validator,
+        &format!("<t:r {t}><t:m>x</t:m></t:r>")
+    ));
+    // `m2` sees the default namespace `urn:t`: a member of `t:h` only.
+    assert!(is_valid(
+        &validator,
+        &format!("<t:r {t}><t:m2>x</t:m2></t:r>")
+    ));
+    assert!(!is_valid(&validator, &format!("<s {t}><t:m2>x</t:m2></s>")));
+    // The heads themselves.
+    assert!(is_valid(
+        &validator,
+        &format!("<t:r {t}><t:h>x</t:h></t:r>")
+    ));
+    assert!(is_valid(&validator, "<s><h>x</h></s>"));
+}

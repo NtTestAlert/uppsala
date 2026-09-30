@@ -20,7 +20,7 @@ use crate::error::{XmlError, XmlResult};
 
 use super::builtins::{instant_is_unrepresentable, trim_xml_whitespace, values_equal};
 use super::composition::{
-    process_schema_composition, resolve_unqualified_type_refs, CompositionState,
+    declare_own, process_schema_composition, resolve_unqualified_type_refs, CompositionState,
 };
 use super::facet_resolution::{
     resolve_content_model_list_item_facets, resolve_inline_list_item_facets, ListBasesMap,
@@ -30,8 +30,9 @@ use super::parser::{
     parse_simple_type, resolve_type_name,
 };
 use super::types::{
-    AttributeDecl, BuiltInType, ComplexTypeDef, ContentModel, ElementDecl, Facet, Particle,
-    ParticleKind, SimpleTypeDef, TypeDef, TypeRef, UnqualifiedTypeName, XsdValidator,
+    AttributeDecl, BuiltInType, ComplexTypeDef, ContentModel, ElementDecl, Facet,
+    ImportedComponents, Particle, ParticleKind, SimpleTypeDef, TypeDef, TypeRef,
+    UnqualifiedTypeName, XsdValidator,
 };
 use super::validation::{qname_display, MAX_SIMPLE_TYPE_DEPTH};
 use super::XS_NAMESPACE;
@@ -527,6 +528,8 @@ impl XsdValidator {
             enforce_qname_length_facets: true,
             substitution_groups: HashMap::new(),
             lenient: false,
+            imported: ImportedComponents::default(),
+            unloaded_documents: Vec::new(),
         };
 
         let schema_elem = schema_doc
@@ -617,7 +620,12 @@ impl XsdValidator {
                                 qualified: true,
                             };
                             let key = (validator.target_namespace.clone(), name.to_string());
-                            validator.global_attributes.insert(key, decl);
+                            declare_own(
+                                &mut validator.global_attributes,
+                                &mut validator.imported.global_attributes,
+                                key,
+                                decl,
+                            );
                         }
                     }
                 }
@@ -717,7 +725,12 @@ impl XsdValidator {
                             validator.block_default_restriction,
                         )?;
                         let key = (validator.target_namespace.clone(), decl.name.clone());
-                        validator.elements.insert(key, decl);
+                        declare_own(
+                            &mut validator.elements,
+                            &mut validator.imported.elements,
+                            key,
+                            decl,
+                        );
                     }
                     "complexType" => {
                         let type_def = parse_complex_type(
@@ -734,7 +747,12 @@ impl XsdValidator {
                         if let TypeDef::Complex(ref ct) = type_def {
                             if let Some(name) = &ct.name {
                                 let key = (validator.target_namespace.clone(), name.clone());
-                                validator.types.insert(key, type_def);
+                                declare_own(
+                                    &mut validator.types,
+                                    &mut validator.imported.types,
+                                    key,
+                                    type_def,
+                                );
                             }
                         }
                     }
@@ -743,7 +761,12 @@ impl XsdValidator {
                         if let TypeDef::Simple(ref st) = type_def {
                             if let Some(name) = &st.name {
                                 let key = (validator.target_namespace.clone(), name.clone());
-                                validator.types.insert(key, type_def);
+                                declare_own(
+                                    &mut validator.types,
+                                    &mut validator.imported.types,
+                                    key,
+                                    type_def,
+                                );
                             }
                         }
                     }
@@ -791,7 +814,12 @@ impl XsdValidator {
                                     qualified: true,
                                 };
                                 let key = (validator.target_namespace.clone(), name.to_string());
-                                validator.global_attributes.insert(key, decl);
+                                declare_own(
+                                    &mut validator.global_attributes,
+                                    &mut validator.imported.global_attributes,
+                                    key,
+                                    decl,
+                                );
                             }
                         }
                     }

@@ -2118,7 +2118,186 @@ fn positions_count_lf_lines_and_byte_columns() {
 
 // ─── Chameleon includes of modules that import ─────────────
 
+/// Write `files` into a fresh directory and build `files[0]` with that
+/// directory as its base, returning the build result.
+fn try_build_files(
+    label: &str,
+    files: &[(&str, String)],
+) -> (Result<XsdValidator, String>, PathBuf) {
+    let dir = mkdir_unique(label);
+    for (name, text) in files {
+        fs::write(dir.join(name), text).unwrap();
+    }
+    let main_path = dir.join(files[0].0);
+    (build_with_base(&files[0].1, &main_path), dir)
+}
+
+fn with_target_namespace(target_ns: &str, body: &str) -> String {
+    format!(
+        r#"<xs:schema {} targetNamespace="{}">{}</xs:schema>"#,
+        XS, target_ns, body
+    )
+}
+
 const NAME_MAX_3: &str = r#"<xs:simpleType name="Name"><xs:restriction base="xs:string"><xs:maxLength value="3"/></xs:restriction></xs:simpleType>"#;
+const NAME_MAX_10: &str = r#"<xs:simpleType name="Name"><xs:restriction base="xs:string"><xs:maxLength value="10"/></xs:restriction></xs:simpleType>"#;
+
+/// A chameleon include (XSD 1.0 Part 1 §4.2.1) changes only the included
+/// document's own components. A namespaced document the included module
+/// imports keeps its names: its unprefixed `Name` without a default
+/// namespace is `{absent}Name`, wherever that is defined, and neither the
+/// built-in `xs:Name` nor a type of the including namespace.
+#[test]
+fn chameleon_include_leaves_the_names_of_imported_documents_alone() {
+    let b_xsd = |import_c: &str| {
+        with_target_namespace(
+            "urn:b",
+            &format!(r#"{}<xs:element name="e" type="Name"/>"#, import_c),
+        )
+    };
+    let a_xsd = schema(r#"<xs:import namespace="urn:b" schemaLocation="b.xsd"/>"#);
+    let e_cases: &[(&str, bool)] = &[
+        (r#"<b:e xmlns:b="urn:b">AB</b:e>"#, true),
+        (r#"<b:e xmlns:b="urn:b">ABCDE</b:e>"#, false),
+    ];
+
+    // The including schema imports the no-namespace `Name`; the included
+    // module imports the document that uses it.
+    let (validator, dir) = build_files(
+        "chameleon-import-absent",
+        &[
+            (
+                "main.xsd",
+                with_target_namespace(
+                    "urn:m",
+                    r#"<xs:import schemaLocation="c.xsd"/><xs:include schemaLocation="a.xsd"/>"#,
+                ),
+            ),
+            ("c.xsd", schema(NAME_MAX_3)),
+            ("a.xsd", a_xsd.clone()),
+            ("b.xsd", b_xsd("<xs:import/>")),
+        ],
+    );
+    assert_instances(&validator, e_cases);
+    let _ = fs::remove_dir_all(&dir);
+
+    // The same, and the including namespace has a `Name` of its own.
+    let (validator, dir) = build_files(
+        "chameleon-import-collision",
+        &[
+            (
+                "main.xsd",
+                with_target_namespace(
+                    "urn:m",
+                    &format!(
+                        r#"<xs:import schemaLocation="c.xsd"/><xs:include schemaLocation="a.xsd"/>{}"#,
+                        NAME_MAX_10
+                    ),
+                ),
+            ),
+            ("c.xsd", schema(NAME_MAX_3)),
+            ("a.xsd", a_xsd.clone()),
+            ("b.xsd", b_xsd("<xs:import/>")),
+        ],
+    );
+    assert_instances(&validator, e_cases);
+    let _ = fs::remove_dir_all(&dir);
+
+    // The imported document imports the no-namespace `Name` itself.
+    let (validator, dir) = build_files(
+        "chameleon-import-nested",
+        &[
+            (
+                "main.xsd",
+                with_target_namespace("urn:m", r#"<xs:include schemaLocation="a.xsd"/>"#),
+            ),
+            ("c.xsd", schema(NAME_MAX_3)),
+            ("a.xsd", a_xsd.clone()),
+            ("b.xsd", b_xsd(r#"<xs:import schemaLocation="c.xsd"/>"#)),
+        ],
+    );
+    assert_instances(&validator, e_cases);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A chameleon-included module that defines a `Name` of its own and reaches
+/// a no-namespace `Name` through an import: its own moves into the including
+/// namespace with the module's element, while the imported `{absent}Name`
+/// stays for the imported document. Both are needed; neither replaces the
+/// other.
+#[test]
+fn chameleon_include_separates_an_own_name_from_an_imported_one() {
+    let b_xsd = with_target_namespace(
+        "urn:b",
+        r#"<xs:import schemaLocation="c.xsd"/><xs:element name="e" type="Name"/>"#,
+    );
+    let (validator, dir) = build_files(
+        "chameleon-import-own-name",
+        &[
+            (
+                "main.xsd",
+                with_target_namespace("urn:m", r#"<xs:include schemaLocation="a.xsd"/>"#),
+            ),
+            ("c.xsd", schema(NAME_MAX_3)),
+            (
+                "a.xsd",
+                schema(&format!(
+                    r#"<xs:import namespace="urn:b" schemaLocation="b.xsd"/>{}<xs:element name="x" type="Name"/>"#,
+                    NAME_MAX_10
+                )),
+            ),
+            ("b.xsd", b_xsd),
+        ],
+    );
+    assert_instances(
+        &validator,
+        &[
+            (r#"<b:e xmlns:b="urn:b">AB</b:e>"#, true),
+            (r#"<b:e xmlns:b="urn:b">ABCDE</b:e>"#, false),
+            (r#"<m:x xmlns:m="urn:m">ABCDEFGH</m:x>"#, true),
+            (r#"<m:x xmlns:m="urn:m">ABCDEFGHIJKL</m:x>"#, false),
+        ],
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The local elements of a document that a chameleon-included module
+/// imports keep their namespace: an unqualified local element is in no
+/// namespace, not in the including one.
+#[test]
+fn chameleon_include_leaves_the_local_elements_of_imported_documents_alone() {
+    let (validator, dir) = build_files(
+        "chameleon-import-local",
+        &[
+            (
+                "main.xsd",
+                with_target_namespace("urn:m", r#"<xs:include schemaLocation="a.xsd"/>"#),
+            ),
+            (
+                "a.xsd",
+                schema(r#"<xs:import namespace="urn:b" schemaLocation="b.xsd"/>"#),
+            ),
+            (
+                "b.xsd",
+                with_target_namespace(
+                    "urn:b",
+                    r#"<xs:element name="r"><xs:complexType><xs:sequence><xs:element name="c" type="xs:string"/></xs:sequence></xs:complexType></xs:element>"#,
+                ),
+            ),
+        ],
+    );
+    assert_instances(
+        &validator,
+        &[
+            (r#"<b:r xmlns:b="urn:b"><c>x</c></b:r>"#, true),
+            (
+                r#"<b:r xmlns:b="urn:b" xmlns:m="urn:m"><m:c>x</m:c></b:r>"#,
+                false,
+            ),
+        ],
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
 
 /// An unprefixed name without a default namespace resolves to a type of an
 /// included no-namespace document in every place a type name occurs: a list
@@ -2161,6 +2340,128 @@ fn unprefixed_names_resolve_across_documents_in_every_position() {
 }
 
 // ─── Schema documents that are not loaded ──────────────────
+
+/// A `schemaLocation` that names no file is not an error by itself, but the
+/// document's components are absent: a type name that needed them is not
+/// defined (src-resolve), and the build refuses it rather than taking a
+/// built-in type of the same name. An import nothing refers to stays
+/// harmless.
+#[test]
+fn names_that_need_a_missing_document_are_refused() {
+    // The import names no namespace, so the missing document would define
+    // `{absent}date`, which the unprefixed `date` refers to.
+    let (result, dir) = try_build_files(
+        "missing-import",
+        &[(
+            "main.xsd",
+            with_target_namespace(
+                "urn:t",
+                r#"<xs:import schemaLocation="missing.xsd"/><xs:element name="e" type="date"/>"#,
+            ),
+        )],
+    );
+    let error = result.err().expect("schema refused");
+    assert!(
+        error.contains("'date'") && error.contains("missing.xsd") && error.contains("src-resolve"),
+        "{}",
+        error
+    );
+    let _ = fs::remove_dir_all(&dir);
+
+    // The same name in a list item type and a union member.
+    for body in [
+        r#"<xs:simpleType name="L"><xs:list itemType="date"/></xs:simpleType>"#,
+        r#"<xs:simpleType name="U"><xs:union memberTypes="date xs:int"/></xs:simpleType>"#,
+    ] {
+        let (result, dir) = try_build_files(
+            "missing-import-positions",
+            &[(
+                "main.xsd",
+                with_target_namespace(
+                    "urn:t",
+                    &format!(r#"<xs:import schemaLocation="missing.xsd"/>{}"#, body),
+                ),
+            )],
+        );
+        assert!(result.is_err(), "{}", body);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A missing include of a no-namespace schema: `Name` would have been
+    // its type, so it is not the built-in `xs:Name`.
+    let (result, dir) = try_build_files(
+        "missing-include",
+        &[(
+            "main.xsd",
+            schema(r#"<xs:include schemaLocation="types.xsd"/><xs:element name="e" type="Name"/>"#),
+        )],
+    );
+    let error = result.err().expect("schema refused");
+    assert!(error.contains("types.xsd"), "{}", error);
+    let _ = fs::remove_dir_all(&dir);
+
+    // Unused: the missing import is simply unavailable, as before.
+    let (validator, dir) = build_files(
+        "missing-import-unused",
+        &[(
+            "main.xsd",
+            with_target_namespace(
+                "urn:t",
+                r#"<xs:import schemaLocation="missing.xsd"/><xs:import namespace="urn:x" schemaLocation="missing-x.xsd"/>
+                   <xs:element name="e" type="xs:date"/>"#,
+            ),
+        )],
+    );
+    assert_instances(
+        &validator,
+        &[
+            (r#"<t:e xmlns:t="urn:t">2020-01-01</t:e>"#, true),
+            (r#"<t:e xmlns:t="urn:t">01.01.2020</t:e>"#, false),
+        ],
+    );
+    let _ = fs::remove_dir_all(&dir);
+
+    // A missing import of another namespace does not concern `{absent}date`:
+    // the name keeps its legacy reading.
+    let (validator, dir) = build_files(
+        "missing-import-other-namespace",
+        &[(
+            "main.xsd",
+            with_target_namespace(
+                "urn:t",
+                r#"<xs:import namespace="urn:x" schemaLocation="missing-x.xsd"/><xs:element name="e" type="date"/>"#,
+            ),
+        )],
+    );
+    assert_instances(
+        &validator,
+        &[(r#"<t:e xmlns:t="urn:t">2020-01-01</t:e>"#, true)],
+    );
+    let _ = fs::remove_dir_all(&dir);
+
+    // A document of the namespace that is loaded defines the name: resolved.
+    let (validator, dir) = build_files(
+        "missing-import-name-found",
+        &[
+            (
+                "main.xsd",
+                with_target_namespace(
+                    "urn:t",
+                    r#"<xs:import schemaLocation="missing.xsd"/><xs:import schemaLocation="n.xsd"/><xs:element name="e" type="Name"/>"#,
+                ),
+            ),
+            ("n.xsd", schema(NAME_MAX_3)),
+        ],
+    );
+    assert_instances(
+        &validator,
+        &[
+            (r#"<t:e xmlns:t="urn:t">AB</t:e>"#, true),
+            (r#"<t:e xmlns:t="urn:t">ABCDE</t:e>"#, false),
+        ],
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
 
 /// Characters that Unicode calls white space but XML does not (XML white
 /// space is only `#x20`, `#x9`, `#xD` and `#xA`): no-break space, em space,
