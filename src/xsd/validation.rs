@@ -41,8 +41,9 @@ fn attr_decl_matches(attr: &crate::dom::Attribute<'_>, decl: &AttributeDecl) -> 
 enum XsiTypeResult {
     /// A built-in XSD type like xs:string, xs:int, etc.
     BuiltIn(BuiltInType),
-    /// A named type definition from the schema.
-    Named(Box<TypeDef>),
+    /// A named type definition from the schema, with the key it was found
+    /// under.
+    Named((Option<String>, String), Box<TypeDef>),
     /// The xsi:type QName could not be resolved.
     NotFound(String),
 }
@@ -321,9 +322,13 @@ impl XsdValidator {
 
         // Resolve prefix to namespace URI
         let type_ns = if let Some(pfx) = prefix {
-            // Look up prefix in namespace declarations
+            // Look up prefix in namespace declarations. A prefix without a
+            // binding names no type (cvc-elt.4.1).
             let resolver = build_resolver_for_node(doc, node);
-            resolver.resolve(pfx).map(|s| s.to_string())
+            match resolver.resolve(pfx) {
+                Some(uri) => Some(uri.to_string()),
+                None => return Some(XsiTypeResult::NotFound(xsi_type_value.to_string())),
+            }
         } else {
             // No prefix — use default namespace if present
             // Per XSD spec, an unprefixed QName in xsi:type uses the default namespace
@@ -338,15 +343,12 @@ impl XsdValidator {
             }
         }
 
-        // Try looking up in schema types
-        let key = (type_ns.clone(), local_name.to_string());
+        // Look the expanded name up in the schema types. A type of another
+        // namespace with the same local name is a different type, so there is
+        // no fallback to the no-namespace key.
+        let key = (type_ns, local_name.to_string());
         if let Some(td) = self.types.get(&key) {
-            return Some(XsiTypeResult::Named(Box::new(td.clone())));
-        }
-        // Also try without namespace
-        let key_no_ns = (None, local_name.to_string());
-        if let Some(td) = self.types.get(&key_no_ns) {
-            return Some(XsiTypeResult::Named(Box::new(td.clone())));
+            return Some(XsiTypeResult::Named(key, Box::new(td.clone())));
         }
 
         Some(XsiTypeResult::NotFound(xsi_type_value.to_string()))
@@ -435,87 +437,60 @@ impl XsdValidator {
         None
     }
 
-    /// Check if `xsi_type` is the declared type or derived from it.
-    ///
-    /// The declared element type is given as a `TypeRef`. Returns `true` if the
-    /// xsi:type is valid for substitution (ignoring block constraints).
-    fn is_type_derived_from_decl(&self, xsi_type: &TypeDef, decl_type_ref: &TypeRef) -> bool {
-        // Get the declared type's key (namespace, local_name)
+    /// Check if the `xsi:type` type found under `xsi_key` is the declared type
+    /// or derived from it (cvc-elt.4.3), ignoring block constraints.
+    fn is_type_derived_from_decl(
+        &self,
+        xsi_key: &(Option<String>, String),
+        decl_type_ref: &TypeRef,
+    ) -> bool {
         let decl_key = match decl_type_ref {
             TypeRef::Named(ns, name) => (ns.clone(), name.clone()),
-            TypeRef::BuiltIn(bt) => {
-                // xsi:type is always a named type here, AnyType allows everything
-                if *bt == BuiltInType::AnyType {
-                    return true;
-                }
-                // For other built-in types, the xsi:type must match exactly
-                // (named schema types can't derive from built-in complex types normally)
-                return false;
-            }
-            TypeRef::Inline(_) => {
-                // Inline (anonymous) type — xsi:type substitution is not meaningful
-                // since you can't name the declared type. Allow it.
-                return true;
-            }
+            // Every type derives from xs:anyType; a named schema type is not
+            // compared with the other built-in types here.
+            TypeRef::BuiltIn(bt) => return *bt == BuiltInType::AnyType,
+            // An anonymous type has no name, so no QName names it, and a
+            // named type can only derive from a named base: no `xsi:type`
+            // is validly derived from it.
+            TypeRef::Inline(_) => return false,
             // Decided at build; never present in a built validator.
             TypeRef::Unqualified(_) => return false,
         };
-
-        // Check if xsi:type IS the declared type
-        let xsi_key = match xsi_type {
-            TypeDef::Complex(ct) => {
-                if let Some(ref name) = ct.name {
-                    // Try to match: check if namespace+name matches decl_key
-                    // We need the type's namespace. Walk through the types map to find it.
-                    if let Some(found_key) = self.find_type_key_by_typedef(xsi_type) {
-                        if found_key == decl_key {
-                            return true;
-                        }
-                        found_key
-                    } else {
-                        // Anonymous type — can't be the same as a named declared type
-                        (None, name.clone())
-                    }
-                } else {
-                    return false; // anonymous type, can't match
-                }
-            }
-            TypeDef::Simple(st) => {
-                if let Some(ref name) = st.name {
-                    if let Some(found_key) = self.find_type_key_by_typedef(xsi_type) {
-                        if found_key == decl_key {
-                            return true;
-                        }
-                        found_key
-                    } else {
-                        (None, name.clone())
-                    }
-                } else {
-                    return false;
-                }
-            }
-        };
-
-        // Walk the derivation chain of xsi:type to see if it eventually derives from decl_key
-        self.is_derived_from(&xsi_key, &decl_key)
+        *xsi_key == decl_key || self.is_derived_from(xsi_key, &decl_key)
     }
 
-    /// Find the key in `self.types` that corresponds to a given `TypeDef`.
-    ///
-    /// Searches the types map by matching the type's name field against the map's
-    /// local name component. Returns the full `(Option<namespace>, name)` key.
-    fn find_type_key_by_typedef(&self, td: &TypeDef) -> Option<(Option<String>, String)> {
-        let name = match td {
-            TypeDef::Complex(ct) => ct.name.as_ref()?,
-            TypeDef::Simple(st) => st.name.as_ref()?,
+    /// Check that a built-in `xsi:type` type is the declared type or derived
+    /// from it (cvc-elt.4.3), and that no derivation step is blocked by the
+    /// element declaration. A built-in type derives only from built-in types,
+    /// so a declared schema type, named or anonymous, admits none.
+    fn builtin_xsi_type_error(&self, xsi_type: &BuiltInType, decl: &ElementDecl) -> Option<String> {
+        let not_derived = || {
+            Some(format!(
+                "xsi:type '{}' is not derived from the declared element type",
+                self.builtin_type_name(xsi_type)
+            ))
         };
-        // Look for it in the types map
-        for key in self.types.keys() {
-            if &key.1 == name {
-                return Some(key.clone());
+        let TypeRef::BuiltIn(declared) = &decl.type_ref else {
+            return not_derived();
+        };
+        let mut current = Some(xsi_type.clone());
+        let mut steps = 0;
+        while let Some(t) = current {
+            if t == *declared {
+                // Every built-in derivation step is a restriction, or a list
+                // of xs:anySimpleType, which a block on restriction also
+                // covers (cos-st-derived-ok 2.1).
+                if steps > 0 && decl.block_restriction {
+                    return Some(
+                        "Type substitution blocked: derivation chain includes restriction, which is blocked by element declaration".to_string(),
+                    );
+                }
+                return None;
             }
+            current = builtin_base_type(&t);
+            steps += 1;
         }
-        None
+        not_derived()
     }
 
     /// Check if a type identified by `type_key` is derived (directly or transitively)
@@ -838,6 +813,9 @@ impl XsdValidator {
         let has_child_elements = self.element_has_child_elements(doc, node);
         let is_empty = !has_child_elements && doc.text_content_deep(node).is_empty();
         let supplied = decl.fixed.as_deref().filter(|_| is_empty);
+        // The type the element is assessed against: a valid `xsi:type`
+        // replaces the declared type (cvc-elt.4.3).
+        let mut actual_type = decl.type_ref.clone();
         if decl.fixed.is_some() {
             let is_id = self
                 .element_value_type(decl)
@@ -855,7 +833,10 @@ impl XsdValidator {
             }
         }
 
-        // Check for xsi:type override
+        // Check for xsi:type override. A valid substitution replaces the
+        // declared type for the element's content (cvc-elt.4.3); the
+        // declaration's fixed value and identity constraints still apply
+        // after it (cvc-elt.5, cvc-elt.6).
         if let Some(xsi_type_ref) = self.resolve_xsi_type(doc, node) {
             match xsi_type_ref {
                 XsiTypeResult::BuiltIn(bt) => {
@@ -864,6 +845,14 @@ impl XsdValidator {
                         errors.push(ValidationError {
                             message: "xs:NOTATION cannot be used as the type of an element"
                                 .to_string(),
+                            line: Some(doc.node_line(node)),
+                            column: Some(doc.node_column(node)),
+                        });
+                        return;
+                    }
+                    if let Some(message) = self.builtin_xsi_type_error(&bt, decl) {
+                        errors.push(ValidationError {
+                            message,
                             line: Some(doc.node_line(node)),
                             column: Some(doc.node_column(node)),
                         });
@@ -890,11 +879,11 @@ impl XsdValidator {
                         };
                         validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
                     }
-                    return;
+                    actual_type = TypeRef::BuiltIn(bt);
                 }
-                XsiTypeResult::Named(td) => {
+                XsiTypeResult::Named(xsi_key, td) => {
                     // Check that xsi:type is the declared type or derived from it
-                    if !self.is_type_derived_from_decl(&td, &decl.type_ref) {
+                    if !self.is_type_derived_from_decl(&xsi_key, &decl.type_ref) {
                         let type_name = match td.as_ref() {
                             TypeDef::Complex(ct) => ct.name.as_deref().unwrap_or("anonymous"),
                             TypeDef::Simple(st) => st.name.as_deref().unwrap_or("anonymous"),
@@ -955,7 +944,7 @@ impl XsdValidator {
                             self.validate_simple_content(doc, node, &st, supplied, errors);
                         }
                     }
-                    return;
+                    actual_type = TypeRef::Named(xsi_key.0, xsi_key.1);
                 }
                 XsiTypeResult::NotFound(type_name) => {
                     errors.push(ValidationError {
@@ -966,49 +955,48 @@ impl XsdValidator {
                     return;
                 }
             }
-        }
+        } else {
+            let type_def = self.resolve_type(&decl.type_ref);
 
-        let type_def = self.resolve_type(&decl.type_ref);
-
-        match type_def {
-            Some(TypeDef::Complex(ct)) => {
-                self.validate_complex_content(doc, node, ct, supplied, errors);
-            }
-            Some(TypeDef::Simple(st)) => {
-                // Simple types cannot have child elements
-                if self.element_has_child_elements(doc, node) {
-                    let elem_name = doc
-                        .element(node)
-                        .map(|e| &*e.name.local_name)
-                        .unwrap_or("?");
-                    errors.push(ValidationError {
-                        message: format!(
-                            "Element '{}' has simple type but contains child elements",
-                            elem_name
-                        ),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
+            match type_def {
+                Some(TypeDef::Complex(ct)) => {
+                    self.validate_complex_content(doc, node, ct, supplied, errors);
                 }
-                self.validate_simple_content(doc, node, st, supplied, errors);
-            }
-            None => {
-                // If type can't be resolved, check if it's a built-in
-                match &decl.type_ref {
-                    TypeRef::BuiltIn(bt) => match bt {
-                        BuiltInType::AnyType => {
-                            // AnyType allows any content, but we should still
-                            // validate child elements against their own declarations.
-                            self.validate_children_against_global_decls(doc, node, errors);
-                        }
-                        _ => {
-                            // Built-in simple types cannot have child elements
-                            if self.element_has_child_elements(doc, node) {
-                                let elem_name = doc
-                                    .element(node)
-                                    .map(|e| &*e.name.local_name)
-                                    .unwrap_or("?");
-                                errors.push(ValidationError {
+                Some(TypeDef::Simple(st)) => {
+                    // Simple types cannot have child elements
+                    if self.element_has_child_elements(doc, node) {
+                        let elem_name = doc
+                            .element(node)
+                            .map(|e| &*e.name.local_name)
+                            .unwrap_or("?");
+                        errors.push(ValidationError {
+                            message: format!(
+                                "Element '{}' has simple type but contains child elements",
+                                elem_name
+                            ),
+                            line: Some(doc.node_line(node)),
+                            column: Some(doc.node_column(node)),
+                        });
+                    }
+                    self.validate_simple_content(doc, node, st, supplied, errors);
+                }
+                None => {
+                    // If type can't be resolved, check if it's a built-in
+                    match &decl.type_ref {
+                        TypeRef::BuiltIn(bt) => match bt {
+                            BuiltInType::AnyType => {
+                                // AnyType allows any content, but we should still
+                                // validate child elements against their own declarations.
+                                self.validate_children_against_global_decls(doc, node, errors);
+                            }
+                            _ => {
+                                // Built-in simple types cannot have child elements
+                                if self.element_has_child_elements(doc, node) {
+                                    let elem_name = doc
+                                        .element(node)
+                                        .map(|e| &*e.name.local_name)
+                                        .unwrap_or("?");
+                                    errors.push(ValidationError {
                                     message: format!(
                                         "Element '{}' has simple type '{:?}' but contains child elements",
                                         elem_name, bt
@@ -1016,32 +1004,33 @@ impl XsdValidator {
                                     line: Some(doc.node_line(node)),
                                     column: Some(doc.node_column(node)),
                                 });
+                                }
+                                let text = match supplied {
+                                    Some(text) => text.to_string(),
+                                    None => doc.text_content_deep(node),
+                                };
+                                validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
                             }
-                            let text = match supplied {
-                                Some(text) => text.to_string(),
-                                None => doc.text_content_deep(node),
-                            };
-                            validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
+                        },
+                        TypeRef::Named(ns, name) => {
+                            let display = ns
+                                .as_ref()
+                                .map(|uri| format!("{{{}}}{}", uri, name))
+                                .unwrap_or_else(|| name.clone());
+                            errors.push(ValidationError {
+                                message: format!("Type '{}' not found", display),
+                                line: Some(doc.node_line(node)),
+                                column: Some(doc.node_column(node)),
+                            });
                         }
-                    },
-                    TypeRef::Named(ns, name) => {
-                        let display = ns
-                            .as_ref()
-                            .map(|uri| format!("{{{}}}{}", uri, name))
-                            .unwrap_or_else(|| name.clone());
-                        errors.push(ValidationError {
-                            message: format!("Type '{}' not found", display),
+                        // Decided at build; never present in a built validator.
+                        TypeRef::Unqualified(name) => errors.push(ValidationError {
+                            message: format!("Type '{}' not found", name.local),
                             line: Some(doc.node_line(node)),
                             column: Some(doc.node_column(node)),
-                        });
+                        }),
+                        TypeRef::Inline(_) => {}
                     }
-                    // Decided at build; never present in a built validator.
-                    TypeRef::Unqualified(name) => errors.push(ValidationError {
-                        message: format!("Type '{}' not found", name.local),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    }),
-                    TypeRef::Inline(_) => {}
                 }
             }
         }
@@ -1049,7 +1038,8 @@ impl XsdValidator {
         // Check the fixed-value constraint of a non-empty element
         // (cvc-elt.5.2.2). The element must have no element children
         // (5.2.2.1), whatever its content type, mixed included; then its
-        // text is compared by value with the fixed value, read in the
+        // text, read in the actual type (the `xsi:type` type when one
+        // applies), is compared by value with the fixed value, read in the
         // declared type, or character for character for mixed content
         // (5.2.2.2); see `element_matches_fixed_value`.
         if let Some(ref fixed_value) = decl.fixed.as_ref().filter(|_| has_child_elements) {
@@ -1067,7 +1057,7 @@ impl XsdValidator {
                 &text,
                 fixed_value,
                 &decl.type_ref,
-                &decl.type_ref,
+                &actual_type,
                 doc,
                 node,
             );
@@ -3144,6 +3134,54 @@ type UnionMemo = HashMap<(usize, String), Option<(String, BuiltInType)>>;
 /// Maximum number of restriction steps in a simple type's derivation chain,
 /// and of nested union member / list item types, followed during validation.
 pub(super) const MAX_SIMPLE_TYPE_DEPTH: usize = 64;
+
+/// The base type of a built-in type in the XSD 1.0 Part 2 type hierarchy
+/// (§3, the built-in datatype hierarchy); `None` for `xs:anyType`. The list
+/// types are derived from `xs:anySimpleType`.
+fn builtin_base_type(bt: &BuiltInType) -> Option<BuiltInType> {
+    use BuiltInType as B;
+    Some(match bt {
+        B::AnyType => return None,
+        B::AnySimpleType => B::AnyType,
+        B::String
+        | B::Boolean
+        | B::Decimal
+        | B::Float
+        | B::Double
+        | B::Duration
+        | B::DateTime
+        | B::Time
+        | B::Date
+        | B::GYearMonth
+        | B::GYear
+        | B::GMonthDay
+        | B::GDay
+        | B::GMonth
+        | B::HexBinary
+        | B::Base64Binary
+        | B::AnyURI
+        | B::QName
+        | B::NOTATION
+        | B::IDREFS
+        | B::NMTOKENS
+        | B::ENTITIES => B::AnySimpleType,
+        B::NormalizedString => B::String,
+        B::Token => B::NormalizedString,
+        B::Language | B::NMTOKEN | B::Name => B::Token,
+        B::NCName => B::Name,
+        B::ID | B::IDREF | B::ENTITY => B::NCName,
+        B::Integer => B::Decimal,
+        B::NonPositiveInteger | B::Long | B::NonNegativeInteger => B::Integer,
+        B::NegativeInteger => B::NonPositiveInteger,
+        B::Int => B::Long,
+        B::Short => B::Int,
+        B::Byte => B::Short,
+        B::UnsignedLong | B::PositiveInteger => B::NonNegativeInteger,
+        B::UnsignedInt => B::UnsignedLong,
+        B::UnsignedShort => B::UnsignedInt,
+        B::UnsignedByte => B::UnsignedShort,
+    })
+}
 
 /// How a derivation step's facets are applied: to an atomic value of the
 /// given built-in type, whose step reads its enumeration literals with the
