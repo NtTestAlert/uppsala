@@ -36,8 +36,7 @@ pub(super) fn resolve_inline_list_item_facets(
                 // handles this for named derived types; this covers anonymous
                 // inline types embedded in element declarations and particles.
                 if !st.is_list {
-                    if let Some(base_local) = &st._base_type_local {
-                        let base_key = (schema_ns.clone(), base_local.clone());
+                    if let Some(base_key) = st.named_base_key() {
                         if let Some((item_type, item_facets)) = list_bases.get(&base_key) {
                             st.is_list = true;
                             if st.item_type.is_none() {
@@ -50,8 +49,7 @@ pub(super) fn resolve_inline_list_item_facets(
                     }
                 }
                 if st.is_list {
-                    if let Some(item_name) = &st._item_type_local {
-                        let item_key = (schema_ns.clone(), item_name.clone());
+                    if let Some(item_key) = st.named_item_key() {
                         if let Some((item_base, item_facets)) = resolved_items.get(&item_key) {
                             st.item_type = Some(item_base.clone());
                             st.item_facets = item_facets.clone();

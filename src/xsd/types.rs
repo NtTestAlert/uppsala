@@ -135,6 +135,28 @@ pub(crate) enum TypeRef {
     Named(Option<String>, String), // (namespace, local_name)
     Inline(Box<TypeDef>),
     BuiltIn(BuiltInType),
+    /// An unprefixed type QName in a schema document with no default
+    /// namespace declaration. Which type it names depends on the composed
+    /// schema, so it is decided after composition (see
+    /// `resolve_unqualified_type_refs`); no reference of this kind remains in
+    /// a built validator.
+    Unqualified(Box<UnqualifiedTypeName>),
+}
+
+/// An unprefixed type QName read without a default namespace. XSD names it
+/// `{absent}local`, which a chameleon include moves into the including
+/// schema's target namespace (`absent_ns`). As legacy leniencies for schemas
+/// that are invalid under that rule, it may instead name a type of the
+/// schema document's target namespace (`target_ns`) or a built-in type.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UnqualifiedTypeName {
+    /// The namespace of `{absent}local` in the composed schema: no namespace,
+    /// or the including schema's target namespace after a chameleon include.
+    pub(super) absent_ns: Option<String>,
+    /// The target namespace of the schema document the name was read in
+    /// (moved by a chameleon include like `absent_ns`).
+    pub(super) target_ns: Option<String>,
+    pub(super) local: String,
 }
 
 /// A type definition (complex or simple).
@@ -306,6 +328,10 @@ pub(crate) struct ComplexTypeDef {
     /// Unresolved attribute group references (namespace, local_name) from xs:attributeGroup ref.
     /// Used to re-resolve after xs:redefine updates the attribute group definition.
     pub(super) attribute_group_refs: Vec<(Option<String>, String)>,
+    /// A `base` written as an unprefixed QName without a default namespace:
+    /// `base_type` (and a base kept in `content`) is decided after
+    /// composition from this name. `None` once decided.
+    pub(super) unqualified_base: Option<Box<UnqualifiedTypeName>>,
 }
 
 /// Content model for a complex type.
@@ -400,6 +426,33 @@ pub(crate) struct SimpleTypeDef {
     pub(super) _base_type_local: Option<String>,
     /// Non-builtin item type local name, for resolving in post-processing.
     pub(super) _item_type_local: Option<String>,
+    /// The base of a restriction when it is not a built-in type: a named
+    /// user-defined type (its QName resolved with the prefix bindings in scope
+    /// at the declaration) or an anonymous `<simpleType>` child. `None` when
+    /// the base is the built-in type in `base`. Validation follows this chain
+    /// and checks every step's facets.
+    pub(super) base_ref: Option<TypeRef>,
+    /// For list types whose item type is not a built-in: the named item type
+    /// or the anonymous `<simpleType>` child of `<list>`.
+    pub(super) item_ref: Option<TypeRef>,
+}
+
+impl SimpleTypeDef {
+    /// The (namespace, local_name) key of a named user-defined base type.
+    pub(super) fn named_base_key(&self) -> Option<(Option<String>, String)> {
+        match &self.base_ref {
+            Some(TypeRef::Named(ns, name)) => Some((ns.clone(), name.clone())),
+            _ => None,
+        }
+    }
+
+    /// The (namespace, local_name) key of a named user-defined list item type.
+    pub(super) fn named_item_key(&self) -> Option<(Option<String>, String)> {
+        match &self.item_ref {
+            Some(TypeRef::Named(ns, name)) => Some((ns.clone(), name.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// Built-in XSD datatypes.

@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::ValidationError;
 use crate::namespace::build_resolver_for_node;
+use crate::xsd_regex::XsdRegex;
 
 use super::builtins::{
     apply_whitespace_normalization, validate_builtin_value, validate_facet, validate_list_facet,
@@ -335,6 +336,8 @@ impl XsdValidator {
                 // since you can't name the declared type. Allow it.
                 return true;
             }
+            // Decided at build; never present in a built validator.
+            TypeRef::Unqualified(_) => return false,
         };
 
         // Check if xsi:type IS the declared type
@@ -873,13 +876,13 @@ impl XsdValidator {
                                     .map(|e| &*e.name.local_name)
                                     .unwrap_or("?");
                                 errors.push(ValidationError {
-                                message: format!(
-                                    "Element '{}' has simple type '{:?}' but contains child elements",
-                                    elem_name, bt
-                                ),
-                                line: Some(doc.node_line(node)),
-                                column: Some(doc.node_column(node)),
-                            });
+                                    message: format!(
+                                        "Element '{}' has simple type '{:?}' but contains child elements",
+                                        elem_name, bt
+                                    ),
+                                    line: Some(doc.node_line(node)),
+                                    column: Some(doc.node_column(node)),
+                                });
                             }
                             let text = doc.text_content_deep(node);
                             validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
@@ -896,6 +899,12 @@ impl XsdValidator {
                             column: Some(doc.node_column(node)),
                         });
                     }
+                    // Decided at build; never present in a built validator.
+                    TypeRef::Unqualified(name) => errors.push(ValidationError {
+                        message: format!("Type '{}' not found", name.local),
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    }),
                     TypeRef::Inline(_) => {}
                 }
             }
@@ -934,7 +943,7 @@ impl XsdValidator {
                 self.types.get(&key)
             }
             TypeRef::Inline(td) => Some(td.as_ref()),
-            TypeRef::BuiltIn(_) => None,
+            TypeRef::BuiltIn(_) | TypeRef::Unqualified(_) => None,
         }
     }
 
@@ -1329,6 +1338,8 @@ impl XsdValidator {
                             self.validate_simple_content(doc, node, st, errors);
                         }
                     }
+                    // Decided at build; never present in a built validator.
+                    TypeRef::Unqualified(_) => {}
                 }
             }
             ContentModel::Any => {
@@ -2055,8 +2066,8 @@ impl XsdValidator {
 
     /// Validate simple (text) content of an element against a simple type definition.
     ///
-    /// Handles both list types (whitespace-separated items validated individually)
-    /// and atomic types. Applies XSD whiteSpace normalization before validation.
+    /// See [`XsdValidator::validate_simple_value`] for the derivation-chain
+    /// and list semantics.
     fn validate_simple_content(
         &self,
         doc: &Document,
@@ -2065,20 +2076,98 @@ impl XsdValidator {
         errors: &mut Vec<ValidationError>,
     ) {
         let raw_text = doc.text_content_deep(node);
-        // Apply XSD whiteSpace normalization before any validation.
-        let ws_mode = whitespace_for_type(&st.base);
-        let text = apply_whitespace_normalization(&raw_text, &ws_mode);
+        self.validate_simple_value(&raw_text, st, doc, node, errors);
+    }
 
-        if st.is_list {
-            // List type: value is whitespace-separated items
-            let items: Vec<&str> = text.split_whitespace().collect();
+    /// Validate an attribute value against its declared type reference
+    /// (built-in, anonymous or named simple type).
+    fn validate_attribute_value(
+        &self,
+        value: &str,
+        type_ref: &TypeRef,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        debug_log!("validate_attribute_value type_ref={:?}", type_ref);
+        self.check_type_ref_value(value, type_ref, doc, node, errors, 0);
+    }
 
-            // Validate each item against the item type
-            if let Some(ref item_bt) = st.item_type {
+    /// Validate a value against a simple type, following its whole derivation chain.
+    ///
+    /// XSD 1.0 Part 2 semantics:
+    /// - an atomic value must be valid for the built-in type at the root of the
+    ///   chain and satisfy the facets of **every** restriction step; range facets
+    ///   compare in the root type's value space (dates, decimals, integers);
+    /// - within one step, `pattern` facets are alternatives (ORed); across steps
+    ///   they all apply (ANDed);
+    /// - the `whiteSpace` facet of the most-derived step that sets one applies,
+    ///   otherwise the root built-in type's whitespace handling;
+    /// - a list splits the collapsed value into items, validates each item
+    ///   against the item type and applies each step's list facets.
+    fn validate_simple_value(
+        &self,
+        value: &str,
+        st: &SimpleTypeDef,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        self.check_simple_value(value, st, doc, node, errors, 0);
+    }
+
+    /// Validate `value` against `st`, pushing errors. On success returns the
+    /// value as normalized by the type and the built-in type whose value space
+    /// it belongs to.
+    #[allow(clippy::too_many_arguments)]
+    fn check_simple_value(
+        &self,
+        value: &str,
+        st: &SimpleTypeDef,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+        depth: usize,
+    ) -> Option<(String, BuiltInType)> {
+        let error = |message: String| ValidationError {
+            message,
+            line: Some(doc.node_line(node)),
+            column: Some(doc.node_column(node)),
+        };
+        if depth > MAX_SIMPLE_TYPE_DEPTH {
+            errors.push(error(format!(
+                "Simple type nesting deeper than {} levels",
+                MAX_SIMPLE_TYPE_DEPTH
+            )));
+            return None;
+        }
+        let chain = match self.simple_type_chain(st) {
+            Ok(chain) => chain,
+            Err(message) => {
+                errors.push(error(message));
+                return None;
+            }
+        };
+        let root = chain[chain.len() - 1];
+        let start = errors.len();
+
+        let (normalized, value_type) = if root.is_list {
+            let normalized = apply_whitespace_normalization(value, &WhiteSpaceHandling::Collapse);
+            let items: Vec<&str> = normalized.split_whitespace().collect();
+            if let Some(item_ref) = &root.item_ref {
+                // User-defined or anonymous item type: validate each item
+                // against the whole item type, along its chain.
+                for item in &items {
+                    self.check_type_ref_value(item, item_ref, doc, node, errors, depth + 1);
+                }
+            } else if let Some((item_bt, item_facets)) = [st, root]
+                .into_iter()
+                .find_map(|s| s.item_type.as_ref().map(|bt| (bt, &s.item_facets)))
+            {
                 for item in &items {
                     validate_builtin_value(item, item_bt, doc, node, errors, self.lenient);
                     // Also validate item-level facets (from user-defined item types)
-                    for facet in &st.item_facets {
+                    for facet in item_facets {
                         validate_facet(
                             item,
                             facet,
@@ -2091,164 +2180,244 @@ impl XsdValidator {
                     }
                 }
             }
-
-            // Validate list-level facets (length counts items, not chars)
-            for facet in &st.facets {
-                validate_list_facet(&items, facet, &text, doc, node, errors);
-            }
-        } else {
-            validate_builtin_value(&text, &st.base, doc, node, errors, self.lenient);
-
-            // Validate facets
-            for facet in &st.facets {
-                validate_facet(
-                    &text,
-                    facet,
-                    &st.base,
+            // List-level facets (length counts items, not chars), for every step.
+            for step in &chain {
+                self.validate_step_facets(
+                    &normalized,
+                    &step.facets,
+                    FacetTarget::List(&items),
                     doc,
                     node,
                     errors,
-                    self.enforce_qname_length_facets,
                 );
             }
-        }
+            (normalized, BuiltInType::String)
+        } else {
+            // The whitespace mode of the most-derived step that sets one,
+            // else the root built-in type's.
+            let mut in_effect = whitespace_for_type(&root.base);
+            for step in chain.iter().rev() {
+                if let Some(mode) = step.facets.iter().find_map(|facet| match facet {
+                    Facet::WhiteSpace(mode) => Some(mode),
+                    _ => None,
+                }) {
+                    in_effect = mode.clone();
+                }
+            }
+            let normalized = apply_whitespace_normalization(value, &in_effect);
+            validate_builtin_value(&normalized, &root.base, doc, node, errors, self.lenient);
+            for step in &chain {
+                self.validate_step_facets(
+                    &normalized,
+                    &step.facets,
+                    FacetTarget::Atomic(&root.base),
+                    doc,
+                    node,
+                    errors,
+                );
+            }
+            (normalized, root.base.clone())
+        };
+
+        (errors.len() == start).then_some((normalized, value_type))
     }
 
-    /// Validate an attribute value against its declared type reference.
-    ///
-    /// Handles all three forms of type references:
-    /// - `BuiltIn` → validate directly against the built-in type
-    /// - `Inline` → resolve to simple type and validate with facets
-    /// - `Named` → look up in schema types map and validate
-    fn validate_attribute_value(
+    /// Validate a value against a type reference used as a list item type.
+    /// See [`XsdValidator::check_simple_value`].
+    #[allow(clippy::too_many_arguments)]
+    fn check_type_ref_value(
         &self,
         value: &str,
         type_ref: &TypeRef,
         doc: &Document,
         node: NodeId,
         errors: &mut Vec<ValidationError>,
-    ) {
+        depth: usize,
+    ) -> Option<(String, BuiltInType)> {
+        let error = |message: String| ValidationError {
+            message,
+            line: Some(doc.node_line(node)),
+            column: Some(doc.node_column(node)),
+        };
+        let builtin = |bt: &BuiltInType, errors: &mut Vec<ValidationError>| {
+            let start = errors.len();
+            validate_builtin_value(value, bt, doc, node, errors, self.lenient);
+            let normalized = apply_whitespace_normalization(value, &whitespace_for_type(bt));
+            (errors.len() == start).then(|| (normalized, bt.clone()))
+        };
         match type_ref {
-            TypeRef::BuiltIn(bt) => {
-                validate_builtin_value(value, bt, doc, node, errors, self.lenient);
+            TypeRef::BuiltIn(bt) => builtin(bt, errors),
+            // Decided at build; never present in a built validator.
+            TypeRef::Unqualified(name) => {
+                errors.push(error(format!("Type '{}' not found", name.local)));
+                None
             }
-            TypeRef::Inline(td) => {
-                match td.as_ref() {
-                    TypeDef::Simple(st) => {
-                        if st.is_list {
-                            let items: Vec<&str> = value.split_whitespace().collect();
-                            if let Some(ref item_bt) = st.item_type {
-                                for item in &items {
-                                    validate_builtin_value(
-                                        item,
-                                        item_bt,
-                                        doc,
-                                        node,
-                                        errors,
-                                        self.lenient,
-                                    );
-                                    for facet in &st.item_facets {
-                                        validate_facet(
-                                            item,
-                                            facet,
-                                            item_bt,
-                                            doc,
-                                            node,
-                                            errors,
-                                            self.enforce_qname_length_facets,
-                                        );
-                                    }
-                                }
-                            }
-                            for facet in &st.facets {
-                                validate_list_facet(&items, facet, value, doc, node, errors);
-                            }
-                        } else {
-                            validate_builtin_value(
-                                value,
-                                &st.base,
-                                doc,
-                                node,
-                                errors,
-                                self.lenient,
-                            );
-                            for facet in &st.facets {
-                                validate_facet(
-                                    value,
-                                    facet,
-                                    &st.base,
-                                    doc,
-                                    node,
-                                    errors,
-                                    self.enforce_qname_length_facets,
-                                );
-                            }
-                        }
+            TypeRef::Inline(td) => match td.as_ref() {
+                TypeDef::Simple(st) => self.check_simple_value(value, st, doc, node, errors, depth),
+                TypeDef::Complex(_) => {
+                    errors.push(error("Anonymous complex type used as a simple type".into()));
+                    None
+                }
+            },
+            TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
+                Some(TypeDef::Simple(st)) => {
+                    self.check_simple_value(value, st, doc, node, errors, depth)
+                }
+                Some(TypeDef::Complex(_)) => {
+                    errors.push(error(format!(
+                        "Type '{}' is not a simple type",
+                        qname_display(ns, name)
+                    )));
+                    None
+                }
+                None => match parse_builtin_type(name) {
+                    Some(bt) if ns.as_deref() == Some(XS_NAMESPACE) => builtin(&bt, errors),
+                    _ => {
+                        errors.push(error(format!(
+                            "Type '{}' not found",
+                            qname_display(ns, name)
+                        )));
+                        None
                     }
+                },
+            },
+        }
+    }
+
+    /// The restriction chain of a simple type: `st` first, then each base in
+    /// turn, ending with the step whose base is a built-in type (or which is a
+    /// list). Fails on a missing or non-simple base, and on a cyclic or
+    /// overlong chain.
+    pub(super) fn simple_type_chain<'a>(
+        &'a self,
+        st: &'a SimpleTypeDef,
+    ) -> Result<Vec<&'a SimpleTypeDef>, String> {
+        let mut chain = vec![st];
+        let mut current = st;
+        while let Some(base) = &current.base_ref {
+            let (next, display) = match base {
+                TypeRef::BuiltIn(_) => break,
+                // Decided at build; never present in a built validator.
+                TypeRef::Unqualified(name) => {
+                    return Err(format!("Base type '{}' not found", name.local))
+                }
+                TypeRef::Inline(td) => match td.as_ref() {
+                    TypeDef::Simple(base_st) => (base_st, "anonymous".to_string()),
                     TypeDef::Complex(_) => {
-                        // Attributes shouldn't have complex types
+                        return Err("The base of a simple type is a complex type".to_string())
+                    }
+                },
+                TypeRef::Named(ns, name) => {
+                    let display = qname_display(ns, name);
+                    match self.types.get(&(ns.clone(), name.clone())) {
+                        Some(TypeDef::Simple(base_st)) => (base_st, display),
+                        Some(TypeDef::Complex(_)) => {
+                            return Err(format!(
+                                "Base type '{}' of a simple type is not a simple type",
+                                display
+                            ))
+                        }
+                        None => return Err(format!("Base type '{}' not found", display)),
+                    }
+                }
+            };
+            if chain.len() >= MAX_SIMPLE_TYPE_DEPTH || chain.iter().any(|s| std::ptr::eq(*s, next))
+            {
+                return Err(format!(
+                    "Simple type derivation through '{}' is circular or longer than {} steps",
+                    display, MAX_SIMPLE_TYPE_DEPTH
+                ));
+            }
+            chain.push(next);
+            current = next;
+        }
+        Ok(chain)
+    }
+
+    /// Check one restriction step's facets. The step's `pattern` facets are
+    /// alternatives: the value must match at least one of them. Every other
+    /// facet must hold.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_step_facets(
+        &self,
+        text: &str,
+        facets: &[Facet],
+        target: FacetTarget<'_>,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let error = |message: String| ValidationError {
+            message,
+            line: Some(doc.node_line(node)),
+            column: Some(doc.node_column(node)),
+        };
+        let patterns: Vec<&String> = facets
+            .iter()
+            .filter_map(|facet| match facet {
+                Facet::Pattern(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        if patterns.len() > 1 {
+            let mut matched = false;
+            for pattern in &patterns {
+                match XsdRegex::compile(pattern) {
+                    Ok(re) => matched |= re.is_match(text),
+                    Err(e) => {
+                        errors.push(error(format!(
+                            "Pattern facet '{}' could not be compiled: {}",
+                            pattern, e
+                        )));
+                        return;
                     }
                 }
             }
-            TypeRef::Named(ns, name) => {
-                // Try to resolve the named type
-                let key = (ns.clone(), name.clone());
-                debug_log!(
-                    "validate_attribute_value Named key={:?} found={}",
-                    key,
-                    self.types.contains_key(&key)
-                );
-                if let Some(TypeDef::Simple(st)) = self.types.get(&key) {
-                    debug_log!("SimpleTypeDef base={:?} facets={:?}", st.base, st.facets);
-                    if st.is_list {
-                        let items: Vec<&str> = value.split_whitespace().collect();
-                        if let Some(ref item_bt) = st.item_type {
-                            for item in &items {
-                                validate_builtin_value(
-                                    item,
-                                    item_bt,
-                                    doc,
-                                    node,
-                                    errors,
-                                    self.lenient,
-                                );
-                                for facet in &st.item_facets {
-                                    validate_facet(
-                                        item,
-                                        facet,
-                                        item_bt,
-                                        doc,
-                                        node,
-                                        errors,
-                                        self.enforce_qname_length_facets,
-                                    );
-                                }
-                            }
-                        }
-                        for facet in &st.facets {
-                            validate_list_facet(&items, facet, value, doc, node, errors);
-                        }
-                    } else {
-                        validate_builtin_value(value, &st.base, doc, node, errors, self.lenient);
-                        for facet in &st.facets {
-                            validate_facet(
-                                value,
-                                facet,
-                                &st.base,
-                                doc,
-                                node,
-                                errors,
-                                self.enforce_qname_length_facets,
-                            );
-                        }
-                    }
-                } else if ns.as_deref() == Some(XS_NAMESPACE) {
-                    // It's a built-in XSD type
-                    if let Some(bt) = parse_builtin_type(name) {
-                        validate_builtin_value(value, &bt, doc, node, errors, self.lenient);
-                    }
+            if !matched {
+                errors.push(error(format!(
+                    "Value '{}' does not match any of the patterns {:?}",
+                    text, patterns
+                )));
+            }
+        }
+        for facet in facets {
+            if patterns.len() > 1 && matches!(facet, Facet::Pattern(_)) {
+                continue;
+            }
+            match target {
+                FacetTarget::Atomic(bt) => validate_facet(
+                    text,
+                    facet,
+                    bt,
+                    doc,
+                    node,
+                    errors,
+                    self.enforce_qname_length_facets,
+                ),
+                FacetTarget::List(items) => {
+                    validate_list_facet(items, facet, text, doc, node, errors)
                 }
             }
         }
+    }
+}
+
+/// Maximum number of restriction steps in a simple type's derivation chain,
+/// and of nested list item types, followed during validation.
+pub(super) const MAX_SIMPLE_TYPE_DEPTH: usize = 64;
+
+/// How a derivation step's facets are applied: to an atomic value of the
+/// given built-in type, or to the items of a list.
+#[derive(Clone, Copy)]
+enum FacetTarget<'a> {
+    Atomic(&'a BuiltInType),
+    List(&'a [&'a str]),
+}
+
+/// `{namespace}local` for messages, or just `local` without a namespace.
+pub(super) fn qname_display(ns: &Option<String>, name: &str) -> String {
+    match ns {
+        Some(uri) => format!("{{{}}}{}", uri, name),
+        None => name.to_string(),
     }
 }
