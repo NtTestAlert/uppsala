@@ -310,6 +310,86 @@ fn fixed_value_and_identity_constraints_apply_with_xsi_type() {
     );
 }
 
+/// Assert that each instance is refused with an error naming `name`.
+fn assert_refused_naming(validator: &XsdValidator, cases: &[(String, &str)]) {
+    for (xml, name) in cases {
+        let errs = errors(validator, xml);
+        assert!(
+            errs.iter().any(|e| e.contains(name)),
+            "instance {}: expected an error naming {:?}, got {:?}",
+            xml,
+            name,
+            errs
+        );
+    }
+}
+
+const XSI_TYPES: &str = r###"
+<xs:complexType name="T"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence></xs:complexType>
+<xs:complexType name="B"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence>
+  <xs:anyAttribute namespace="##other" processContents="skip"/></xs:complexType>
+<xs:complexType name="L"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence>
+  <xs:anyAttribute namespace="##local" processContents="skip"/></xs:complexType>
+<xs:complexType name="D"><xs:complexContent><xs:extension base="m:B"><xs:sequence>
+  <xs:element name="b" type="xs:int"/></xs:sequence></xs:extension></xs:complexContent></xs:complexType>
+<xs:element name="r"><xs:complexType><xs:choice>
+  <xs:element name="c" type="m:T"/>
+  <xs:element name="w" type="m:B"/>
+  <xs:element name="l" type="m:L"/>
+  <xs:element name="z" type="m:T" nillable="true"/>
+  <xs:element name="s" type="xs:string"/>
+</xs:choice></xs:complexType></xs:element>"###;
+
+fn xsi_root(child: &str) -> String {
+    format!(r#"<m:r xmlns:m="urn:m" xmlns:xs="http://www.w3.org/2001/XMLSchema">{child}</m:r>"#)
+}
+
+/// A declaration that is not nillable admits no `xsi:nil` at all, whatever
+/// its value (cvc-elt.3.1); on a nillable one the value must be a boolean.
+#[test]
+fn xsi_nil_is_refused_on_an_element_that_is_not_nillable() {
+    let validator = build(&schema_ns(XSI_TYPES));
+    let not_nillable = |name: &str| format!("'{}', which is not nillable", name);
+    let c = not_nillable("c");
+    let s = not_nillable("s");
+    assert_refused_naming(
+        &validator,
+        &[
+            (
+                xsi_root(&format!(r#"<m:c {XSI} xsi:nil="false"><m:a>1</m:a></m:c>"#)),
+                &c,
+            ),
+            (xsi_root(&format!(r#"<m:c {XSI} xsi:nil="true"/>"#)), &c),
+            (xsi_root(&format!(r#"<m:s {XSI} xsi:nil="0">a</m:s>"#)), &s),
+            (
+                xsi_root(&format!(r#"<m:z {XSI} xsi:nil="maybe"/>"#)),
+                "'maybe' is not a valid boolean",
+            ),
+            (
+                xsi_root(&format!(r#"<m:z {XSI} xsi:nil="maybe"><m:a>1</m:a></m:z>"#)),
+                "'maybe' is not a valid boolean",
+            ),
+        ],
+    );
+    assert_verdicts(
+        &validator,
+        &[
+            (xsi_root(&format!(r#"<m:z {XSI} xsi:nil="true"/>"#)), true),
+            (xsi_root(&format!(r#"<m:z {XSI} xsi:nil=" 1 "/>"#)), true),
+            (
+                xsi_root(&format!(r#"<m:z {XSI} xsi:nil="false"><m:a>1</m:a></m:z>"#)),
+                true,
+            ),
+            (xsi_root(&format!(r#"<m:z {XSI} xsi:nil="false"/>"#)), false),
+            (
+                xsi_root(&format!(r#"<m:z {XSI} xsi:nil="true"><m:a>1</m:a></m:z>"#)),
+                false,
+            ),
+            (xsi_root(r#"<m:c><m:a>1</m:a></m:c>"#), true),
+        ],
+    );
+}
+
 /// Under `xsi:type`, the element's value is compared with the fixed value in
 /// the value space of the actual type (cvc-elt.5.2.2.2.2): as an `xs:token`,
 /// ` 1 ` is `1`.
@@ -401,6 +481,46 @@ fn fixed_value_is_a_value_of_the_declared_type() {
             (r(r#"<m:y2 xsi:type="xs:boolean">true</m:y2>"#), false),
             (r(r#"<m:y2 xsi:type="xs:decimal">1.0</m:y2>"#), false),
             (r(r#"<m:y2 xsi:type="xs:string">1</m:y2>"#), true),
+        ],
+    );
+}
+
+/// A nilled element has no character children (cvc-elt.3.2.1): XML white
+/// space is a character child too, whatever the element's type.
+#[test]
+fn nilled_element_refuses_white_space_content() {
+    let validator = build(&schema_ns(
+        r#"<xs:complexType name="T"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence></xs:complexType>
+<xs:element name="r"><xs:complexType><xs:choice>
+  <xs:element name="v" type="xs:int" nillable="true"/>
+  <xs:element name="z" type="m:T" nillable="true"/>
+</xs:choice></xs:complexType></xs:element>"#,
+    ));
+    let nilled = |name: &str, content: &str| {
+        xsi_root(&format!(
+            r#"<m:{name} {XSI} xsi:nil="true">{content}</m:{name}>"#
+        ))
+    };
+    assert_refused_naming(
+        &validator,
+        &[
+            (nilled("v", " "), "'v' has xsi:nil='true'"),
+            (nilled("v", "&#9;&#10;"), "'v' has xsi:nil='true'"),
+            (nilled("v", "<![CDATA[ ]]>"), "'v' has xsi:nil='true'"),
+            (nilled("z", "\n  "), "'z' has xsi:nil='true'"),
+        ],
+    );
+    assert_verdicts(
+        &validator,
+        &[
+            (xsi_root(&format!(r#"<m:v {XSI} xsi:nil="true"/>"#)), true),
+            (nilled("v", ""), true),
+            (nilled("v", "<!-- a comment -->"), true),
+            (nilled("z", ""), true),
+            (
+                xsi_root(&format!(r#"<m:v {XSI} xsi:nil="false"> 1 </m:v>"#)),
+                true,
+            ),
         ],
     );
 }

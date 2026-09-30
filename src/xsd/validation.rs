@@ -32,6 +32,28 @@ fn attr_decl_matches(attr: &crate::dom::Attribute<'_>, decl: &AttributeDecl) -> 
         && attr.name.namespace_uri.as_deref() == decl.namespace.as_deref()
 }
 
+/// Whether an attribute is one of the four XSI attributes that any element
+/// may carry: `type`, `nil`, `schemaLocation` and `noNamespaceSchemaLocation`
+/// in the XSI namespace (XSD 1.0 Part 1 §3.2.7, cvc-complex-type.3,
+/// cvc-type.3.1.1). It is matched by namespace URI, never by prefix: a
+/// prefix `xsi` bound to another namespace names an ordinary attribute, and
+/// any other name in the XSI namespace is assessed like any other attribute.
+fn is_exempt_xsi_attribute(attr: &crate::dom::Attribute<'_>) -> bool {
+    attr.name.namespace_uri.as_deref() == Some(XSI_NAMESPACE)
+        && matches!(
+            &*attr.name.local_name,
+            "type" | "nil" | "schemaLocation" | "noNamespaceSchemaLocation"
+        )
+}
+
+/// An attribute's expanded name for messages: `{uri}local`, or `local`.
+fn attribute_display(attr: &crate::dom::Attribute<'_>) -> String {
+    match attr.name.namespace_uri.as_deref() {
+        Some(uri) => format!("{{{}}}{}", uri, attr.name.local_name),
+        None => attr.name.local_name.to_string(),
+    }
+}
+
 /// Result of resolving an `xsi:type` attribute on an element.
 ///
 /// When an instance element carries `xsi:type`, the validator resolves it to one of:
@@ -300,15 +322,9 @@ impl XsdValidator {
     fn resolve_xsi_type(&self, doc: &Document, node: NodeId) -> Option<XsiTypeResult> {
         let elem = doc.element(node)?;
 
-        // Look for xsi:type attribute
-        let xsi_type_value = elem.get_attribute_ns(XSI_NAMESPACE, "type").or_else(|| {
-            // Also try by prefix match for elements where namespace resolution
-            // hasn't been applied to attributes
-            elem.attributes
-                .iter()
-                .find(|a| a.name.local_name == "type" && a.name.prefix.as_deref() == Some("xsi"))
-                .map(|a| &*a.value)
-        })?;
+        // The attribute is found by namespace URI only: a prefix `xsi` bound
+        // to another namespace names an ordinary attribute.
+        let xsi_type_value = elem.get_attribute_ns(XSI_NAMESPACE, "type")?;
 
         // Parse the QName value (may be prefixed like "xs:int")
         let (prefix, local_name) = if let Some(colon_pos) = xsi_type_value.find(':') {
@@ -774,45 +790,72 @@ impl XsdValidator {
             return;
         }
 
-        // Check for xsi:nil="true"
-        if let Some(elem) = doc.element(node) {
-            let xsi_nil_value = elem.get_attribute_ns(XSI_NAMESPACE, "nil").or_else(|| {
-                elem.attributes
-                    .iter()
-                    .find(|a| a.name.local_name == "nil" && a.name.prefix.as_deref() == Some("xsi"))
-                    .map(|a| &*a.value)
-            });
-            if xsi_nil_value == Some("true") || xsi_nil_value == Some("1") {
-                if !decl.nillable {
+        // xsi:nil (cvc-elt.3), found by namespace URI. A declaration that is
+        // not nillable admits no xsi:nil at all, whatever its value (3.1);
+        // the value is a boolean. A nilled element has no content (3.2.1)
+        // and its declaration no fixed value (3.2.2); its attributes are
+        // still assessed, its content is not.
+        let mut nilled = false;
+        let nil_value = doc
+            .element(node)
+            .and_then(|elem| elem.get_attribute_ns(XSI_NAMESPACE, "nil"));
+        if let Some(nil_value) = nil_value {
+            if !decl.nillable {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Attribute xsi:nil is not allowed on element '{}', which is not nillable",
+                        decl.name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+                return;
+            }
+            match trim_xml_whitespace(nil_value) {
+                "true" | "1" => nilled = true,
+                "false" | "0" => {}
+                _ => {
                     errors.push(ValidationError {
-                        message: "xsi:nil='true' on non-nillable element".to_string(),
+                        message: format!("xsi:nil value '{}' is not a valid boolean", nil_value),
                         line: Some(doc.node_line(node)),
                         column: Some(doc.node_column(node)),
                     });
                     return;
                 }
-                // Nillable element with xsi:nil="true": must be empty
-                // (no child elements and no non-whitespace text content)
-                let has_children = self.element_has_child_elements(doc, node);
-                let text = doc.text_content_deep(node);
-                let has_text = !trim_xml_whitespace(&text).is_empty();
-                if has_children || has_text {
-                    errors.push(ValidationError {
-                        message: "Element with xsi:nil='true' must have no content".to_string(),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
-                // Skip all further content validation — nilled element is valid if empty
-                return;
+            }
+        }
+        if nilled {
+            let has_children = self.element_has_child_elements(doc, node);
+            // Any character child counts, XML white space included.
+            let has_text = !doc.text_content_deep(node).is_empty();
+            if has_children || has_text {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has xsi:nil='true' and must have no content",
+                        decl.name
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
+            }
+            if let Some(fixed) = &decl.fixed {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Element '{}' has fixed value '{}' and cannot be nil",
+                        decl.name, fixed
+                    ),
+                    line: Some(doc.node_line(node)),
+                    column: Some(doc.node_column(node)),
+                });
             }
         }
 
         // An empty element with a fixed value takes that value (XSD 1.0
         // cvc-elt.5.1.2); the value is validated in place of the empty text.
+        // A nilled element takes none.
         let has_child_elements = self.element_has_child_elements(doc, node);
         let is_empty = !has_child_elements && doc.text_content_deep(node).is_empty();
-        let supplied = decl.fixed.as_deref().filter(|_| is_empty);
+        let supplied = decl.fixed.as_deref().filter(|_| is_empty && !nilled);
         // The type the element is assessed against: a valid `xsi:type`
         // replaces the declared type (cvc-elt.4.3).
         let mut actual_type = decl.type_ref.clone();
@@ -873,11 +916,13 @@ impl XsdValidator {
                             });
                             return;
                         }
-                        let text = match supplied {
-                            Some(text) => text.to_string(),
-                            None => doc.text_content_deep(node),
-                        };
-                        validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
+                        if !nilled {
+                            let text = match supplied {
+                                Some(text) => text.to_string(),
+                                None => doc.text_content_deep(node),
+                            };
+                            validate_builtin_value(&text, &bt, doc, node, errors, self.lenient);
+                        }
                     }
                     actual_type = TypeRef::BuiltIn(bt);
                 }
@@ -926,6 +971,9 @@ impl XsdValidator {
                         return;
                     }
                     match *td {
+                        TypeDef::Complex(ct) if nilled => {
+                            self.validate_attributes(doc, node, &ct, errors);
+                        }
                         TypeDef::Complex(ct) => {
                             self.validate_complex_content(doc, node, &ct, supplied, errors);
                         }
@@ -941,7 +989,9 @@ impl XsdValidator {
                                 });
                                 return;
                             }
-                            self.validate_simple_content(doc, node, &st, supplied, errors);
+                            if !nilled {
+                                self.validate_simple_content(doc, node, &st, supplied, errors);
+                            }
                         }
                     }
                     actual_type = TypeRef::Named(xsi_key.0, xsi_key.1);
@@ -959,6 +1009,9 @@ impl XsdValidator {
             let type_def = self.resolve_type(&decl.type_ref);
 
             match type_def {
+                Some(TypeDef::Complex(ct)) if nilled => {
+                    self.validate_attributes(doc, node, ct, errors);
+                }
                 Some(TypeDef::Complex(ct)) => {
                     self.validate_complex_content(doc, node, ct, supplied, errors);
                 }
@@ -978,7 +1031,9 @@ impl XsdValidator {
                             column: Some(doc.node_column(node)),
                         });
                     }
-                    self.validate_simple_content(doc, node, st, supplied, errors);
+                    if !nilled {
+                        self.validate_simple_content(doc, node, st, supplied, errors);
+                    }
                 }
                 None => {
                     // If type can't be resolved, check if it's a built-in
@@ -1005,11 +1060,20 @@ impl XsdValidator {
                                     column: Some(doc.node_column(node)),
                                 });
                                 }
-                                let text = match supplied {
-                                    Some(text) => text.to_string(),
-                                    None => doc.text_content_deep(node),
-                                };
-                                validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
+                                if !nilled {
+                                    let text = match supplied {
+                                        Some(text) => text.to_string(),
+                                        None => doc.text_content_deep(node),
+                                    };
+                                    validate_builtin_value(
+                                        &text,
+                                        bt,
+                                        doc,
+                                        node,
+                                        errors,
+                                        self.lenient,
+                                    );
+                                }
                             }
                         },
                         TypeRef::Named(ns, name) => {
@@ -1139,22 +1203,16 @@ impl XsdValidator {
         }
     }
 
-    /// Validate the complex content of an element against a complex type definition.
-    ///
-    /// This handles:
-    /// - Required/optional attribute checking
-    /// - Attribute value validation against declared types
-    /// - Attribute wildcard processing (processContents=skip/lax/strict)
-    /// - Rejecting undeclared attributes when no wildcard is present
-    /// - Element-only text content rejection (non-mixed types)
-    /// - Content model validation (sequence/choice/all/empty/simpleContent/any)
-    /// - Extension type particle merging
-    fn validate_complex_content(
+    /// Validate the attributes of an element against a complex type definition:
+    /// required and declared attributes, the attribute wildcard, and the
+    /// refusal of any other attribute. The four XSI attributes are exempt
+    /// (cvc-complex-type.3); every other attribute in the XSI namespace is
+    /// assessed like any other.
+    fn validate_attributes(
         &self,
         doc: &Document,
         node: NodeId,
         ct: &ComplexTypeDef,
-        text: Option<&str>,
         errors: &mut Vec<ValidationError>,
     ) {
         if self.has_complex_derivation_cycle(ct) {
@@ -1241,11 +1299,7 @@ impl XsdValidator {
                     {
                         continue;
                     }
-                    // Skip xsi:* attributes
-                    if attr.name.prefix.as_deref() == Some("xsi")
-                        || attr.name.namespace_uri.as_deref()
-                            == Some("http://www.w3.org/2001/XMLSchema-instance")
-                    {
+                    if is_exempt_xsi_attribute(attr) {
                         continue;
                     }
                     // Skip if already matched by an explicit attribute declaration
@@ -1331,11 +1385,7 @@ impl XsdValidator {
                     {
                         continue;
                     }
-                    // Skip xsi:* attributes
-                    if attr.name.prefix.as_deref() == Some("xsi")
-                        || attr.name.namespace_uri.as_deref()
-                            == Some("http://www.w3.org/2001/XMLSchema-instance")
-                    {
+                    if is_exempt_xsi_attribute(attr) {
                         continue;
                     }
                     // Check if declared
@@ -1345,7 +1395,7 @@ impl XsdValidator {
                         errors.push(ValidationError {
                             message: format!(
                                 "Attribute '{}' is not allowed (no wildcard permits additional attributes)",
-                                attr.name.local_name,
+                                attribute_display(attr),
                             ),
                             line: Some(doc.node_line(node)),
                             column: Some(doc.node_column(node)),
@@ -1354,6 +1404,36 @@ impl XsdValidator {
                 }
             }
         }
+    }
+
+    /// Validate the complex content of an element against a complex type definition.
+    ///
+    /// This handles:
+    /// - Required/optional attribute checking
+    /// - Attribute value validation against declared types
+    /// - Attribute wildcard processing (processContents=skip/lax/strict)
+    /// - Rejecting undeclared attributes when no wildcard is present
+    /// - Element-only text content rejection (non-mixed types)
+    /// - Content model validation (sequence/choice/all/empty/simpleContent/any)
+    /// - Extension type particle merging
+    fn validate_complex_content(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        ct: &ComplexTypeDef,
+        text: Option<&str>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if self.has_complex_derivation_cycle(ct) {
+            errors.push(ValidationError {
+                message: "Complex type derivation cycle detected".to_string(),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
+            return;
+        }
+
+        self.validate_attributes(doc, node, ct, errors);
 
         // Validate content model
         let child_elements: Vec<NodeId> = doc
