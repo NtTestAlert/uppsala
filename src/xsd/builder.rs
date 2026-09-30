@@ -190,10 +190,12 @@ impl XsdValidator {
     }
 
     /// Refuse a schema whose simple types reference a missing or non-simple
-    /// type (as a restriction base or list item type), whose references form
-    /// a cycle or nest deeper than `MAX_SIMPLE_TYPE_DEPTH`, or which gives a
-    /// facet declared `fixed` in a base type another value. Validation could
-    /// otherwise only fail every value of such a type.
+    /// type (as a restriction base, list item type or union member), whose
+    /// references form a cycle or nest deeper than `MAX_SIMPLE_TYPE_DEPTH`,
+    /// which restricts a union with facets other than `pattern` and
+    /// `enumeration`, or which gives a facet declared `fixed` in a base type
+    /// another value. Validation could otherwise only fail every value of such
+    /// a type, or not terminate on a cyclic union.
     ///
     /// Named simple types are checked first. The anonymous simple types of
     /// element and attribute declarations are checked the same way, and the
@@ -268,7 +270,11 @@ impl XsdValidator {
         if depth > MAX_SIMPLE_TYPE_DEPTH {
             return Err(too_deep());
         }
-        let refs = st.base_ref.iter().chain(st.item_ref.iter());
+        let refs = st
+            .base_ref
+            .iter()
+            .chain(st.item_ref.iter())
+            .chain(st.union_members.iter().flatten());
         let mut height = 0;
         for type_ref in refs {
             let below = match type_ref {
@@ -339,8 +345,8 @@ impl XsdValidator {
     }
 
     /// The per-definition checks of `check_simple_type_references`: the
-    /// derivation chain resolves, and no step changes a facet a base step
-    /// fixed.
+    /// derivation chain resolves, a union is restricted only by `pattern` and
+    /// `enumeration`, and no step changes a facet a base step fixed.
     fn check_simple_type_steps(
         &self,
         st: &SimpleTypeDef,
@@ -353,6 +359,18 @@ impl XsdValidator {
         };
         let chain = self.simple_type_chain(st).map_err(XmlError::validation)?;
         let root = chain[chain.len() - 1];
+        let restricts_union_badly = root.union_members.is_some()
+            && chain.iter().any(|step| {
+                step.facets
+                    .iter()
+                    .any(|f| !matches!(f, Facet::Pattern(_) | Facet::Enumeration(_)))
+            });
+        if restricts_union_badly {
+            return Err(XmlError::validation(format!(
+                "Simple type '{}' restricts a union with a facet other than pattern or enumeration",
+                display()
+            )));
+        }
         for (i, step) in chain.iter().enumerate() {
             for facet in &step.facets {
                 for base in &chain[i + 1..] {

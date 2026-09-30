@@ -573,13 +573,16 @@ fn chameleon_fixup_type_def(td: &mut TypeDef, target_ns: &Option<String>) {
             chameleon_fixup_content_model(&mut ct.content, target_ns);
         }
         TypeDef::Simple(ref mut st) => {
-            // Unprefixed base and item type names of a no-namespace module
-            // move to the including schema's target namespace too.
+            // Unprefixed base, item and member type names of a no-namespace
+            // module move to the including schema's target namespace too.
             if let Some(ref mut base) = st.base_ref {
                 chameleon_fixup_type_ref(base, target_ns);
             }
             if let Some(ref mut item) = st.item_ref {
                 chameleon_fixup_type_ref(item, target_ns);
+            }
+            for member in st.union_members.iter_mut().flatten() {
+                chameleon_fixup_type_ref(member, target_ns);
             }
         }
     }
@@ -720,7 +723,7 @@ impl UnqualifiedResolver<'_> {
         }
     }
 
-    /// A simple type's base and item types. A base or item type
+    /// A simple type's base, item and member types. A base or item type
     /// that turns out to be built-in is stored the way the parser stores a
     /// built-in one (`base` / `item_type`, no reference).
     fn simple_type(&self, st: &mut SimpleTypeDef) {
@@ -759,6 +762,9 @@ impl UnqualifiedResolver<'_> {
             }
         } else if let Some(item) = st.item_ref.as_mut() {
             self.type_ref(item);
+        }
+        for member in st.union_members.iter_mut().flatten() {
+            self.type_ref(member);
         }
     }
 

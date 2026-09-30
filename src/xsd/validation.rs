@@ -10,7 +10,7 @@
 //! - xsi:type resolution and type substitution blocking checks
 //! - Substitution group matching for element declarations
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::ValidationError;
@@ -19,7 +19,7 @@ use crate::xsd_regex::XsdRegex;
 
 use super::builtins::{
     apply_whitespace_normalization, split_xml_whitespace, trim_xml_whitespace,
-    validate_builtin_value, validate_facet, validate_list_facet, whitespace_for_type,
+    validate_builtin_value, validate_facet, validate_list_facet, values_equal, whitespace_for_type,
 };
 use super::parser::parse_builtin_type;
 use super::types::*;
@@ -2066,8 +2066,8 @@ impl XsdValidator {
 
     /// Validate simple (text) content of an element against a simple type definition.
     ///
-    /// See [`XsdValidator::validate_simple_value`] for the derivation-chain
-    /// and list semantics.
+    /// See [`XsdValidator::validate_simple_value`] for the derivation-chain,
+    /// list and union semantics.
     fn validate_simple_content(
         &self,
         doc: &Document,
@@ -2090,7 +2090,7 @@ impl XsdValidator {
         errors: &mut Vec<ValidationError>,
     ) {
         debug_log!("validate_attribute_value type_ref={:?}", type_ref);
-        self.check_type_ref_value(value, type_ref, doc, node, errors, 0);
+        self.check_type_ref_value(value, type_ref, doc, node, errors, 0, &mut UnionMemo::new());
     }
 
     /// Validate a value against a simple type, following its whole derivation chain.
@@ -2107,7 +2107,10 @@ impl XsdValidator {
     ///   normalized with the mode in effect for the base (not the most-derived
     ///   one), then compared with the value as values;
     /// - a list splits the collapsed value into items, validates each item
-    ///   against the item type and applies each step's list facets.
+    ///   against the item type and applies each step's list facets;
+    /// - a union accepts the value if any member type accepts it, tried in
+    ///   declaration order; `pattern`/`enumeration` facets of restrictions of the
+    ///   union then apply to the value as the accepting member normalized it.
     fn validate_simple_value(
         &self,
         value: &str,
@@ -2116,12 +2119,14 @@ impl XsdValidator {
         node: NodeId,
         errors: &mut Vec<ValidationError>,
     ) {
-        self.check_simple_value(value, st, doc, node, errors, 0);
+        self.check_simple_value(value, st, doc, node, errors, 0, &mut UnionMemo::new());
     }
 
     /// Validate `value` against `st`, pushing errors. On success returns the
     /// value as normalized by the type and the built-in type whose value space
-    /// it belongs to.
+    /// it belongs to (used to apply union facets). `memo` caches which member
+    /// of a union accepts a value, so that unions sharing members are
+    /// validated in time linear in the number of distinct types.
     #[allow(clippy::too_many_arguments)]
     fn check_simple_value(
         &self,
@@ -2131,6 +2136,7 @@ impl XsdValidator {
         node: NodeId,
         errors: &mut Vec<ValidationError>,
         depth: usize,
+        memo: &mut UnionMemo,
     ) -> Option<(String, BuiltInType)> {
         let error = |message: String| ValidationError {
             message,
@@ -2154,14 +2160,37 @@ impl XsdValidator {
         let root = chain[chain.len() - 1];
         let start = errors.len();
 
-        let (normalized, value_type) = if root.is_list {
+        let (normalized, value_type) = if root.union_members.is_some() {
+            let Some((normalized, member_type)) =
+                self.union_member_value(value, root, doc, node, depth, memo)
+            else {
+                errors.push(error(format!(
+                    "Value '{}' does not match any member type of the union",
+                    value
+                )));
+                return None;
+            };
+            for step in &chain {
+                self.validate_step_facets(
+                    &normalized,
+                    &step.facets,
+                    FacetTarget::Union(&member_type, root, step),
+                    doc,
+                    node,
+                    errors,
+                    depth,
+                    memo,
+                );
+            }
+            (normalized, member_type)
+        } else if root.is_list {
             let normalized = apply_whitespace_normalization(value, &WhiteSpaceHandling::Collapse);
             let items: Vec<&str> = split_xml_whitespace(&normalized).collect();
             if let Some(item_ref) = &root.item_ref {
                 // User-defined or anonymous item type: validate each item
-                // against the whole item type, along its chain.
+                // against the whole item type (its chain, a union, ...).
                 for item in &items {
-                    self.check_type_ref_value(item, item_ref, doc, node, errors, depth + 1);
+                    self.check_type_ref_value(item, item_ref, doc, node, errors, depth + 1, memo);
                 }
             } else if let Some((item_bt, item_facets)) = [st, root]
                 .into_iter()
@@ -2193,6 +2222,8 @@ impl XsdValidator {
                     doc,
                     node,
                     errors,
+                    depth,
+                    memo,
                 );
             }
             (normalized, BuiltInType::String)
@@ -2225,6 +2256,8 @@ impl XsdValidator {
                     doc,
                     node,
                     errors,
+                    depth,
+                    memo,
                 );
             }
             (normalized, root.base.clone())
@@ -2233,8 +2266,46 @@ impl XsdValidator {
         (errors.len() == start).then_some((normalized, value_type))
     }
 
-    /// Validate a value against a type reference used as a list item type.
-    /// See [`XsdValidator::check_simple_value`].
+    /// The first member of the union `root` (in declaration order) that
+    /// accepts `value`, as that member's normalized value and built-in type.
+    /// Results are cached in `memo` per union definition and value.
+    fn union_member_value(
+        &self,
+        value: &str,
+        root: &SimpleTypeDef,
+        doc: &Document,
+        node: NodeId,
+        depth: usize,
+        memo: &mut UnionMemo,
+    ) -> Option<(String, BuiltInType)> {
+        let key = (root as *const SimpleTypeDef as usize, value.to_string());
+        if let Some(cached) = memo.get(&key) {
+            return cached.clone();
+        }
+        test_counters::note(&test_counters::UNION_MEMBER_SELECTIONS);
+        let mut accepted = None;
+        for member in root.union_members.iter().flatten() {
+            let mut member_errors = Vec::new();
+            let result = self.check_type_ref_value(
+                value,
+                member,
+                doc,
+                node,
+                &mut member_errors,
+                depth + 1,
+                memo,
+            );
+            if member_errors.is_empty() && result.is_some() {
+                accepted = result;
+                break;
+            }
+        }
+        memo.insert(key, accepted.clone());
+        accepted
+    }
+
+    /// Validate a value against a type reference used as a union member or a
+    /// list item type. See [`XsdValidator::check_simple_value`].
     #[allow(clippy::too_many_arguments)]
     fn check_type_ref_value(
         &self,
@@ -2244,6 +2315,7 @@ impl XsdValidator {
         node: NodeId,
         errors: &mut Vec<ValidationError>,
         depth: usize,
+        memo: &mut UnionMemo,
     ) -> Option<(String, BuiltInType)> {
         let error = |message: String| ValidationError {
             message,
@@ -2264,7 +2336,9 @@ impl XsdValidator {
                 None
             }
             TypeRef::Inline(td) => match td.as_ref() {
-                TypeDef::Simple(st) => self.check_simple_value(value, st, doc, node, errors, depth),
+                TypeDef::Simple(st) => {
+                    self.check_simple_value(value, st, doc, node, errors, depth, memo)
+                }
                 TypeDef::Complex(_) => {
                     errors.push(error("Anonymous complex type used as a simple type".into()));
                     None
@@ -2272,7 +2346,7 @@ impl XsdValidator {
             },
             TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
                 Some(TypeDef::Simple(st)) => {
-                    self.check_simple_value(value, st, doc, node, errors, depth)
+                    self.check_simple_value(value, st, doc, node, errors, depth, memo)
                 }
                 Some(TypeDef::Complex(_)) => {
                     errors.push(error(format!(
@@ -2297,7 +2371,7 @@ impl XsdValidator {
 
     /// The restriction chain of a simple type: `st` first, then each base in
     /// turn, ending with the step whose base is a built-in type (or which is a
-    /// list). Fails on a missing or non-simple base, and on a cyclic or
+    /// list or union). Fails on a missing or non-simple base, and on a cyclic or
     /// overlong chain.
     pub(super) fn simple_type_chain<'a>(
         &'a self,
@@ -2357,6 +2431,8 @@ impl XsdValidator {
         doc: &Document,
         node: NodeId,
         errors: &mut Vec<ValidationError>,
+        depth: usize,
+        memo: &mut UnionMemo,
     ) {
         let error = |message: String| ValidationError {
             message,
@@ -2409,23 +2485,131 @@ impl XsdValidator {
                 FacetTarget::List(items) => {
                     validate_list_facet(items, facet, text, doc, node, errors)
                 }
+                FacetTarget::Union(bt, root, step) => match facet {
+                    Facet::Pattern(_) => validate_facet(
+                        text,
+                        facet,
+                        bt,
+                        None,
+                        doc,
+                        node,
+                        errors,
+                        self.enforce_qname_length_facets,
+                    ),
+                    Facet::Enumeration(values) => {
+                        // Each literal is read by the union like a value: the
+                        // member that accepts it gives its type and value.
+                        // The readings are kept with the step, so they are
+                        // made once per type, not once per value.
+                        let mut read = |literal: &str| {
+                            test_counters::note(&test_counters::UNION_LITERAL_READS);
+                            self.union_member_value(literal, root, doc, node, depth, memo)
+                        };
+                        let cached = step.union_enumeration.get_or_init(|| UnionEnumeration {
+                            lenient: self.lenient,
+                            enforce_qname_length_facets: self.enforce_qname_length_facets,
+                            literals: values
+                                .iter()
+                                .map(|literal| {
+                                    if literal.contains(':') {
+                                        UnionLiteral::Scoped
+                                    } else {
+                                        match read(literal) {
+                                            Some((lit, lit_type)) => {
+                                                UnionLiteral::Value(lit, lit_type)
+                                            }
+                                            None => UnionLiteral::Invalid,
+                                        }
+                                    }
+                                })
+                                .collect(),
+                        });
+                        let usable = cached.lenient == self.lenient
+                            && cached.enforce_qname_length_facets
+                                == self.enforce_qname_length_facets
+                            && cached.literals.len() == values.len();
+                        let found = values.iter().enumerate().any(|(i, literal)| {
+                            let reading = match cached.literals.get(i) {
+                                Some(UnionLiteral::Value(lit, lit_type)) if usable => {
+                                    return values_equal(text, bt, lit, lit_type);
+                                }
+                                Some(UnionLiteral::Invalid) if usable => return false,
+                                _ => read(literal),
+                            };
+                            reading.is_some_and(|(lit, lit_type)| {
+                                values_equal(text, bt, &lit, &lit_type)
+                            })
+                        });
+                        if !found {
+                            errors.push(error(format!(
+                                "'{}' is not one of the allowed values: {:?}",
+                                text, values
+                            )));
+                        }
+                    }
+                    other => errors.push(error(format!(
+                        "Facet {:?} does not apply to a union type",
+                        other
+                    ))),
+                },
             }
         }
     }
 }
 
+/// Operation counters for the complexity tests; empty outside `cfg(test)`.
+pub(crate) mod test_counters {
+    #[cfg(test)]
+    thread_local! {
+        /// Union enumeration literals read by the union on this thread.
+        pub(crate) static UNION_LITERAL_READS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+        /// Union member selections made (not found in the memo) on this thread.
+        pub(crate) static UNION_MEMBER_SELECTIONS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+        counter.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) -> usize {
+        counter.with(|count| count.replace(0))
+    }
+
+    #[cfg(not(test))]
+    pub(crate) struct Counter;
+    #[cfg(not(test))]
+    pub(crate) const UNION_LITERAL_READS: Counter = Counter;
+    #[cfg(not(test))]
+    pub(crate) const UNION_MEMBER_SELECTIONS: Counter = Counter;
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note(_counter: &Counter) {}
+}
+
+/// Cache of union member selection: (address of the union's root
+/// definition, value) to the accepting member's normalized value and type.
+type UnionMemo = HashMap<(usize, String), Option<(String, BuiltInType)>>;
+
 /// Maximum number of restriction steps in a simple type's derivation chain,
-/// and of nested list item types, followed during validation.
+/// and of nested union member / list item types, followed during validation.
 pub(super) const MAX_SIMPLE_TYPE_DEPTH: usize = 64;
 
 /// How a derivation step's facets are applied: to an atomic value of the
 /// given built-in type, whose step reads its enumeration literals with the
-/// given whitespace mode (the one in effect for the step's base); or to the
-/// items of a list.
+/// given whitespace mode (the one in effect for the step's base); to the
+/// items of a list; or to a union value that the member of the given
+/// built-in type accepted (the union's root definition reads enumeration
+/// literals, and the step, the last field, keeps them read).
 #[derive(Clone, Copy)]
 enum FacetTarget<'a> {
     Atomic(&'a BuiltInType, &'a WhiteSpaceHandling),
     List(&'a [&'a str]),
+    Union(&'a BuiltInType, &'a SimpleTypeDef, &'a SimpleTypeDef),
 }
 
 /// `{namespace}local` for messages, or just `local` without a namespace.

@@ -8,6 +8,7 @@
 //! parsing (builder/parser) through validation.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use super::wildcard::{
     intersect_namespace_constraints, stricter_process_contents, union_namespace_constraints,
@@ -435,10 +436,40 @@ pub(crate) struct SimpleTypeDef {
     /// For list types whose item type is not a built-in: the named item type
     /// or the anonymous `<simpleType>` child of `<list>`.
     pub(super) item_ref: Option<TypeRef>,
+    /// For union types: the member types, in declaration order
+    /// (`memberTypes` first, then anonymous `<simpleType>` children).
+    pub(super) union_members: Option<Vec<TypeRef>>,
     /// Names of the facets this restriction step declares with
     /// `fixed="true"` (e.g. `"maxLength"`); a type derived from this one may
     /// not give them another value.
     pub(super) fixed_facets: Vec<&'static str>,
+    /// For a restriction step of a union type: the step's enumeration
+    /// literals as the union reads them, filled on first use during
+    /// validation. They do not depend on the instance, so they are read once
+    /// per type, not for every value.
+    pub(super) union_enumeration: OnceLock<UnionEnumeration>,
+}
+
+/// The enumeration literals of a restriction step of a union, each read by
+/// the union like a value, with the validator settings they were read with.
+#[derive(Debug, Clone)]
+pub(crate) struct UnionEnumeration {
+    pub(super) lenient: bool,
+    pub(super) enforce_qname_length_facets: bool,
+    /// One entry per literal, in the order of the facet's values.
+    pub(super) literals: Vec<UnionLiteral>,
+}
+
+/// How a union reads one enumeration literal.
+#[derive(Debug, Clone)]
+pub(crate) enum UnionLiteral {
+    /// The accepting member's normalized value and built-in type.
+    Value(String, BuiltInType),
+    /// No member accepts the literal.
+    Invalid,
+    /// The literal contains `:`; a `QName` member reads a prefix in the
+    /// scope of the element being validated, so it is read for each value.
+    Scoped,
 }
 
 impl SimpleTypeDef {

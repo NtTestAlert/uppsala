@@ -25,6 +25,7 @@ use crate::dom::{Document, NodeId, NodeKind};
 use crate::error::{XmlError, XmlResult};
 use crate::namespace::build_resolver_for_node;
 
+use super::builtins::split_xml_whitespace;
 use super::types::{
     AttributeDecl, AttributeGroupDef, AttributeWildcard, BuiltInType, ComplexTypeDef, ContentModel,
     ElementDecl, Facet, IdentityConstraint, IdentityConstraintKind, MaxOccurs, ModelGroupDef,
@@ -1328,8 +1329,9 @@ fn parse_attribute_decl(
 /// - All facets: length, minLength, maxLength, pattern, enumeration, min/maxInclusive,
 ///   min/maxExclusive, totalDigits, fractionDigits, whiteSpace
 /// - Derived list types: NMTOKENS, IDREFS, ENTITIES
+/// - `<xs:union memberTypes="...">` and anonymous `<xs:simpleType>` members
 ///
-/// A user-defined base or item type is recorded as a `TypeRef` whose
+/// A user-defined base, item or member type is recorded as a `TypeRef` whose
 /// QName is resolved with the prefix bindings in scope here (unprefixed names
 /// take the schema's target namespace, as in `resolve_type_name`).
 pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeDef> {
@@ -1347,6 +1349,7 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
     let mut base_type_local: Option<String> = None;
     let mut base_ref: Option<TypeRef> = None;
     let mut item_ref: Option<TypeRef> = None;
+    let mut union_members: Option<Vec<TypeRef>> = None;
     let mut fixed_facets = Vec::new();
     let target_ns = schema_target_namespace(doc, node);
 
@@ -1372,6 +1375,24 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
                         "xs:list needs an itemType attribute or a simpleType child",
                     ));
                 }
+            } else if child_elem.name.local_name == "union" {
+                let mut members = Vec::new();
+                if let Some(member_names) = child_elem.get_attribute("memberTypes") {
+                    for member_name in split_xml_whitespace(member_names) {
+                        members.push(resolve_type_name(doc, child, member_name, &target_ns)?);
+                    }
+                }
+                for member in doc.children(child) {
+                    if is_xs_simple_type(doc, member) {
+                        members.push(TypeRef::Inline(Box::new(parse_simple_type(doc, member)?)));
+                    }
+                }
+                if members.is_empty() {
+                    return Err(XmlError::validation(
+                        "xs:union needs memberTypes or at least one simpleType child",
+                    ));
+                }
+                union_members = Some(members);
             } else if child_elem.name.local_name == "restriction" {
                 if let Some(base_name) = child_elem.get_attribute("base") {
                     match resolve_type_name(doc, child, base_name, &target_ns)? {
@@ -1432,7 +1453,9 @@ pub(super) fn parse_simple_type(doc: &Document, node: NodeId) -> XmlResult<TypeD
         _item_type_local: item_type_local,
         base_ref,
         item_ref,
+        union_members,
         fixed_facets,
+        union_enumeration: Default::default(),
     }))
 }
 
