@@ -433,6 +433,103 @@ fn simple_content_base_with_element_content_is_refused() {
     );
 }
 
+/// A chain of `n` named `complexContent` extensions of `T0`, each adding a
+/// choice of one element. `T0` has a required attribute and an attribute
+/// wildcard, which every extension inherits.
+fn extension_chain(n: usize) -> String {
+    let mut body = String::from(
+        r#"<xs:complexType name="T0"><xs:sequence><xs:element name="x" type="xs:int"/></xs:sequence><xs:attribute name="a" type="xs:int" use="required"/><xs:anyAttribute namespace="urn:w" processContents="skip"/></xs:complexType>"#,
+    );
+    for i in 1..=n {
+        body.push_str(&format!(
+            r#"<xs:complexType name="T{}"><xs:complexContent><xs:extension base="T{}"><xs:choice><xs:element name="e{}" type="xs:int"/></xs:choice></xs:extension></xs:complexContent></xs:complexType>"#,
+            i,
+            i - 1,
+            i
+        ));
+    }
+    body
+}
+
+fn chain_instance(attrs: &str, n: usize, last: &str) -> String {
+    let mut xml = format!(r#"<r xmlns:w="urn:w" {}><x>1</x>"#, attrs);
+    for i in 1..n {
+        xml.push_str(&format!("<e{}>1</e{}>", i, i));
+    }
+    xml.push_str(last);
+    xml.push_str("</r>");
+    xml
+}
+
+#[test]
+fn derivation_chain_at_the_limit_builds_and_validates() {
+    // 256 derivation steps from T256 to T0: the most the build accepts. The
+    // content, the inherited attribute use and the inherited wildcard are
+    // all checked through the whole chain, and `xsi:type` substitutes T256
+    // for its root T0 across all 256 steps.
+    let n = 256;
+    let last = format!("<e{}>1</e{}>", n, n);
+    let xsd = schema(&format!(
+        r#"{}<xs:element name="r" type="T{}"/><xs:element name="s" type="T0"/>"#,
+        extension_chain(n),
+        n
+    ));
+    let validator = build(&xsd);
+    let as_s = |xml: String| {
+        xml.replacen(
+            "<r ",
+            r#"<s xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="T256" "#,
+            1,
+        )
+        .replace("</r>", "</s>")
+    };
+    for (xml, valid) in [
+        (as_s(chain_instance(r#"a="1""#, n, &last)), true),
+        (as_s(chain_instance(r#"a="1""#, n, "")), false),
+        (chain_instance(r#"a="1" w:q="1""#, n, &last), true),
+        (chain_instance(r#"a="1""#, n, ""), false),
+        (
+            chain_instance(r#"a="1""#, n, &format!("<e{}>x</e{}>", n, n)),
+            false,
+        ),
+        (chain_instance(r#"w:q="1""#, n, &last), false),
+        (chain_instance(r#"a="1" b="1""#, n, &last), false),
+    ] {
+        assert_eq!(
+            errors(&validator, &xml).is_empty(),
+            valid,
+            "instance with attributes {:?}",
+            &xml[..40]
+        );
+    }
+}
+
+#[test]
+fn derivation_chain_longer_than_the_limit_is_refused_at_build() {
+    let refused = |xsd: String| {
+        let doc = parse(&xsd).expect("schema parses");
+        match XsdValidator::from_schema(&doc) {
+            Ok(_) => panic!("a derivation chain of 257 steps must be refused"),
+            Err(err) => err.to_string(),
+        }
+    };
+    // A named type 257 steps from T0.
+    let err = refused(schema(&format!(
+        r#"{}<xs:element name="r" type="T257"/>"#,
+        extension_chain(257)
+    )));
+    assert!(err.contains("'T257'"), "{}", err);
+    assert!(err.contains("longer than 256 steps"), "{}", err);
+    // An anonymous type one step below T256 is refused too, whether or not
+    // anything uses it.
+    let err = refused(schema(&format!(
+        r#"{}<xs:element name="r"><xs:complexType><xs:complexContent><xs:extension base="T256"><xs:attribute name="z"/></xs:extension></xs:complexContent></xs:complexType></xs:element>"#,
+        extension_chain(256)
+    )));
+    assert!(err.contains("'(anonymous)'"), "{}", err);
+    assert!(err.contains("longer than 256 steps"), "{}", err);
+}
+
 /// A chain of 256 extensions, each adding an optional choice, of a type
 /// whose sequence holds a child of the most derived type: every level of
 /// nesting in the instance is an element of a 256-step type. Validating 32

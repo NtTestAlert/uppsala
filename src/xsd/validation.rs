@@ -561,16 +561,16 @@ impl XsdValidator {
     /// Check if a type identified by `type_key` is derived (directly or transitively)
     /// from a type identified by `ancestor_key`.
     ///
-    /// Walks up the derivation chain (via `base_type` links on complex types) up to
-    /// 50 levels deep to prevent infinite loops.
+    /// Walks up the derivation chain (via `base_type` links on complex types).
+    /// A built schema has no chain longer than `MAX_COMPLEX_DERIVATION_DEPTH`
+    /// steps, so the walk stops one step after that, also on a cycle.
     fn is_derived_from(
         &self,
         type_key: &(Option<String>, String),
         ancestor_key: &(Option<String>, String),
     ) -> bool {
         let mut current_key = type_key.clone();
-        // Walk up to 50 levels to avoid infinite loops
-        for _ in 0..50 {
+        for _ in 0..=MAX_COMPLEX_DERIVATION_DEPTH {
             if let Some(td) = self.types.get(&current_key) {
                 match td {
                     TypeDef::Complex(ct) => {
@@ -603,40 +603,40 @@ impl XsdValidator {
     /// effective wildcard and the derived type's own wildcard.
     /// For restriction types or types not derived, this is just the type's own wildcard.
     fn compute_effective_wildcard(&self, ct: &ComplexTypeDef) -> Option<AttributeWildcard> {
-        self.compute_effective_wildcard_inner(ct, &mut HashSet::new())
-    }
-
-    fn compute_effective_wildcard_inner(
-        &self,
-        ct: &ComplexTypeDef,
-        seen: &mut HashSet<(Option<String>, String)>,
-    ) -> Option<AttributeWildcard> {
-        if ct.derived_by_extension == Some(true) {
-            // Get the base type's effective wildcard (recursively)
-            let base_wildcard = if let Some(ref base_key) = ct.base_type {
+        // The extension chain, walked iteratively: the walk runs for every
+        // element, and its length is bounded only at build.
+        let mut chain = vec![ct];
+        let mut seen = HashSet::new();
+        // The effective wildcard of the last type in `chain`.
+        let mut wildcard = loop {
+            let current = chain[chain.len() - 1];
+            if current.derived_by_extension != Some(true) {
+                // Restriction or not derived: use the type's own wildcard
+                break current.attribute_wildcard.clone();
+            }
+            if let Some(base_key) = &current.base_type {
                 if !seen.insert(base_key.clone()) {
-                    return None;
+                    // The extension that closes a cycle has none.
+                    break None;
                 }
                 if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
-                    self.compute_effective_wildcard_inner(base_ct, seen)
-                } else {
-                    None
+                    chain.push(base_ct);
+                    continue;
                 }
-            } else {
-                None
-            };
-
-            // Union of base wildcard and derived wildcard
-            match (&base_wildcard, &ct.attribute_wildcard) {
-                (Some(base_wc), Some(derived_wc)) => Some(base_wc.union(derived_wc)),
-                (Some(base_wc), None) => Some(base_wc.clone()),
-                (None, Some(derived_wc)) => Some(derived_wc.clone()),
-                (None, None) => None,
             }
-        } else {
-            // Restriction or not derived: use the type's own wildcard
-            ct.attribute_wildcard.clone()
+            // An extension of a missing or simple base: its own wildcard.
+            break current.attribute_wildcard.clone();
+        };
+        chain.pop();
+        // Each extension: union of the base's wildcard and its own.
+        while let Some(derived) = chain.pop() {
+            wildcard = match (wildcard, &derived.attribute_wildcard) {
+                (Some(base_wc), Some(derived_wc)) => Some(base_wc.union(derived_wc)),
+                (Some(base_wc), None) => Some(base_wc),
+                (None, derived_wc) => derived_wc.clone(),
+            };
         }
+        wildcard
     }
 
     /// Compute effective attributes for a complex type, including inherited attributes
@@ -647,28 +647,37 @@ impl XsdValidator {
     ///   the restriction are inherited; prohibited attributes are removed
     /// - **Not derived**: just the type's own attributes
     fn compute_effective_attributes(&self, ct: &ComplexTypeDef) -> Vec<AttributeDecl> {
-        self.compute_effective_attributes_inner(ct, &mut HashSet::new())
+        // The derivation chain, walked iteratively: the walk runs for every
+        // element, and its length is bounded only at build.
+        let mut chain = vec![ct];
+        let mut seen = HashSet::new();
+        // The effective attributes of the last type in `chain`.
+        let mut attrs = loop {
+            let current = chain[chain.len() - 1];
+            if let Some(base_key) = &current.base_type {
+                if !seen.insert(base_key.clone()) {
+                    // The type that closes a cycle has none.
+                    break Vec::new();
+                }
+                if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
+                    chain.push(base_ct);
+                    continue;
+                }
+            }
+            break current.attributes.clone();
+        };
+        chain.pop();
+        while let Some(derived) = chain.pop() {
+            attrs = Self::derive_attributes(attrs, derived);
+        }
+        attrs
     }
 
-    fn compute_effective_attributes_inner(
-        &self,
+    /// The effective attributes of `ct` given its base's effective attributes.
+    fn derive_attributes(
+        base_attrs: Vec<AttributeDecl>,
         ct: &ComplexTypeDef,
-        seen: &mut HashSet<(Option<String>, String)>,
     ) -> Vec<AttributeDecl> {
-        // Get base type's effective attributes
-        let base_attrs = if let Some(ref base_key) = ct.base_type {
-            if !seen.insert(base_key.clone()) {
-                return Vec::new();
-            }
-            if let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) {
-                self.compute_effective_attributes_inner(base_ct, seen)
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
         if base_attrs.is_empty() {
             return ct.attributes.clone();
         }
@@ -3312,6 +3321,14 @@ type UnionMemo = HashMap<(usize, String), Option<(String, BuiltInType)>>;
 /// Maximum number of restriction steps in a simple type's derivation chain,
 /// and of nested union member / list item types, followed during validation.
 pub(super) const MAX_SIMPLE_TYPE_DEPTH: usize = 64;
+
+/// Maximum number of derivation steps (`base_type` links through complex
+/// types) from a complex type to the root of its chain. A longer chain is
+/// refused at build: validation walks the chain for every element of such a
+/// type, so the limit bounds the time an instance can cost. The content
+/// model built from the chain does not nest deeper with it (see
+/// `extend_content_type`). No published schema comes near it.
+pub(super) const MAX_COMPLEX_DERIVATION_DEPTH: usize = 256;
 
 /// The base type of a built-in type in the XSD 1.0 Part 2 type hierarchy
 /// (§3, the built-in datatype hierarchy); `None` for `xs:anyType`. The list

@@ -34,7 +34,7 @@ use super::types::{
     ImportedComponents, Particle, ParticleKind, SimpleTypeDef, TypeDef, TypeRef,
     UnqualifiedTypeName, XsdValidator,
 };
-use super::validation::{qname_display, MAX_SIMPLE_TYPE_DEPTH};
+use super::validation::{qname_display, MAX_COMPLEX_DERIVATION_DEPTH, MAX_SIMPLE_TYPE_DEPTH};
 use super::XS_NAMESPACE;
 
 impl XsdValidator {
@@ -428,13 +428,14 @@ impl XsdValidator {
         Ok(())
     }
 
-    /// Check the attribute types, `simpleContent` base and local element
-    /// declarations of a complex type.
+    /// Check the derivation depth, attribute types, `simpleContent` base and
+    /// local element declarations of a complex type.
     fn check_complex_type_refs(
         &self,
         ct: &ComplexTypeDef,
         heights: &mut HashMap<(Option<String>, String), usize>,
     ) -> XmlResult<()> {
+        self.check_complex_derivation_depth(ct)?;
         for decl in &ct.attributes {
             self.check_attribute_type(decl, heights)?;
         }
@@ -462,6 +463,35 @@ impl XsdValidator {
             self.check_simple_type_refs(restriction, &mut Vec::new(), heights, 0)?;
         }
         self.check_content_model_refs(&ct.content, heights)
+    }
+
+    /// Refuse a complex type, named or anonymous, whose derivation chain
+    /// (its `base_type` links through complex types) is longer than
+    /// `MAX_COMPLEX_DERIVATION_DEPTH` steps. The walk stops at a base that is
+    /// missing or not complex, and at a cycle, which validation guards
+    /// against on its own.
+    fn check_complex_derivation_depth(&self, ct: &ComplexTypeDef) -> XmlResult<()> {
+        let mut seen = HashSet::new();
+        let mut current = ct;
+        let mut steps = 0;
+        while let Some(base_key) = &current.base_type {
+            if !seen.insert(base_key) {
+                return Ok(());
+            }
+            let Some(TypeDef::Complex(base_ct)) = self.types.get(base_key) else {
+                return Ok(());
+            };
+            steps += 1;
+            if steps > MAX_COMPLEX_DERIVATION_DEPTH {
+                return Err(XmlError::validation(format!(
+                    "Complex type '{}' has a derivation chain longer than {} steps",
+                    ct.name.as_deref().unwrap_or("(anonymous)"),
+                    MAX_COMPLEX_DERIVATION_DEPTH
+                )));
+            }
+            current = base_ct;
+        }
+        Ok(())
     }
 
     /// Check the local element declarations of a content model.
