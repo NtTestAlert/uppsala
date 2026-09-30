@@ -46,6 +46,55 @@ fn is_exempt_xsi_attribute(attr: &crate::dom::Attribute<'_>) -> bool {
         )
 }
 
+/// Whether an attribute has the name of a namespace declaration: a name in
+/// the reserved xmlns namespace (Namespaces in XML §3; the infoset's
+/// [namespace attributes]) or, without a namespace URI, the unprefixed
+/// `xmlns` or a name with the prefix `xmlns`.
+///
+/// No such attribute is a declaration. The parser keeps declarations apart
+/// from the attributes, so only a tree built through the DOM API holds one,
+/// and the serializer writes it out under another name, as an ordinary
+/// attribute. It is therefore never exempt from assessment: it is refused by
+/// name, so that a built tree is never accepted where its serialized form
+/// would be refused. Any other name is an ordinary attribute, whatever its
+/// local name: `q:xmlns` with `q` bound to `urn:q` is `{urn:q}xmlns`.
+fn has_namespace_declaration_name(attr: &crate::dom::Attribute<'_>) -> bool {
+    match attr.name.namespace_uri.as_deref() {
+        Some(uri) => uri == crate::namespace::XMLNS_NAMESPACE,
+        None => match attr.name.prefix.as_deref() {
+            None => attr.name.local_name == "xmlns",
+            Some(prefix) => prefix == "xmlns",
+        },
+    }
+}
+
+/// The refusal of an attribute with the name of a namespace declaration
+/// (see [`has_namespace_declaration_name`]) on the element `element`.
+fn namespace_declaration_name_error(
+    attr: &crate::dom::Attribute<'_>,
+    element: &str,
+    doc: &Document,
+    node: NodeId,
+) -> ValidationError {
+    let name = match (
+        attr.name.namespace_uri.as_deref(),
+        attr.name.prefix.as_deref(),
+    ) {
+        (Some(_), _) => attribute_display(attr),
+        (None, Some(prefix)) => format!("{}:{}", prefix, attr.name.local_name),
+        (None, None) => attr.name.local_name.to_string(),
+    };
+    ValidationError {
+        message: format!(
+            "Attribute '{}' on element '{}' has the name of a namespace declaration, \
+             which an attribute cannot have",
+            name, element
+        ),
+        line: Some(doc.node_line(node)),
+        column: Some(doc.node_column(node)),
+    }
+}
+
 /// An attribute's expanded name for messages: `{uri}local`, or `local`.
 fn attribute_display(attr: &crate::dom::Attribute<'_>) -> String {
     match attr.name.namespace_uri.as_deref() {
@@ -904,6 +953,7 @@ impl XsdValidator {
                     if bt == BuiltInType::AnyType {
                         self.validate_children_against_global_decls(doc, node, errors);
                     } else {
+                        self.check_simple_type_attributes(doc, node, errors);
                         // Simple built-in type: element must not have child elements
                         if self.element_has_child_elements(doc, node) {
                             errors.push(ValidationError {
@@ -978,6 +1028,7 @@ impl XsdValidator {
                             self.validate_complex_content(doc, node, &ct, supplied, errors);
                         }
                         TypeDef::Simple(st) => {
+                            self.check_simple_type_attributes(doc, node, errors);
                             // Simple type: element must not have child elements
                             if self.element_has_child_elements(doc, node) {
                                 errors.push(ValidationError {
@@ -1016,6 +1067,7 @@ impl XsdValidator {
                     self.validate_complex_content(doc, node, ct, supplied, errors);
                 }
                 Some(TypeDef::Simple(st)) => {
+                    self.check_simple_type_attributes(doc, node, errors);
                     // Simple types cannot have child elements
                     if self.element_has_child_elements(doc, node) {
                         let elem_name = doc
@@ -1045,6 +1097,7 @@ impl XsdValidator {
                                 self.validate_children_against_global_decls(doc, node, errors);
                             }
                             _ => {
+                                self.check_simple_type_attributes(doc, node, errors);
                                 // Built-in simple types cannot have child elements
                                 if self.element_has_child_elements(doc, node) {
                                     let elem_name = doc
@@ -1207,7 +1260,8 @@ impl XsdValidator {
     /// required and declared attributes, the attribute wildcard, and the
     /// refusal of any other attribute. The four XSI attributes are exempt
     /// (cvc-complex-type.3); every other attribute in the XSI namespace is
-    /// assessed like any other.
+    /// assessed like any other. Namespace declarations are not attributes;
+    /// an attribute with a declaration's name is refused by name.
     fn validate_attributes(
         &self,
         doc: &Document,
@@ -1293,10 +1347,13 @@ impl XsdValidator {
             // Validate unmatched attributes against wildcard or reject if no wildcard
             if let Some(ref wildcard) = effective_wildcard {
                 for attr in &elem.attributes {
-                    // Skip namespace declarations
-                    if attr.name.local_name == "xmlns"
-                        || attr.name.prefix.as_deref() == Some("xmlns")
-                    {
+                    if has_namespace_declaration_name(attr) {
+                        errors.push(namespace_declaration_name_error(
+                            attr,
+                            &elem.name.local_name,
+                            doc,
+                            node,
+                        ));
                         continue;
                     }
                     if is_exempt_xsi_attribute(attr) {
@@ -1379,10 +1436,13 @@ impl XsdValidator {
             } else {
                 // No wildcard: reject any undeclared attributes
                 for attr in &elem.attributes {
-                    // Skip namespace declarations
-                    if attr.name.local_name == "xmlns"
-                        || attr.name.prefix.as_deref() == Some("xmlns")
-                    {
+                    if has_namespace_declaration_name(attr) {
+                        errors.push(namespace_declaration_name_error(
+                            attr,
+                            &elem.name.local_name,
+                            doc,
+                            node,
+                        ));
                         continue;
                     }
                     if is_exempt_xsi_attribute(attr) {
@@ -2367,6 +2427,44 @@ impl XsdValidator {
                     });
                 }
             }
+        }
+    }
+
+    /// Refuse, by name, every attribute of an element whose type is simple
+    /// (declared, built-in or given by `xsi:type`), except the four XSI
+    /// attributes (cvc-type.3.1.1). Namespace declarations are not
+    /// attributes, so none is exempt here.
+    fn check_simple_type_attributes(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let Some(elem) = doc.element(node) else {
+            return;
+        };
+        for attr in &elem.attributes {
+            if has_namespace_declaration_name(attr) {
+                errors.push(namespace_declaration_name_error(
+                    attr,
+                    &elem.name.local_name,
+                    doc,
+                    node,
+                ));
+                continue;
+            }
+            if is_exempt_xsi_attribute(attr) {
+                continue;
+            }
+            errors.push(ValidationError {
+                message: format!(
+                    "Attribute '{}' is not allowed on element '{}', which has a simple type",
+                    attribute_display(attr),
+                    elem.name.local_name
+                ),
+                line: Some(doc.node_line(node)),
+                column: Some(doc.node_column(node)),
+            });
         }
     }
 

@@ -324,6 +324,71 @@ fn assert_refused_naming(validator: &XsdValidator, cases: &[(String, &str)]) {
     }
 }
 
+const SIMPLE_TYPES: &str = r#"
+<xs:simpleType name="N"><xs:restriction base="xs:string"><xs:maxLength value="5"/></xs:restriction></xs:simpleType>
+<xs:complexType name="C"><xs:simpleContent><xs:extension base="xs:string">
+  <xs:attribute name="foo" type="xs:string"/></xs:extension></xs:simpleContent></xs:complexType>
+<xs:element name="r"><xs:complexType><xs:choice>
+  <xs:element name="d" type="xs:date"/>
+  <xs:element name="n" type="m:N"/>
+  <xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"/></xs:simpleType></xs:element>
+  <xs:element name="w"/>
+  <xs:element name="c" type="m:C"/>
+</xs:choice></xs:complexType></xs:element>"#;
+
+/// An element whose type is simple carries no attribute but namespace
+/// declarations and the four XSI attributes (cvc-type.3.1.1), whether the
+/// type is declared, built in, anonymous or given by `xsi:type`.
+#[test]
+fn attributes_on_an_element_of_simple_type_are_refused() {
+    let validator = build(&schema_ns(SIMPLE_TYPES));
+    let r = |child: &str| {
+        format!(
+            r#"<m:r xmlns:m="urn:m" xmlns:xs="http://www.w3.org/2001/XMLSchema" {XSI}>{child}</m:r>"#
+        )
+    };
+    assert_refused_naming(
+        &validator,
+        &[
+            (r(r#"<m:d foo="x">2026-09-30</m:d>"#), "'foo'"),
+            (
+                r(r#"<m:d xmlns:q="urn:q" q:foo="x">2026-09-30</m:d>"#),
+                "'{urn:q}foo'",
+            ),
+            (r(r#"<m:n foo="x">ab</m:n>"#), "'foo'"),
+            (r(r#"<m:a foo="x">ab</m:a>"#), "'foo'"),
+            (
+                r(r#"<m:d xsi:type="xs:date" foo="x">2026-09-30</m:d>"#),
+                "'foo'",
+            ),
+            (
+                r(r#"<m:w xsi:type="xs:date" foo="x">2026-09-30</m:w>"#),
+                "'foo'",
+            ),
+            (r(r#"<m:w xsi:type="m:N" foo="x">ab</m:w>"#), "'foo'"),
+        ],
+    );
+    assert_verdicts(
+        &validator,
+        &[
+            (r(r#"<m:d>2026-09-30</m:d>"#), true),
+            (r(r#"<m:d xmlns:q="urn:q">2026-09-30</m:d>"#), true),
+            (r(r#"<m:d xsi:type="xs:date">2026-09-30</m:d>"#), true),
+            (
+                r(
+                    r#"<m:d xsi:schemaLocation="urn:m s.xsd" xsi:noNamespaceSchemaLocation="s.xsd">2026-09-30</m:d>"#,
+                ),
+                true,
+            ),
+            (r(r#"<m:w xsi:type="xs:date">2026-09-30</m:w>"#), true),
+            (r(r#"<m:w xsi:type="m:N">ab</m:w>"#), true),
+            // A complex type with simple content declares its attributes.
+            (r(r#"<m:c foo="x">ab</m:c>"#), true),
+            (r(r#"<m:c bar="x">ab</m:c>"#), false),
+        ],
+    );
+}
+
 const XSI_TYPES: &str = r###"
 <xs:complexType name="T"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence></xs:complexType>
 <xs:complexType name="B"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence>
@@ -342,6 +407,106 @@ const XSI_TYPES: &str = r###"
 
 fn xsi_root(child: &str) -> String {
     format!(r#"<m:r xmlns:m="urn:m" xmlns:xs="http://www.w3.org/2001/XMLSchema">{child}</m:r>"#)
+}
+
+/// An attribute is an XSI attribute by its namespace URI, not by its
+/// prefix: `xsi` bound to another namespace names an ordinary attribute,
+/// which is refused unless a wildcard admits it, and which is never taken
+/// as `xsi:type` or `xsi:nil`.
+#[test]
+fn xsi_prefix_bound_to_another_namespace_is_an_ordinary_attribute() {
+    let validator = build(&schema_ns(XSI_TYPES));
+    let other = r#"xmlns:xsi="urn:x""#;
+    assert_refused_naming(
+        &validator,
+        &[
+            (
+                xsi_root(&format!(r#"<m:c {other} xsi:foo="1"><m:a>1</m:a></m:c>"#)),
+                "'{urn:x}foo'",
+            ),
+            (
+                xsi_root(&format!(
+                    r#"<m:c {other} xsi:type="m:T"><m:a>1</m:a></m:c>"#
+                )),
+                "'{urn:x}type'",
+            ),
+            (
+                xsi_root(&format!(r#"<m:s {other} xsi:type="xs:string">a</m:s>"#)),
+                "'{urn:x}type'",
+            ),
+        ],
+    );
+    assert_verdicts(
+        &validator,
+        &[
+            // The wildcard admits `{urn:x}type`; it is not `xsi:type`, so
+            // the content is checked as `B`, where `b` is not allowed.
+            (
+                xsi_root(&format!(
+                    r#"<m:w {other} xsi:type="m:D"><m:a>1</m:a><m:b>2</m:b></m:w>"#
+                )),
+                false,
+            ),
+            (
+                xsi_root(&format!(
+                    r#"<m:w {other} xsi:type="m:D"><m:a>1</m:a></m:w>"#
+                )),
+                true,
+            ),
+            // Not `xsi:nil` either: `z` is not nilled and needs its content.
+            (
+                xsi_root(&format!(r#"<m:z {other} xsi:nil="true"/>"#)),
+                false,
+            ),
+            // The real XSI namespace, for contrast.
+            (
+                xsi_root(&format!(
+                    r#"<m:w {XSI} xsi:type="m:D"><m:a>1</m:a><m:b>2</m:b></m:w>"#
+                )),
+                true,
+            ),
+            (xsi_root(&format!(r#"<m:z {XSI} xsi:nil="true"/>"#)), true),
+        ],
+    );
+}
+
+/// Only `type`, `nil`, `schemaLocation` and `noNamespaceSchemaLocation` are
+/// exempt in the XSI namespace (cvc-complex-type.3.2). Any other name in it
+/// is assessed like any attribute: refused, unless a wildcard admits it.
+#[test]
+fn other_attributes_in_the_xsi_namespace_are_not_exempt() {
+    let validator = build(&schema_ns(XSI_TYPES));
+    let foo = "'{http://www.w3.org/2001/XMLSchema-instance}foo'";
+    assert_refused_naming(
+        &validator,
+        &[
+            (
+                xsi_root(&format!(r#"<m:c {XSI} xsi:foo="1"><m:a>1</m:a></m:c>"#)),
+                foo,
+            ),
+            (xsi_root(&format!(r#"<m:s {XSI} xsi:foo="1">a</m:s>"#)), foo),
+            (
+                xsi_root(&format!(r#"<m:l {XSI} xsi:foo="1"><m:a>1</m:a></m:l>"#)),
+                "XMLSchema-instance",
+            ),
+        ],
+    );
+    assert_verdicts(
+        &validator,
+        &[
+            // `##other` admits the XSI namespace.
+            (
+                xsi_root(&format!(r#"<m:w {XSI} xsi:foo="1"><m:a>1</m:a></m:w>"#)),
+                true,
+            ),
+            (
+                xsi_root(&format!(
+                    r#"<m:c {XSI} xsi:schemaLocation="urn:m s.xsd" xsi:noNamespaceSchemaLocation="s.xsd"><m:a>1</m:a></m:c>"#
+                )),
+                true,
+            ),
+        ],
+    );
 }
 
 /// A declaration that is not nillable admits no `xsi:nil` at all, whatever
@@ -390,6 +555,58 @@ fn xsi_nil_is_refused_on_an_element_that_is_not_nillable() {
     );
 }
 
+/// A nilled element has no content, but its attributes are still assessed
+/// against its type (cvc-elt.5.2.1), and its declaration may not have a
+/// fixed value (cvc-elt.3.2.2).
+#[test]
+fn nilled_element_keeps_its_attribute_checks() {
+    let validator = build(&schema_ns(
+        r#"<xs:complexType name="T"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence>
+  <xs:attribute name="id" type="xs:int" use="required"/></xs:complexType>
+<xs:element name="r"><xs:complexType><xs:choice>
+  <xs:element name="z" type="m:T" nillable="true"/>
+  <xs:element name="v" type="xs:int" nillable="true"/>
+  <xs:element name="f" type="xs:int" nillable="true" fixed="1"/>
+</xs:choice></xs:complexType></xs:element>"#,
+    ));
+    assert_refused_naming(
+        &validator,
+        &[
+            (xsi_root(&format!(r#"<m:z {XSI} xsi:nil="true"/>"#)), "'id'"),
+            (
+                xsi_root(&format!(r#"<m:z {XSI} xsi:nil="true" id="1" foo="2"/>"#)),
+                "'foo'",
+            ),
+            (
+                xsi_root(&format!(r#"<m:z {XSI} xsi:nil="true" id="x"/>"#)),
+                "'x'",
+            ),
+            (
+                xsi_root(&format!(r#"<m:v {XSI} xsi:nil="true" foo="2"/>"#)),
+                "'foo'",
+            ),
+            (
+                xsi_root(&format!(r#"<m:f {XSI} xsi:nil="true"/>"#)),
+                "cannot be nil",
+            ),
+        ],
+    );
+    assert_verdicts(
+        &validator,
+        &[
+            (
+                xsi_root(&format!(r#"<m:z {XSI} xsi:nil="true" id="1"/>"#)),
+                true,
+            ),
+            (xsi_root(&format!(r#"<m:v {XSI} xsi:nil="true"/>"#)), true),
+            (
+                xsi_root(&format!(r#"<m:f {XSI} xsi:nil="false">1</m:f>"#)),
+                true,
+            ),
+        ],
+    );
+}
+
 /// Under `xsi:type`, the element's value is compared with the fixed value in
 /// the value space of the actual type (cvc-elt.5.2.2.2.2): as an `xs:token`,
 /// ` 1 ` is `1`.
@@ -415,6 +632,156 @@ fn fixed_value_is_compared_in_the_xsi_type_value_space() {
             (r(r#"<m:s xsi:type="xs:token"/>"#), true),
         ],
     );
+}
+
+const XMLNS_LOCAL_NAME: &str = r###"
+<xs:simpleType name="N"><xs:restriction base="xs:string"><xs:maxLength value="5"/></xs:restriction></xs:simpleType>
+<xs:complexType name="T"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence></xs:complexType>
+<xs:complexType name="B"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence>
+  <xs:anyAttribute namespace="##other" processContents="skip"/></xs:complexType>
+<xs:complexType name="L"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence>
+  <xs:anyAttribute namespace="##local" processContents="skip"/></xs:complexType>
+<xs:element name="r"><xs:complexType><xs:choice>
+  <xs:element name="d" type="xs:date"/>
+  <xs:element name="n" type="m:N"/>
+  <xs:element name="c" type="m:T"/>
+  <xs:element name="w" type="m:B"/>
+  <xs:element name="l" type="m:L"/>
+</xs:choice></xs:complexType></xs:element>"###;
+
+/// Only the unprefixed `xmlns` and `xmlns:*` names are namespace
+/// declarations. An attribute whose local name is `xmlns` in some other
+/// namespace, `q:xmlns` with `q` bound to `urn:q`, is the ordinary attribute
+/// `{urn:q}xmlns`: refused on an element of simple type (cvc-type.3.1.1)
+/// and on one of complex type unless a wildcard admits it
+/// (cvc-complex-type.3.2).
+#[test]
+fn attribute_named_xmlns_in_a_namespace_is_an_ordinary_attribute() {
+    let validator = build(&schema_ns(XMLNS_LOCAL_NAME));
+    let q = r#"xmlns:q="urn:q""#;
+    let r = |child: &str| format!(r#"<m:r xmlns:m="urn:m" {XSI}>{child}</m:r>"#);
+    let name = "'{urn:q}xmlns'";
+    assert_refused_naming(
+        &validator,
+        &[
+            (
+                r(&format!(r#"<m:d {q} q:xmlns="1">2026-09-30</m:d>"#)),
+                name,
+            ),
+            (r(&format!(r#"<m:n {q} q:xmlns="1">ab</m:n>"#)), name),
+            (
+                r(&format!(
+                    r#"<m:d {q} q:xmlns="1" xsi:type="xs:date" xmlns:xs="http://www.w3.org/2001/XMLSchema">2026-09-30</m:d>"#
+                )),
+                name,
+            ),
+            (
+                r(&format!(r#"<m:c {q} q:xmlns="1"><m:a>1</m:a></m:c>"#)),
+                name,
+            ),
+        ],
+    );
+    assert_verdicts(
+        &validator,
+        &[
+            // `##local` admits no namespaced attribute.
+            (
+                r(&format!(r#"<m:l {q} q:xmlns="1"><m:a>1</m:a></m:l>"#)),
+                false,
+            ),
+            // `##other` admits it.
+            (
+                r(&format!(r#"<m:w {q} q:xmlns="1"><m:a>1</m:a></m:w>"#)),
+                true,
+            ),
+            // Real namespace declarations are never attributes.
+            (r(&format!(r#"<m:d {q}>2026-09-30</m:d>"#)), true),
+            (r(r#"<d xmlns="urn:m">2026-09-30</d>"#), true),
+            (r(&format!(r#"<m:c {q} xmlns=""><m:a>1</m:a></m:c>"#)), true),
+        ],
+    );
+}
+
+/// A namespace declaration is never an attribute. The parser keeps
+/// declarations apart, but a tree built through the DOM API can hold an
+/// attribute with a declaration's name, which the serializer writes out
+/// under another name as an ordinary attribute. Such an attribute is
+/// refused by name, on an element of simple and of complex type, so the
+/// built tree is refused as its serialized and re-parsed form is.
+#[test]
+fn attribute_with_a_namespace_declaration_name_is_refused_in_a_built_tree() {
+    use std::borrow::Cow;
+    use uppsala::QName;
+    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+    let validator = build(&schema_ns(
+        r#"<xs:complexType name="T"><xs:sequence><xs:element name="a" type="xs:int"/></xs:sequence></xs:complexType>
+<xs:element name="r"><xs:complexType><xs:choice>
+  <xs:element name="d" type="xs:date"/>
+  <xs:element name="c" type="m:T"/>
+</xs:choice></xs:complexType></xs:element>"#,
+    ));
+    let name =
+        |uri: Option<&'static str>, prefix: Option<&'static str>, local: &'static str| QName {
+            namespace_uri: uri.map(Cow::Borrowed),
+            prefix: prefix.map(Cow::Borrowed),
+            local_name: Cow::Borrowed(local),
+        };
+    let shapes = [
+        (name(None, None, "xmlns"), "'xmlns'"),
+        (name(None, Some("xmlns"), "foo"), "'xmlns:foo'"),
+        (
+            name(Some(XMLNS), Some("xmlns"), "foo"),
+            "'{http://www.w3.org/2000/xmlns/}foo'",
+        ),
+        (
+            name(Some(XMLNS), Some("q"), "foo"),
+            "'{http://www.w3.org/2000/xmlns/}foo'",
+        ),
+        (
+            name(Some(XMLNS), None, "foo"),
+            "'{http://www.w3.org/2000/xmlns/}foo'",
+        ),
+    ];
+    let children = [
+        r#"<m:r xmlns:m="urn:m"><m:d>2026-09-30</m:d></m:r>"#,
+        r#"<m:r xmlns:m="urn:m"><m:c><m:a>1</m:a></m:c></m:r>"#,
+    ];
+    for xml in children {
+        assert!(errors(&validator, xml).is_empty(), "control {}", xml);
+        for (attr, shown) in &shapes {
+            let mut doc = parse(xml).expect("instance parses");
+            let root = doc.document_element().expect("root element");
+            let child = doc
+                .children(root)
+                .into_iter()
+                .find(|&c| doc.element(c).is_some())
+                .expect("child element");
+            doc.element_mut(child)
+                .expect("element")
+                .set_attribute(attr.clone(), Cow::Borrowed("1"));
+            let built: Vec<String> = validator
+                .validate(&doc)
+                .iter()
+                .map(|e| e.to_string())
+                .collect();
+            assert!(
+                built
+                    .iter()
+                    .any(|e| e.contains(shown) && e.contains("namespace declaration")),
+                "{} with {:?}: expected a refusal naming {}, got {:?}",
+                xml,
+                attr,
+                shown,
+                built
+            );
+            let serialized = doc.to_xml();
+            assert!(
+                !errors(&validator, &serialized).is_empty(),
+                "the serialized form {} is accepted",
+                serialized
+            );
+        }
+    }
 }
 
 /// The fixed value is the declaration's value constraint, a value of the
