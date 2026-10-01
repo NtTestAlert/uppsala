@@ -5,6 +5,7 @@
 //! name types, etc.), whitespace normalization, and facet enforcement.
 
 use std::cmp::Ordering;
+use std::num::IntErrorKind;
 
 use crate::dom::{Document, NodeId};
 use crate::error::ValidationError;
@@ -370,6 +371,159 @@ fn primitive_type(bt: &BuiltInType) -> BuiltInType {
         | BuiltInType::AnySimpleType => BuiltInType::String,
         other => other.clone(),
     }
+}
+
+/// The value range of an integer-family built-in type. The value space of
+/// `integer` is unbounded, so a value is never refused for its length alone.
+/// A value that fits in `i128` is compared as a number. Every bound lies well
+/// inside `i128`, so a longer value is beyond every bound on its side: refused
+/// if that side is bounded, and otherwise checked on its digit string, against
+/// the other bound written as a digit string.
+struct IntegerRange {
+    /// The type's name, for messages.
+    name: &'static str,
+    /// The least value, or `None` when the type is unbounded below.
+    min: Option<IntegerBound>,
+    /// The greatest value, or `None` when the type is unbounded above.
+    max: Option<IntegerBound>,
+    /// Whether a leading `-` is refused, even on zero. The lexical space of
+    /// the `unsigned*` types has no minus sign (Part 2, 3.3.21.1 to
+    /// 3.3.24.1); a leading `+` is accepted for them, as before.
+    no_minus: bool,
+}
+
+/// A bound of an integer-family type, as a decimal digit string and as the
+/// same number.
+#[derive(Clone, Copy)]
+struct IntegerBound {
+    digits: &'static str,
+    value: i128,
+}
+
+const fn bound(digits: &'static str, value: i128) -> Option<IntegerBound> {
+    Some(IntegerBound { digits, value })
+}
+
+const fn integer_range(
+    name: &'static str,
+    min: Option<IntegerBound>,
+    max: Option<IntegerBound>,
+    no_minus: bool,
+) -> IntegerRange {
+    IntegerRange {
+        name,
+        min,
+        max,
+        no_minus,
+    }
+}
+
+/// The range of `bt`, one of the 13 integer-family built-in types; any other
+/// type gets the unbounded range of `integer`.
+fn integer_type_range(bt: &BuiltInType) -> IntegerRange {
+    let zero = bound("0", 0);
+    match bt {
+        BuiltInType::Long => integer_range(
+            "long",
+            bound("-9223372036854775808", i64::MIN as i128),
+            bound("9223372036854775807", i64::MAX as i128),
+            false,
+        ),
+        BuiltInType::Int => integer_range(
+            "int",
+            bound("-2147483648", i32::MIN as i128),
+            bound("2147483647", i32::MAX as i128),
+            false,
+        ),
+        BuiltInType::Short => integer_range(
+            "short",
+            bound("-32768", i16::MIN as i128),
+            bound("32767", i16::MAX as i128),
+            false,
+        ),
+        BuiltInType::Byte => integer_range(
+            "byte",
+            bound("-128", i8::MIN as i128),
+            bound("127", i8::MAX as i128),
+            false,
+        ),
+        BuiltInType::NonNegativeInteger => integer_range("nonNegativeInteger", zero, None, false),
+        BuiltInType::PositiveInteger => {
+            integer_range("positiveInteger", bound("1", 1), None, false)
+        }
+        BuiltInType::NonPositiveInteger => integer_range("nonPositiveInteger", None, zero, false),
+        BuiltInType::NegativeInteger => {
+            integer_range("negativeInteger", None, bound("-1", -1), false)
+        }
+        BuiltInType::UnsignedLong => integer_range(
+            "unsignedLong",
+            zero,
+            bound("18446744073709551615", u64::MAX as i128),
+            true,
+        ),
+        BuiltInType::UnsignedInt => integer_range(
+            "unsignedInt",
+            zero,
+            bound("4294967295", u32::MAX as i128),
+            true,
+        ),
+        BuiltInType::UnsignedShort => integer_range(
+            "unsignedShort",
+            zero,
+            bound("65535", u16::MAX as i128),
+            true,
+        ),
+        BuiltInType::UnsignedByte => {
+            integer_range("unsignedByte", zero, bound("255", u8::MAX as i128), true)
+        }
+        _ => integer_range("integer", None, None, false),
+    }
+}
+
+/// Whether `v`, already whitespace-normalized, is a value of the integer type
+/// with `range`: an optional sign and one or more ASCII digits
+/// (`[\-+]?[0-9]+`) whose value lies within the bounds. The cost is linear in
+/// the length of `v`, and nothing is allocated.
+fn is_valid_integer_value(v: &str, range: &IntegerRange) -> bool {
+    if range.no_minus && v.starts_with('-') {
+        return false;
+    }
+    // `i128::from_str` accepts exactly `[\-+]?[0-9]+`. It stops at the first
+    // digit that overflows: such a value, if it is an integer at all, is
+    // beyond every bound on that side, so a bounded side refuses it at once.
+    match v.parse::<i128>() {
+        Ok(n) => {
+            return !matches!(range.min, Some(b) if n < b.value)
+                && !matches!(range.max, Some(b) if n > b.value);
+        }
+        Err(e) => match e.kind() {
+            IntErrorKind::PosOverflow if range.max.is_some() => return false,
+            IntErrorKind::NegOverflow if range.min.is_some() => return false,
+            _ => {}
+        },
+    }
+    let digits = v.strip_prefix(['+', '-']).unwrap_or(v);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // Beyond `i128`: compare the digit strings.
+    if let Some(min) = range.min {
+        if !matches!(
+            compare_decimal_strings(v, min.digits),
+            Some(Ordering::Greater | Ordering::Equal)
+        ) {
+            return false;
+        }
+    }
+    if let Some(max) = range.max {
+        if !matches!(
+            compare_decimal_strings(v, max.digits),
+            Some(Ordering::Less | Ordering::Equal)
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether two whitespace-normalized lexical values denote the same value.
@@ -920,143 +1074,24 @@ pub(crate) fn validate_builtin_value(
                 });
             }
         }
-        BuiltInType::Integer => {
+        BuiltInType::Integer
+        | BuiltInType::Long
+        | BuiltInType::Int
+        | BuiltInType::Short
+        | BuiltInType::Byte
+        | BuiltInType::NonNegativeInteger
+        | BuiltInType::PositiveInteger
+        | BuiltInType::NonPositiveInteger
+        | BuiltInType::NegativeInteger
+        | BuiltInType::UnsignedLong
+        | BuiltInType::UnsignedInt
+        | BuiltInType::UnsignedShort
+        | BuiltInType::UnsignedByte => {
             let v = trim_xml_whitespace(text);
-            if v.parse::<i128>().is_err() {
+            let range = integer_type_range(bt);
+            if !is_valid_integer_value(v, &range) {
                 errors.push(ValidationError {
-                    message: format!("'{}' is not a valid integer", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::Long => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<i64>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid long", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::Int => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<i32>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid int", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::Short => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<i16>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid short", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::Byte => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<i8>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid byte", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::NonNegativeInteger => {
-            let v = trim_xml_whitespace(text);
-            match v.parse::<i128>() {
-                Ok(n) if n >= 0 => {}
-                _ => {
-                    errors.push(ValidationError {
-                        message: format!("'{}' is not a valid nonNegativeInteger", text),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
-            }
-        }
-        BuiltInType::PositiveInteger => {
-            let v = trim_xml_whitespace(text);
-            match v.parse::<i128>() {
-                Ok(n) if n > 0 => {}
-                _ => {
-                    errors.push(ValidationError {
-                        message: format!("'{}' is not a valid positiveInteger", text),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
-            }
-        }
-        BuiltInType::NonPositiveInteger => {
-            let v = trim_xml_whitespace(text);
-            match v.parse::<i128>() {
-                Ok(n) if n <= 0 => {}
-                _ => {
-                    errors.push(ValidationError {
-                        message: format!("'{}' is not a valid nonPositiveInteger", text),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
-            }
-        }
-        BuiltInType::NegativeInteger => {
-            let v = trim_xml_whitespace(text);
-            match v.parse::<i128>() {
-                Ok(n) if n < 0 => {}
-                _ => {
-                    errors.push(ValidationError {
-                        message: format!("'{}' is not a valid negativeInteger", text),
-                        line: Some(doc.node_line(node)),
-                        column: Some(doc.node_column(node)),
-                    });
-                }
-            }
-        }
-        BuiltInType::UnsignedLong => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<u64>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid unsignedLong", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::UnsignedInt => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<u32>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid unsignedInt", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::UnsignedShort => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<u16>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid unsignedShort", text),
-                    line: Some(doc.node_line(node)),
-                    column: Some(doc.node_column(node)),
-                });
-            }
-        }
-        BuiltInType::UnsignedByte => {
-            let v = trim_xml_whitespace(text);
-            if v.parse::<u8>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("'{}' is not a valid unsignedByte", text),
+                    message: format!("'{}' is not a valid {}", text, range.name),
                     line: Some(doc.node_line(node)),
                     column: Some(doc.node_column(node)),
                 });
@@ -1757,4 +1792,66 @@ fn total_digits(text: &str) -> usize {
     let significant = format!("{}{}", int_part, frac_part);
     let significant = significant.trim_start_matches('0');
     significant.len().max(1).max(frac_part.len())
+}
+
+#[cfg(test)]
+mod integer_range_tests {
+    use super::*;
+
+    const INTEGER_TYPES: [BuiltInType; 13] = [
+        BuiltInType::Integer,
+        BuiltInType::Long,
+        BuiltInType::Int,
+        BuiltInType::Short,
+        BuiltInType::Byte,
+        BuiltInType::NonNegativeInteger,
+        BuiltInType::PositiveInteger,
+        BuiltInType::NonPositiveInteger,
+        BuiltInType::NegativeInteger,
+        BuiltInType::UnsignedLong,
+        BuiltInType::UnsignedInt,
+        BuiltInType::UnsignedShort,
+        BuiltInType::UnsignedByte,
+    ];
+
+    /// The digit string and the number of every bound are the same value.
+    #[test]
+    fn bound_digits_and_values_agree() {
+        for bt in &INTEGER_TYPES {
+            let range = integer_type_range(bt);
+            for b in [range.min, range.max].into_iter().flatten() {
+                assert_eq!(b.digits.parse::<i128>(), Ok(b.value), "{}", range.name);
+            }
+        }
+    }
+
+    /// The `i128` path and the digit-string path decide alike at and around
+    /// every bound.
+    #[test]
+    fn number_and_digit_string_paths_agree() {
+        let by_digits = |v: &str, range: &IntegerRange| {
+            [range.min, range.max]
+                .iter()
+                .zip([Ordering::Less, Ordering::Greater])
+                .all(|(b, outside)| match b {
+                    Some(b) => compare_decimal_strings(v, b.digits) != Some(outside),
+                    None => true,
+                })
+        };
+        for bt in &INTEGER_TYPES {
+            let range = integer_type_range(bt);
+            for b in [range.min, range.max].into_iter().flatten() {
+                for n in [b.value - 1, b.value, b.value + 1] {
+                    let v = n.to_string();
+                    let expected = by_digits(&v, &range) && !(range.no_minus && n < 0);
+                    assert_eq!(
+                        is_valid_integer_value(&v, &range),
+                        expected,
+                        "{} {v}",
+                        range.name
+                    );
+                }
+            }
+        }
+    }
 }
