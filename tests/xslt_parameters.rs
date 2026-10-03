@@ -122,3 +122,109 @@ fn external_expressions_reference_earlier_arguments() {
     let reversed = [params[1].clone(), params[0].clone()];
     assert!(sheet.transform_with_params(&source, &reversed).is_err());
 }
+
+/// Literals are installed before expressions even when listed after them. An
+/// expression therefore wins a mixed duplicate, not necessarily the last tuple.
+#[test]
+fn literals_bind_first_and_expression_duplicates_follow_input_order() {
+    let style = Parser::new().parse(STYLE).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    let sheet = Stylesheet::compile(&style).unwrap();
+    let params = [
+        (
+            "p:value".into(),
+            ParameterValue::Expression("concat($q:value, '-first')".into()),
+        ),
+        (
+            "{urn:p}value".into(),
+            ParameterValue::Expression("concat($p:value, '-last')".into()),
+        ),
+        ("q:value".into(), ParameterValue::String("literal".into())),
+    ];
+    assert_eq!(
+        sheet.transform_with_params(&source, &params).unwrap(),
+        "literal-first-last|literal-first-last!"
+    );
+    assert_eq!(sheet.transform(&source).unwrap(), "default|default!");
+}
+
+/// Unused external bindings can feed later external expressions, but must not
+/// override variables or introduce bindings into the stylesheet's global scope.
+#[test]
+fn undeclared_and_variable_arguments_do_not_override_declarations() {
+    let style = Parser::new().parse(STYLE).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    let sheet = Stylesheet::compile(&style).unwrap();
+    let params = [
+        ("unused".into(), ParameterValue::String("ignored".into())),
+        (
+            "derived".into(),
+            ParameterValue::Expression("'wrong'".into()),
+        ),
+    ];
+    assert_eq!(
+        sheet.transform_with_params(&source, &params).unwrap(),
+        "default|default!"
+    );
+    let xml = STYLE.replace("select=\"'default'\"", "select=\"$unused\"");
+    let style = Parser::new().parse(&xml).unwrap();
+    let sheet = Stylesheet::compile(&style).unwrap();
+    assert!(sheet.transform_with_params(&source, &params).is_err());
+}
+
+/// The default XML namespace does not qualify unprefixed parameter names.
+#[test]
+fn unprefixed_names_are_distinct_from_qualified_names() {
+    let xml = STYLE
+        .replace("xmlns:p=\"urn:p\"", "xmlns=\"urn:p\" xmlns:p=\"urn:p\"")
+        .replace(
+            "<xsl:param name=\"p:value\"",
+            "<xsl:param name=\"value\" select=\"'plain'\"/><xsl:param name=\"p:value\"",
+        )
+        .replace(
+            "select=\"$q:value\"",
+            "select=\"concat($value, ':', $q:value)\"",
+        );
+    let style = Parser::new().parse(&xml).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    let sheet = Stylesheet::compile(&style).unwrap();
+    let params = [
+        ("value".into(), ParameterValue::String("unqualified".into())),
+        (
+            "{urn:p}value".into(),
+            ParameterValue::Expression("'qualified'".into()),
+        ),
+    ];
+    assert_eq!(
+        sheet.transform_with_params(&source, &params).unwrap(),
+        "unqualified:qualified|qualified!"
+    );
+}
+
+/// A failed evaluation must leave the compiled sheet reusable; an override can
+/// break a default dependency cycle, but must not persist into the next call.
+#[test]
+fn stylesheet_reuse_after_dependency_and_expression_failures() {
+    let xml = STYLE.replace("select=\"'default'\"", "select=\"$derived\"");
+    let style = Parser::new().parse(&xml).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    let sheet = Stylesheet::compile(&style).unwrap();
+    assert!(sheet
+        .transform(&source)
+        .unwrap_err()
+        .to_string()
+        .contains("circular"));
+    for text in ["first", "second"] {
+        let params = [("p:value".into(), ParameterValue::String(text.into()))];
+        assert_eq!(
+            sheet.transform_with_params(&source, &params).unwrap(),
+            format!("{text}|{text}!")
+        );
+        assert!(sheet.transform(&source).is_err());
+        let invalid = [(
+            "p:value".into(),
+            ParameterValue::Expression("$missing".into()),
+        )];
+        assert!(sheet.transform_with_params(&source, &invalid).is_err());
+    }
+}
