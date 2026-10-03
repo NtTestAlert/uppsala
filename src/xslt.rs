@@ -312,6 +312,17 @@ impl Default for OutputOptions {
 
 // ─── Stylesheet model ─────────────────────────────────────
 
+/// An external top-level parameter supplied for one transformation.
+/// Expressions are evaluated against the source document root and retain their
+/// XPath type. Literal strings bypass XPath parsing entirely.
+#[derive(Clone, Debug)]
+pub enum ParameterValue {
+    /// Literal Unicode text, without XML or XPath escaping.
+    String(String),
+    /// An XPath 1.0 expression using the stylesheet's namespace bindings.
+    Expression(String),
+}
+
 /// A compiled XSLT stylesheet, ready to transform source documents.
 ///
 /// Build one with [`Stylesheet::compile`] and apply it with
@@ -555,6 +566,23 @@ impl Stylesheet {
     /// any expression or pattern uses the attribute axis. The one-shot
     /// [`crate::transform`] helper does this for you.
     pub fn transform(&self, source: &Document<'_>) -> XmlResult<String> {
+        self.transform_with_params(source, &[])
+    }
+
+    /// Transform with invocation-local parameters, without modifying this sheet.
+    ///
+    /// Call parameters override `with_param` defaults. Literals bind first, then
+    /// expressions in input order; the last binding of a duplicate name wins.
+    /// Undeclared parameters and names of variables do not override declarations.
+    /// Expressions are evaluated even for unused names, using the source root
+    /// (position and size 1) and stylesheet namespaces. Expressions may reference
+    /// literal arguments and earlier expression arguments, but not stylesheet globals.
+    /// The source must be prepared for XPath, as for [`Self::transform`].
+    pub fn transform_with_params(
+        &self,
+        source: &Document<'_>,
+        params: &[(String, ParameterValue)],
+    ) -> XmlResult<String> {
         let mut engine = Engine {
             source,
             stylesheet: self,
@@ -565,7 +593,7 @@ impl Stylesheet {
             max_result_tree_bytes: self.max_result_tree_bytes,
             result_tree_bytes_used: 0,
         };
-        engine.init_globals()?;
+        engine.init_globals(params)?;
         let root = source.root();
         let result = engine.apply_to_node(
             Focus {
@@ -646,12 +674,18 @@ fn compile_stylesheet(doc: &Document<'_>, root: NodeId) -> XmlResult<Stylesheet>
             "output" => parse_output(doc, child, &mut output)?,
             "template" => templates.push(compile_template(doc, child, &namespaces)?),
             "variable" | "param" => {
-                let name = el
-                    .get_attribute("name")
-                    .ok_or_else(|| XmlError::xpath("top-level variable/param requires name"))?
-                    .to_string();
+                let name = expanded_param_name(
+                    el.get_attribute("name")
+                        .ok_or_else(|| XmlError::xpath("top-level variable/param requires name"))?,
+                    &in_scope_namespaces(doc, child),
+                )?;
                 let value = compile_value_source(doc, child, el, &namespaces)?;
                 let is_param = el.name.local_name.as_ref() == "param";
+                if globals.iter().any(|g: &GlobalVar| g.name == name) {
+                    return Err(XmlError::xpath(format!(
+                        "duplicate global variable or parameter: {name}"
+                    )));
+                }
                 globals.push(GlobalVar {
                     name,
                     value,
@@ -1175,16 +1209,17 @@ struct Engine<'a, 'b> {
 struct ScopeResolver<'s> {
     locals: &'s [(String, VarValue)],
     globals: &'s [(String, VarValue)],
+    namespaces: &'s HashMap<String, String>,
 }
 
 impl VariableResolver for ScopeResolver<'_> {
     fn resolve_variable(&self, prefix: Option<&str>, local: &str) -> Option<XPathValue> {
-        let key = var_key(prefix, local);
+        let key = expanded_param_name(&var_key(prefix, local), self.namespaces).ok()?;
         self.locals
             .iter()
             .rev()
             .chain(self.globals.iter().rev())
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| expanded_param_name(k, self.namespaces).ok().as_ref() == Some(&key))
             .map(|(_, v)| v.to_xpath())
     }
 }
@@ -1208,8 +1243,35 @@ impl FunctionResolver for ExsltResolver<'_, '_> {
     }
 }
 
-/// XSLT variable key: the expanded-name approximation. Tier A variable names are
-/// unprefixed; a prefixed name is keyed by its literal `prefix:local` form.
+/// Resolve API Clark names or QNames to an expanded variable name. Unprefixed
+/// variables have no namespace, regardless of the default namespace binding.
+fn expanded_param_name(name: &str, namespaces: &HashMap<String, String>) -> XmlResult<String> {
+    if name.starts_with('{') {
+        if let Some((_, local)) = name.split_once('}') {
+            if crate::writer::is_valid_xml_ncname(local) {
+                return Ok(name.to_string());
+            }
+        }
+        return Err(XmlError::xpath("invalid expanded parameter name"));
+    }
+    if !crate::writer::is_valid_xml_qname(name) {
+        return Err(XmlError::xpath(format!("invalid parameter name: {name}")));
+    }
+    if let Some((prefix, local)) = name.split_once(':') {
+        let uri = if prefix == "xml" {
+            "http://www.w3.org/XML/1998/namespace"
+        } else {
+            namespaces
+                .get(prefix)
+                .map(String::as_str)
+                .ok_or_else(|| XmlError::xpath(format!("unbound parameter prefix: {prefix}")))?
+        };
+        return Ok(format!("{{{uri}}}{local}"));
+    }
+    Ok(name.to_string())
+}
+
+/// Reconstruct the lexical QName delivered by the XPath variable resolver.
 fn var_key(prefix: Option<&str>, local: &str) -> String {
     match prefix {
         Some(p) => format!("{}:{}", p, local),
@@ -1311,34 +1373,82 @@ impl<'a, 'b> Engine<'a, 'b> {
         Ok(())
     }
 
-    /// Evaluate top-level variables/params into `self.globals`, in document
-    /// order, so each can reference those declared before it.
-    fn init_globals(&mut self) -> XmlResult<()> {
+    /// Bind invocation parameters, then resolve global defaults in dependency
+    /// order. Missing or circular global dependencies fail the invocation.
+    fn init_globals(&mut self, params: &[(String, ParameterValue)]) -> XmlResult<()> {
         let stylesheet = self.stylesheet;
         let focus = Focus {
             node: self.source.root(),
             position: 1,
             size: 1,
         };
-        for g in &stylesheet.globals {
-            // A top-level xsl:param may be overridden externally (last value for
-            // the name wins); xsl:variable and un-overridden params evaluate their
-            // default. Overrides bind as a string value.
-            let override_val = if g.is_param {
-                stylesheet
-                    .param_overrides
-                    .iter()
-                    .rev()
-                    .find(|(n, _)| *n == g.name)
-                    .map(|(_, v)| v.clone())
-            } else {
-                None
+        let params = params
+            .iter()
+            .map(|(name, value)| Ok((expanded_param_name(name, &stylesheet.namespaces)?, value)))
+            .collect::<XmlResult<Vec<_>>>()?;
+        let defaults = stylesheet
+            .param_overrides
+            .iter()
+            .map(|(name, value)| Ok((expanded_param_name(name, &stylesheet.namespaces)?, value)))
+            .collect::<XmlResult<Vec<_>>>()?;
+        // Literal parameters are bound first, matching lxml's strparam behavior.
+        // Expressions then see literals and earlier expressions, in input order.
+        // Evaluate even unused names to report malformed expressions.
+        for (name, value) in defaults {
+            self.globals.retain(|(key, _)| key != &name);
+            self.globals
+                .push((name, VarValue::Value(XPathValue::String(value.clone()))));
+        }
+        let (literals, expressions): (Vec<_>, Vec<_>) = params
+            .into_iter()
+            .partition(|(_, value)| matches!(value, ParameterValue::String(_)));
+        for (name, value) in literals.into_iter().chain(expressions) {
+            let value = match value {
+                ParameterValue::String(value) => XPathValue::String(value.clone()),
+                ParameterValue::Expression(expr) => {
+                    let compiled = CompiledXPath::compile(expr, DEFAULT_MAX_XPATH_DEPTH)?;
+                    self.eval(&compiled, focus)?
+                }
             };
-            let val = match override_val {
-                Some(v) => VarValue::Value(XPathValue::String(v)),
-                None => self.eval_value_source(&g.value, focus)?,
-            };
-            self.globals.push((g.name.clone(), val));
+            self.globals.retain(|(key, _)| key != &name);
+            self.globals.push((name, VarValue::Value(value)));
+        }
+        // Only declared parameters override stylesheet bindings. Install them
+        // before resolving defaults, regardless of declaration order.
+        self.globals.retain(|(name, _)| {
+            stylesheet
+                .globals
+                .iter()
+                .any(|g| g.is_param && &g.name == name)
+        });
+        let mut pending: Vec<_> = stylesheet
+            .globals
+            .iter()
+            .filter(|g| !self.globals.iter().any(|(name, _)| name == &g.name))
+            .collect();
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut deferred = Vec::new();
+            let mut unresolved = None;
+            for g in pending {
+                match self.eval_value_source(&g.value, focus) {
+                    Ok(value) => self.globals.push((g.name.clone(), value)),
+                    Err(XmlError::XPath(ref err))
+                        if err.message.starts_with("Undefined variable:") =>
+                    {
+                        unresolved = Some(err.message.clone());
+                        deferred.push(g);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if deferred.len() == before {
+                return Err(XmlError::xpath(format!(
+                    "unresolved or circular global dependency: {}",
+                    unresolved.unwrap_or_default()
+                )));
+            }
+            pending = deferred;
         }
         Ok(())
     }
@@ -1493,6 +1603,7 @@ impl<'a, 'b> Engine<'a, 'b> {
         let vars = ScopeResolver {
             locals: &self.locals,
             globals: &self.globals,
+            namespaces: &self.stylesheet.namespaces,
         };
         let mut best: Option<(usize, f64)> = None;
         for (i, tmpl) in self.stylesheet.templates.iter().enumerate() {
@@ -1540,7 +1651,10 @@ impl<'a, 'b> Engine<'a, 'b> {
         let mark = self.locals.len();
         let mut out = Vec::new();
         for instr in body {
-            self.execute_instruction(instr, focus, &mut out)?;
+            if let Err(error) = self.execute_instruction(instr, focus, &mut out) {
+                self.locals.truncate(mark);
+                return Err(error);
+            }
         }
         self.locals.truncate(mark);
         Ok(out)
@@ -1909,12 +2023,17 @@ impl<'a, 'b> Engine<'a, 'b> {
     }
 
     fn lookup_var_ref(&self, prefix: Option<&str>, local: &str) -> Option<&VarValue> {
-        let key = var_key(prefix, local);
+        let key = expanded_param_name(&var_key(prefix, local), &self.stylesheet.namespaces).ok()?;
         self.locals
             .iter()
             .rev()
             .chain(self.globals.iter().rev())
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| {
+                expanded_param_name(k, &self.stylesheet.namespaces)
+                    .ok()
+                    .as_ref()
+                    == Some(&key)
+            })
             .map(|(_, v)| v)
     }
 
@@ -1956,6 +2075,7 @@ impl<'a, 'b> Engine<'a, 'b> {
         let vars = ScopeResolver {
             locals: &self.locals,
             globals: &self.globals,
+            namespaces: &self.stylesheet.namespaces,
         };
         eval_compiled(
             expr,
