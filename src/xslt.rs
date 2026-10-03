@@ -312,6 +312,25 @@ impl Default for OutputOptions {
 
 // ─── Stylesheet model ─────────────────────────────────────
 
+/// An XPath expression and the namespace bindings at its declaration site.
+struct ScopedXPath {
+    expression: CompiledXPath,
+    namespaces: HashMap<String, String>,
+}
+
+impl ScopedXPath {
+    fn compile(
+        text: &str,
+        max_depth: u32,
+        namespaces: &HashMap<String, String>,
+    ) -> XmlResult<Self> {
+        Ok(Self {
+            expression: CompiledXPath::compile(text, max_depth)?,
+            namespaces: namespaces.clone(),
+        })
+    }
+}
+
 /// An external top-level parameter supplied for one transformation.
 /// Expressions are evaluated against the source document root and retain their
 /// XPath type. Literal strings bypass XPath parsing entirely.
@@ -374,6 +393,7 @@ struct GlobalVar {
 struct Template {
     /// The compiled `match` pattern, if this is a match template.
     pattern: Option<CompiledPattern>,
+    namespaces: HashMap<String, String>,
     /// Precomputed dispatch descriptor for `pattern`, used to skip
     /// non-applicable templates cheaply during per-node template selection.
     dispatch: Option<PatternDispatch>,
@@ -399,7 +419,7 @@ enum Instruction {
     },
     /// `xsl:value-of`.
     ValueOf {
-        select: CompiledXPath,
+        select: ScopedXPath,
         disable_escaping: bool,
     },
     /// `xsl:text`.
@@ -410,22 +430,22 @@ enum Instruction {
     /// `xsl:apply-templates` with an optional `select` (defaults to the
     /// children of the current node) and `xsl:with-param` children.
     ApplyTemplates {
-        select: Option<CompiledXPath>,
+        select: Option<ScopedXPath>,
         params: Vec<WithParam>,
     },
     /// `xsl:if`.
     If {
-        test: CompiledXPath,
+        test: ScopedXPath,
         body: Vec<Instruction>,
     },
     /// `xsl:choose` — the first `when` whose test is true, else `otherwise`.
     Choose {
-        whens: Vec<(CompiledXPath, Vec<Instruction>)>,
+        whens: Vec<(ScopedXPath, Vec<Instruction>)>,
         otherwise: Vec<Instruction>,
     },
     /// `xsl:for-each` — execute the body for each selected node.
     ForEach {
-        select: CompiledXPath,
+        select: ScopedXPath,
         body: Vec<Instruction>,
     },
     /// `xsl:variable` declaration (scoped to following siblings).
@@ -433,7 +453,7 @@ enum Instruction {
     /// `xsl:copy` — shallow-copy the current node, then execute the body.
     Copy { body: Vec<Instruction> },
     /// `xsl:copy-of` — deep-copy the selected nodes / fragment.
-    CopyOf { select: CompiledXPath },
+    CopyOf { select: ScopedXPath },
     /// `xsl:element` with a computed (AVT) name.
     Element { name: Avt, body: Vec<Instruction> },
     /// `xsl:attribute` with a computed (AVT) name; the body is its value.
@@ -455,7 +475,7 @@ enum Instruction {
 /// The value of an `xsl:variable`/`xsl:param`/`xsl:with-param`: either a
 /// `select` expression or a body (result-tree fragment) sequence constructor.
 enum ValueSource {
-    Select(CompiledXPath),
+    Select(ScopedXPath),
     Body(Vec<Instruction>),
 }
 
@@ -480,7 +500,7 @@ struct Avt {
 
 enum AvtPart {
     Literal(String),
-    Expr(CompiledXPath),
+    Expr(ScopedXPath),
 }
 
 // ─── Public API ───────────────────────────────────────────
@@ -785,10 +805,11 @@ fn compile_template(
                         "xsl:param must come before all other template content",
                     ));
                 }
-                let name = ce
-                    .get_attribute("name")
-                    .ok_or_else(|| XmlError::xpath("xsl:param requires name"))?
-                    .to_string();
+                let name = expanded_param_name(
+                    ce.get_attribute("name")
+                        .ok_or_else(|| XmlError::xpath("xsl:param requires name"))?,
+                    &in_scope_namespaces(doc, child),
+                )?;
                 let value = compile_value_source(doc, child, ce, ns)?;
                 params.push(WithParam { name, value });
             }
@@ -804,6 +825,7 @@ fn compile_template(
 
     Ok(Template {
         pattern,
+        namespaces: in_scope_namespaces(doc, node),
         dispatch,
         explicit_priority,
         name: name_attr,
@@ -824,12 +846,15 @@ fn compile_value_source(
     doc: &Document<'_>,
     node: NodeId,
     el: &crate::dom::Element<'_>,
-    ns: &HashMap<String, String>,
+    _ns: &HashMap<String, String>,
 ) -> XmlResult<ValueSource> {
+    let local_namespaces = in_scope_namespaces(doc, node);
+    let ns = &local_namespaces;
     if let Some(sel) = el.get_attribute("select") {
-        Ok(ValueSource::Select(CompiledXPath::compile(
+        Ok(ValueSource::Select(ScopedXPath::compile(
             sel,
             DEFAULT_MAX_XPATH_DEPTH,
+            ns,
         )?))
     } else {
         Ok(ValueSource::Body(compile_sequence(doc, node, ns)?))
@@ -846,10 +871,11 @@ fn compile_with_params(
     for child in doc.children(node) {
         if let Some(NodeKind::Element(ce)) = doc.node_kind(child) {
             if is_xsl(ce, "with-param") {
-                let name = ce
-                    .get_attribute("name")
-                    .ok_or_else(|| XmlError::xpath("xsl:with-param requires name"))?
-                    .to_string();
+                let name = expanded_param_name(
+                    ce.get_attribute("name")
+                        .ok_or_else(|| XmlError::xpath("xsl:with-param requires name"))?,
+                    &in_scope_namespaces(doc, child),
+                )?;
                 let value = compile_value_source(doc, child, ce, ns)?;
                 params.push(WithParam { name, value });
             }
@@ -908,14 +934,16 @@ fn compile_xsl_instruction(
     doc: &Document<'_>,
     node: NodeId,
     el: &crate::dom::Element<'_>,
-    ns: &HashMap<String, String>,
+    _ns: &HashMap<String, String>,
 ) -> XmlResult<Option<Instruction>> {
+    let local_namespaces = in_scope_namespaces(doc, node);
+    let ns = &local_namespaces;
     // Helper closures for common attribute reads.
-    let compile_sel = |name: &str| -> XmlResult<CompiledXPath> {
+    let compile_sel = |name: &str| -> XmlResult<ScopedXPath> {
         let s = el.get_attribute(name).ok_or_else(|| {
             XmlError::xpath(format!("xsl:{} requires {}", el.name.local_name, name))
         })?;
-        CompiledXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH)
+        ScopedXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH, ns)
     };
 
     let instr = match el.name.local_name.as_ref() {
@@ -941,7 +969,7 @@ fn compile_xsl_instruction(
         }
         "apply-templates" => Instruction::ApplyTemplates {
             select: match el.get_attribute("select") {
-                Some(s) => Some(CompiledXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH)?),
+                Some(s) => Some(ScopedXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH, ns)?),
                 None => None,
             },
             params: compile_with_params(doc, node, ns)?,
@@ -956,10 +984,11 @@ fn compile_xsl_instruction(
             body: compile_sequence(doc, node, ns)?,
         },
         "variable" => {
-            let name = el
-                .get_attribute("name")
-                .ok_or_else(|| XmlError::xpath("xsl:variable requires name"))?
-                .to_string();
+            let name = expanded_param_name(
+                el.get_attribute("name")
+                    .ok_or_else(|| XmlError::xpath("xsl:variable requires name"))?,
+                &in_scope_namespaces(doc, node),
+            )?;
             Instruction::Variable {
                 name,
                 value: compile_value_source(doc, node, el, ns)?,
@@ -1036,7 +1065,11 @@ fn compile_choose(
                     .get_attribute("test")
                     .ok_or_else(|| XmlError::xpath("xsl:when requires test"))?;
                 whens.push((
-                    CompiledXPath::compile(test, DEFAULT_MAX_XPATH_DEPTH)?,
+                    ScopedXPath::compile(
+                        test,
+                        DEFAULT_MAX_XPATH_DEPTH,
+                        &in_scope_namespaces(doc, child),
+                    )?,
                     compile_sequence(doc, child, ns)?,
                 ));
             } else if is_xsl(ce, "otherwise") {
@@ -1050,8 +1083,10 @@ fn compile_choose(
 fn compile_literal_element(
     doc: &Document<'_>,
     node: NodeId,
-    ns: &HashMap<String, String>,
+    _ns: &HashMap<String, String>,
 ) -> XmlResult<Instruction> {
+    let local_namespaces = in_scope_namespaces(doc, node);
+    let ns = &local_namespaces;
     let el = match doc.node_kind(node) {
         Some(NodeKind::Element(e)) => e,
         _ => unreachable!(),
@@ -1112,7 +1147,7 @@ fn compile_literal_element(
 
 /// Parse an attribute value template: text with `{expr}` placeholders and
 /// `{{`/`}}` escapes.
-fn compile_avt(value: &str, _ns: &HashMap<String, String>) -> XmlResult<Avt> {
+fn compile_avt(value: &str, ns: &HashMap<String, String>) -> XmlResult<Avt> {
     // Fast path: no braces means a single literal part, so skip the char buffer
     // and the placeholder scan entirely (the overwhelmingly common attribute).
     if !value.contains(['{', '}']) {
@@ -1153,9 +1188,10 @@ fn compile_avt(value: &str, _ns: &HashMap<String, String>) -> XmlResult<Avt> {
                     ));
                 }
                 let expr: String = chars[start..i].iter().collect();
-                parts.push(AvtPart::Expr(CompiledXPath::compile(
+                parts.push(AvtPart::Expr(ScopedXPath::compile(
                     &expr,
                     DEFAULT_MAX_XPATH_DEPTH,
+                    ns,
                 )?));
                 i += 1; // consume '}'
             }
@@ -1219,7 +1255,7 @@ impl VariableResolver for ScopeResolver<'_> {
             .iter()
             .rev()
             .chain(self.globals.iter().rev())
-            .find(|(k, _)| expanded_param_name(k, self.namespaces).ok().as_ref() == Some(&key))
+            .find(|(k, _)| *k == key)
             .map(|(_, v)| v.to_xpath())
     }
 }
@@ -1389,8 +1425,12 @@ impl<'a, 'b> Engine<'a, 'b> {
         let defaults = stylesheet
             .param_overrides
             .iter()
-            .map(|(name, value)| Ok((expanded_param_name(name, &stylesheet.namespaces)?, value)))
-            .collect::<XmlResult<Vec<_>>>()?;
+            .filter_map(|(name, value)| {
+                expanded_param_name(name, &stylesheet.namespaces)
+                    .ok()
+                    .map(|name| (name, value))
+            })
+            .collect::<Vec<_>>();
         // Literal parameters are bound first, matching lxml's strparam behavior.
         // Expressions then see literals and earlier expressions, in input order.
         // Evaluate even unused names to report malformed expressions.
@@ -1406,7 +1446,11 @@ impl<'a, 'b> Engine<'a, 'b> {
             let value = match value {
                 ParameterValue::String(value) => XPathValue::String(value.clone()),
                 ParameterValue::Expression(expr) => {
-                    let compiled = CompiledXPath::compile(expr, DEFAULT_MAX_XPATH_DEPTH)?;
+                    let compiled = ScopedXPath::compile(
+                        expr,
+                        DEFAULT_MAX_XPATH_DEPTH,
+                        &stylesheet.namespaces,
+                    )?;
                     self.eval(&compiled, focus)?
                 }
             };
@@ -1600,14 +1644,14 @@ impl<'a, 'b> Engine<'a, 'b> {
     /// `priority` if given, else the matching pattern alternative's default
     /// priority.
     fn best_matching_template(&self, node: NodeId) -> Option<usize> {
-        let vars = ScopeResolver {
-            locals: &self.locals,
-            globals: &self.globals,
-            namespaces: &self.stylesheet.namespaces,
-        };
         let mut best: Option<(usize, f64)> = None;
         for (i, tmpl) in self.stylesheet.templates.iter().enumerate() {
             if let Some(pattern) = &tmpl.pattern {
+                let vars = ScopeResolver {
+                    locals: &self.locals,
+                    globals: &self.globals,
+                    namespaces: &tmpl.namespaces,
+                };
                 // Cheap O(1) pre-filter: skip the full pattern match for nodes
                 // this template's pattern can never match (by kind/name). This
                 // turns per-node selection from "test every template" into "test
@@ -1622,7 +1666,7 @@ impl<'a, 'b> Engine<'a, 'b> {
                     self.source,
                     node,
                     node,
-                    &self.stylesheet.namespaces,
+                    &tmpl.namespaces,
                     &vars,
                     &self.funcs(),
                     DEFAULT_MAX_XPATH_NODE_VISITS,
@@ -1867,21 +1911,25 @@ impl<'a, 'b> Engine<'a, 'b> {
     /// a scalar, or a result-tree-fragment variable verbatim.
     fn execute_copy_of(
         &mut self,
-        select: &CompiledXPath,
+        select: &ScopedXPath,
         focus: Focus,
         out: &mut Vec<ResultItem>,
     ) -> XmlResult<()> {
         // copy-of of a bare RTF variable copies the fragment, not its string.
-        if let Some((prefix, local)) = select.as_variable() {
-            if let Some(cloned_bytes) = self.lookup_var_ref(prefix, local).and_then(|value| {
-                if let VarValue::Rtf(nodes) = value {
-                    Some(accounted_node_forest_bytes(nodes))
-                } else {
-                    None
-                }
-            }) {
+        if let Some((prefix, local)) = select.expression.as_variable() {
+            if let Some(cloned_bytes) = self
+                .lookup_var_ref(prefix, local, &select.namespaces)
+                .and_then(|value| {
+                    if let VarValue::Rtf(nodes) = value {
+                        Some(accounted_node_forest_bytes(nodes))
+                    } else {
+                        None
+                    }
+                })
+            {
                 self.charge_result_bytes(cloned_bytes)?;
-                let Some(VarValue::Rtf(nodes)) = self.lookup_var(prefix, local) else {
+                let Some(VarValue::Rtf(nodes)) = self.lookup_var(prefix, local, &select.namespaces)
+                else {
                     return Ok(());
                 };
                 for n in nodes {
@@ -2018,22 +2066,27 @@ impl<'a, 'b> Engine<'a, 'b> {
     }
 
     /// Look up the raw (un-coerced) value of a variable in scope.
-    fn lookup_var(&self, prefix: Option<&str>, local: &str) -> Option<VarValue> {
-        self.lookup_var_ref(prefix, local).cloned()
+    fn lookup_var(
+        &self,
+        prefix: Option<&str>,
+        local: &str,
+        namespaces: &HashMap<String, String>,
+    ) -> Option<VarValue> {
+        self.lookup_var_ref(prefix, local, namespaces).cloned()
     }
 
-    fn lookup_var_ref(&self, prefix: Option<&str>, local: &str) -> Option<&VarValue> {
-        let key = expanded_param_name(&var_key(prefix, local), &self.stylesheet.namespaces).ok()?;
+    fn lookup_var_ref(
+        &self,
+        prefix: Option<&str>,
+        local: &str,
+        namespaces: &HashMap<String, String>,
+    ) -> Option<&VarValue> {
+        let key = expanded_param_name(&var_key(prefix, local), namespaces).ok()?;
         self.locals
             .iter()
             .rev()
             .chain(self.globals.iter().rev())
-            .find(|(k, _)| {
-                expanded_param_name(k, &self.stylesheet.namespaces)
-                    .ok()
-                    .as_ref()
-                    == Some(&key)
-            })
+            .find(|(k, _)| *k == key)
             .map(|(_, v)| v)
     }
 
@@ -2071,20 +2124,20 @@ impl<'a, 'b> Engine<'a, 'b> {
         }
     }
 
-    fn eval(&self, expr: &CompiledXPath, focus: Focus) -> XmlResult<XPathValue> {
+    fn eval(&self, expr: &ScopedXPath, focus: Focus) -> XmlResult<XPathValue> {
         let vars = ScopeResolver {
             locals: &self.locals,
             globals: &self.globals,
-            namespaces: &self.stylesheet.namespaces,
+            namespaces: &expr.namespaces,
         };
         eval_compiled(
-            expr,
+            &expr.expression,
             self.source,
             focus.node,
             focus.node,
             focus.position,
             focus.size,
-            &self.stylesheet.namespaces,
+            &expr.namespaces,
             &vars,
             &self.funcs(),
             DEFAULT_MAX_XPATH_NODE_VISITS,

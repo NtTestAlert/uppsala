@@ -233,12 +233,17 @@ source document root (position and size 1) and stylesheet namespace bindings,
 and preserve XPath types, including source node sets. Prepare the source for
 XPath before calling, as for `transform`.
 
+Unresolvable or unmatched builder `with_param` names are ignored; invocation-local
+parameter names remain strictly validated.
+
 Call values override `with_param` defaults. Literals bind first, followed by
 expressions in supplied order; the last binding of a duplicate name wins. Names
 may be QNames using stylesheet prefixes or `{namespace}local` expanded names.
 Unprefixed names have no namespace. Undeclared names and variable declarations
 are not overridden. Expressions can refer to literal arguments and earlier
-expression arguments, but not stylesheet globals. Defaults resolve global dependencies, reporting unresolved
+expression arguments, but not stylesheet globals. Stylesheet expressions retain
+the namespace bindings in scope on their own declaration elements, including
+local prefix rebinding. Defaults resolve global dependencies, reporting unresolved
 or circular dependencies as errors. The compiled sheet remains reusable after
 success and failure. This does not add unsupported XSLT instructions such as
 imports, includes, or sorting.

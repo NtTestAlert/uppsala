@@ -228,3 +228,116 @@ fn stylesheet_reuse_after_dependency_and_expression_failures() {
         assert!(sheet.transform_with_params(&source, &invalid).is_err());
     }
 }
+
+/// Declarations and references resolve prefixes at their own stylesheet nodes.
+#[test]
+fn locally_declared_prefixes_work_in_expressions_and_avts() {
+    let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+      <xsl:output omit-xml-declaration="yes"/>
+      <xsl:param xmlns:p="urn:local" name="p:v" select="'global'"/>
+      <xsl:variable xmlns:q="urn:local" name="derived" select="concat($q:v, '!')"/>
+      <xsl:template match="/" xmlns:p="urn:local">
+        <out value="{$p:v}"><xsl:value-of select="$derived"/>
+          <xsl:if test="$p:v = 'global'"><yes/></xsl:if>
+          <xsl:choose><xsl:when xmlns:q="urn:local" test="$q:v = 'global'"><chosen/></xsl:when></xsl:choose>
+        </out>
+      </xsl:template>
+    </xsl:stylesheet>"#;
+    let style = Parser::new().parse(xml).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    let sheet = Stylesheet::compile(&style).unwrap();
+    assert_eq!(
+        sheet.transform(&source).unwrap(),
+        "<out value=\"global\">global!<yes/><chosen/></out>"
+    );
+    assert_eq!(
+        sheet
+            .transform_with_params(
+                &source,
+                &[(
+                    "{urn:local}v".into(),
+                    ParameterValue::String("override".into())
+                )]
+            )
+            .unwrap(),
+        "<out value=\"override\">override!</out>"
+    );
+}
+
+/// Rebinding a prefix must not change a previously declared variable's name;
+/// aliases must also work for template arguments and result-tree fragments.
+#[test]
+fn local_bindings_and_fragment_copy_preserve_namespace_identity() {
+    let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:global">
+      <xsl:output omit-xml-declaration="yes"/>
+      <xsl:param name="p:v" select="'global'"/>
+      <xsl:template match="/">
+        <xsl:variable xmlns:p="urn:local" name="p:v"><item>local</item></xsl:variable>
+        <out><xsl:value-of select="$p:v"/>
+          <xsl:copy-of xmlns:q="urn:local" select="$q:v"/>
+          <xsl:call-template name="named"><xsl:with-param xmlns:q="urn:local" name="q:arg" select="$q:v"/></xsl:call-template>
+        </out>
+      </xsl:template>
+      <xsl:template name="named"><xsl:param xmlns:p="urn:local" name="p:arg"/>
+        <xsl:value-of xmlns:q="urn:local" select="$q:arg"/>
+      </xsl:template>
+    </xsl:stylesheet>"#;
+    let style = Parser::new().parse(xml).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    assert_eq!(
+        Stylesheet::compile(&style)
+            .unwrap()
+            .transform(&source)
+            .unwrap(),
+        "<out>global<item>local</item>local</out>"
+    );
+}
+
+/// The builder API historically ignores unmatched names; the per-call API is
+/// deliberately strict about undefined prefixes and malformed parameter names.
+#[test]
+fn unresolved_builder_defaults_are_ignored_but_call_names_are_strict() {
+    let style = Parser::new().parse(STYLE).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    let sheet = Stylesheet::compile(&style)
+        .unwrap()
+        .with_param("missing:arg", "ignored")
+        .with_param("{}", "ignored")
+        .with_param("p:value", "valid");
+    assert_eq!(sheet.transform(&source).unwrap(), "valid|valid!");
+    for name in ["missing:arg", "{}"] {
+        assert!(sheet
+            .transform_with_params(
+                &source,
+                &[(name.into(), ParameterValue::String("bad".into()))]
+            )
+            .is_err());
+        assert_eq!(sheet.transform(&source).unwrap(), "valid|valid!");
+    }
+}
+
+/// Namespace context applies to source paths and template patterns as well as
+/// variable references, even when the prefix has no stylesheet-root binding.
+#[test]
+fn local_namespaces_apply_to_paths_and_patterns() {
+    let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+      <xsl:output method="text"/>
+      <xsl:template match="/">
+        <xsl:apply-templates xmlns:s="urn:source" select="/s:root/s:item"/>
+        <xsl:for-each xmlns:s="urn:source" select="/s:root/s:item"><xsl:value-of select="@id"/></xsl:for-each>
+      </xsl:template>
+      <xsl:template xmlns:t="urn:source" match="t:item"><xsl:value-of select="@id"/></xsl:template>
+    </xsl:stylesheet>"#;
+    let style = Parser::new().parse(xml).unwrap();
+    let mut source = Parser::new()
+        .parse("<root xmlns=\"urn:source\"><item id=\"1\"/><item id=\"2\"/></root>")
+        .unwrap();
+    source.prepare_xpath();
+    assert_eq!(
+        Stylesheet::compile(&style)
+            .unwrap()
+            .transform(&source)
+            .unwrap(),
+        "1212"
+    );
+}
