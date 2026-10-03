@@ -991,3 +991,169 @@ fn cross_import_xsi_type_list_attribute_validates_per_item() {
         "invalid list item should be reported per item, got: {bad_errors:?}"
     );
 }
+
+// Regression coverage for GitHub issue #43.
+#[test]
+fn xsd_inherited_simple_content_values_and_children() {
+    // Exercise both built-in values and named simple types with facets.
+    for base in ["xs:decimal", "Amount"] {
+        let xsd = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="Amount">
+    <xs:restriction base="xs:decimal">
+      <xs:minInclusive value="0"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:complexType name="Base">
+    <xs:simpleContent><xs:extension base="{base}"/></xs:simpleContent>
+  </xs:complexType>
+  <xs:complexType name="Derived">
+    <xs:simpleContent><xs:extension base="Base"/></xs:simpleContent>
+  </xs:complexType>
+  <xs:complexType name="Leaf">
+    <xs:simpleContent><xs:extension base="Derived"/></xs:simpleContent>
+  </xs:complexType>
+  <xs:element name="base" type="Base"/>
+  <xs:element name="leaf" type="Leaf"/>
+</xs:schema>"#
+        );
+        let validator = uppsala::XsdValidator::from_schema(&parse(&xsd).unwrap()).unwrap();
+        for (xml, valid) in [
+            ("<base>12.50</base>", true),
+            ("<base>garbage</base>", false),
+            ("<base><child/>12.50</base>", false),
+            (
+                "<leaf> <![CDATA[12.50]]><!-- comment --><?pi ok?> </leaf>",
+                true,
+            ),
+            ("<leaf>garbage</leaf>", false),
+            (
+                r#"<base xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:type="Leaf">garbage</base>"#,
+                false,
+            ),
+            ("<leaf>-1</leaf>", base == "xs:decimal"),
+            ("<leaf><child>12.50</child></leaf>", false),
+        ] {
+            let errors = validator.validate(&parse(xml).unwrap());
+            assert_eq!(errors.is_empty(), valid, "{base}: {xml}: {errors:?}");
+        }
+    }
+}
+
+#[test]
+fn xsd_inherited_simple_content_preserves_derived_attributes() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:complexType name="Base">
+    <xs:simpleContent><xs:extension base="xs:decimal">
+      <xs:attribute name="legacy" type="xs:string"/>
+      <xs:attribute name="id" type="xs:integer"/>
+    </xs:extension></xs:simpleContent>
+  </xs:complexType>
+  <xs:complexType name="Restricted">
+    <xs:simpleContent><xs:restriction base="Base">
+      <xs:attribute name="legacy" use="prohibited"/>
+      <xs:attribute name="id" type="xs:positiveInteger" use="required"/>
+    </xs:restriction></xs:simpleContent>
+  </xs:complexType>
+  <xs:complexType name="Leaf">
+    <xs:simpleContent><xs:extension base="Restricted">
+      <xs:attribute name="label" type="xs:string" use="required"/>
+    </xs:extension></xs:simpleContent>
+  </xs:complexType>
+  <xs:element name="item" type="Leaf"/>
+</xs:schema>"#;
+    let valid = r#"<item id="1" label="price">12.50</item>"#;
+    let result = validate_xml_against_xsd(valid, xsd);
+    assert!(result.is_ok(), "{result:?}");
+    for xml in [
+        r#"<item id="1" label="price" legacy="old">12.50</item>"#,
+        r#"<item label="price">12.50</item>"#,
+        r#"<item id="0" label="price">12.50</item>"#,
+        r#"<item id="1">12.50</item>"#,
+    ] {
+        assert!(validate_xml_against_xsd(xml, xsd).is_err(), "{xml}");
+    }
+}
+
+#[test]
+fn xsd_simple_content_inheritance_cycles_are_rejected() {
+    for base in ["A", "B"] {
+        let xsd = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:complexType name="A">
+    <xs:simpleContent><xs:extension base="{base}"/></xs:simpleContent>
+  </xs:complexType>
+  <xs:complexType name="B">
+    <xs:simpleContent><xs:restriction base="A"/></xs:simpleContent>
+  </xs:complexType>
+  <xs:element name="item">
+    <xs:complexType><xs:simpleContent>
+      <xs:extension base="A"/>
+    </xs:simpleContent></xs:complexType>
+  </xs:element>
+</xs:schema>"#
+        );
+        let error = validate_xml_against_xsd("<item>12.50</item>", &xsd).unwrap_err();
+        assert!(
+            error.contains("Complex type derivation cycle detected"),
+            "base={base}: {error}"
+        );
+    }
+}
+
+#[test]
+fn xsd_unresolved_simple_content_base_names_the_type() {
+    // An unresolvable value type is reported with the same wording as any other
+    // unresolved type reference, so the missing name is visible either way.
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+    xmlns:o="urn:other" xmlns="urn:me" targetNamespace="urn:me">
+  <xs:import namespace="urn:other"/>
+  <xs:complexType name="T">
+    <xs:simpleContent><xs:extension base="o:Thing">
+      <xs:attribute name="a" type="xs:string"/>
+    </xs:extension></xs:simpleContent>
+  </xs:complexType>
+  <xs:element name="r" type="T"/>
+</xs:schema>"#;
+    let validator = uppsala::XsdValidator::from_schema(&parse(xsd).unwrap()).unwrap();
+    let errors = validator.validate(&parse(r#"<r xmlns="urn:me" a="1">12.5</r>"#).unwrap());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, "Type '{urn:other}Thing' not found");
+}
+
+#[test]
+fn xsd_simple_content_checks_preserve_complex_content_extensions() {
+    // Particleless complex-content extensions share the parser's SimpleContent
+    // representation. Follow the chain before deciding whether children are forbidden.
+    for content in [
+        r#"<xs:complexContent><xs:extension base="xs:anyType"/></xs:complexContent>"#,
+        r#"<xs:sequence><xs:element name="a"/></xs:sequence>"#,
+        r#"<xs:choice><xs:element name="a"/><xs:element name="b"/></xs:choice>"#,
+        r#"<xs:all><xs:element name="a"/></xs:all>"#,
+        r#"<xs:simpleContent><xs:extension base="xs:decimal"/></xs:simpleContent>"#,
+    ] {
+        let schema = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+          <xs:complexType name="Base">{content}</xs:complexType>
+          <xs:complexType name="Derived"><xs:complexContent><xs:extension base="Base"/></xs:complexContent></xs:complexType>
+          <xs:complexType name="Leaf"><xs:complexContent><xs:extension base="Derived"/></xs:complexContent></xs:complexType>
+          <xs:element name="base" type="Base"/><xs:element name="derived" type="Derived"/><xs:element name="leaf" type="Leaf"/>
+        </xs:schema>"#
+        );
+        let validator = uppsala::XsdValidator::from_schema(&parse(&schema).unwrap()).unwrap();
+        for name in ["base", "derived", "leaf"] {
+            let xml = format!("<{name}><a/></{name}>");
+            let errors = validator.validate(&parse(&xml).unwrap());
+            let simple = content.contains("simpleContent");
+            assert_eq!(errors.is_empty(), !simple, "{content}, {xml}: {errors:?}");
+            if simple {
+                for (value, valid) in [("12.50", true), ("garbage", false)] {
+                    let xml = format!("<{name}>{value}</{name}>");
+                    let errors = validator.validate(&parse(&xml).unwrap());
+                    assert_eq!(errors.is_empty(), valid, "{xml}: {errors:?}");
+                }
+            }
+        }
+    }
+}

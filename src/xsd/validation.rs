@@ -1305,30 +1305,75 @@ impl XsdValidator {
                 self.validate_all(doc, &child_elements, particles, node, errors);
             }
             ContentModel::SimpleContent(type_ref) => {
-                match type_ref.as_ref() {
-                    TypeRef::BuiltIn(bt) => {
+                // Attributes were checked against the effective derived type
+                // above. Follow only value references, so base attributes are
+                // not reapplied to the derived element. The parser also uses
+                // SimpleContent references for particleless complex-content
+                // derivations, so reject children only after reaching a simple
+                // value type. Preserve other content models' existing behavior.
+                let mut current = type_ref.as_ref();
+                let mut seen = Vec::new();
+                let failure = loop {
+                    if let TypeRef::BuiltIn(bt) = current {
+                        // anyType is complex and permits child elements.
+                        if matches!(bt, BuiltInType::AnyType) {
+                            break None;
+                        }
+                        if !child_elements.is_empty() {
+                            break Some(
+                                "Simple content must not contain child elements".to_string(),
+                            );
+                        }
                         let text = doc.text_content_deep(node);
                         validate_builtin_value(&text, bt, doc, node, errors, self.lenient);
+                        break None;
                     }
-                    TypeRef::Named(ns, local_name) => {
-                        let key = (ns.clone(), local_name.clone());
-                        if let Some(type_def) = self.types.get(&key) {
-                            match type_def {
-                                TypeDef::Simple(st) => {
-                                    self.validate_simple_content(doc, node, st, errors);
-                                }
-                                TypeDef::Complex(_) => {
-                                    // Complex base type for simpleContent — text validated against
-                                    // the complex type's own simpleContent base (recursively)
-                                }
+                    if let TypeRef::Named(ns, name) = current {
+                        // Value references may differ from the base_type chain
+                        // already checked by has_complex_derivation_cycle.
+                        if seen.contains(&(ns, name)) {
+                            break Some("Complex type derivation cycle detected".to_string());
+                        }
+                        seen.push((ns, name));
+                    }
+                    match self.resolve_type(current) {
+                        Some(TypeDef::Simple(st)) => {
+                            if !child_elements.is_empty() {
+                                break Some(
+                                    "Simple content must not contain child elements".to_string(),
+                                );
                             }
-                        }
-                    }
-                    TypeRef::Inline(inner_type_def) => {
-                        if let TypeDef::Simple(st) = inner_type_def.as_ref() {
                             self.validate_simple_content(doc, node, st, errors);
+                            break None;
+                        }
+                        Some(TypeDef::Complex(base)) => match &base.content {
+                            ContentModel::SimpleContent(base_ref) => current = base_ref.as_ref(),
+                            // Other base content models have no simple value
+                            // reference to follow. Their derivation legality is
+                            // a separate schema-validation concern.
+                            _ => break None,
+                        },
+                        None => {
+                            let message = match current {
+                                TypeRef::Named(ns, name) => {
+                                    let display = ns.as_ref().map_or_else(
+                                        || name.clone(),
+                                        |uri| format!("{{{uri}}}{name}"),
+                                    );
+                                    format!("Type '{display}' not found")
+                                }
+                                _ => "Simple content value type could not be resolved".to_string(),
+                            };
+                            break Some(message);
                         }
                     }
+                };
+                if let Some(message) = failure {
+                    errors.push(ValidationError {
+                        message,
+                        line: Some(doc.node_line(node)),
+                        column: Some(doc.node_column(node)),
+                    });
                 }
             }
             ContentModel::Any => {

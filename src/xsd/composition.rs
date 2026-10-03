@@ -673,6 +673,20 @@ fn process_redefine_children(
                                     if let TypeDef::Complex(ref mut new_ct) = new_td {
                                         new_ct.base_type =
                                             Some((old_key.0.clone(), old_key.1.clone()));
+                                        // The value reference must follow the same
+                                        // original definition as the derivation link.
+                                        if let ContentModel::SimpleContent(value_ref) =
+                                            &mut new_ct.content
+                                        {
+                                            if matches!(value_ref.as_ref(), TypeRef::Named(ns, name)
+                                                if ns == &base.0 && name == &base.1)
+                                            {
+                                                **value_ref = TypeRef::Named(
+                                                    old_key.0.clone(),
+                                                    old_key.1.clone(),
+                                                );
+                                            }
+                                        }
                                     }
                                     validator.types.insert(key, new_td);
                                 } else {
