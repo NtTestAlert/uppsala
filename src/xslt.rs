@@ -645,10 +645,19 @@ fn in_scope_namespaces(doc: &Document<'_>, node: NodeId) -> HashMap<String, Stri
         cur = doc.parent(n);
     }
     chain.reverse();
-    let mut map = HashMap::new();
+    // The xml prefix is in scope even without an explicit xmlns:xml attribute.
+    let mut map = HashMap::from([(
+        "xml".to_string(),
+        crate::namespace::XML_NAMESPACE.to_string(),
+    )]);
     for n in chain {
         if let Some(NodeKind::Element(e)) = doc.node_kind(n) {
             for (prefix, uri) in &e.namespace_declarations {
+                // DOM mutation can bypass parser validation. Preserve the
+                // reserved binding even for programmatically built stylesheets.
+                if prefix.as_ref() == "xml" {
+                    continue;
+                }
                 // The `xsl` prefix bound to the XSLT namespace never participates
                 // in result output or non-XSLT name resolution; skip it so it
                 // cannot leak into result QNames or XPath name resolution.
