@@ -212,8 +212,14 @@ impl XPathEvaluator {
     }
 
     /// Register a namespace prefix for use in XPath expressions.
+    /// Attempts to rebind the reserved `xml` prefix to another URI are ignored.
     pub fn add_namespace(&mut self, prefix: impl Into<String>, uri: impl Into<String>) {
-        self.namespaces.insert(prefix.into(), uri.into());
+        let prefix = prefix.into();
+        let uri = uri.into();
+        if prefix == "xml" && uri != crate::namespace::XML_NAMESPACE {
+            return;
+        }
+        self.namespaces.insert(prefix, uri);
     }
 
     /// Override the maximum expression-nesting depth. Returns `self` so it

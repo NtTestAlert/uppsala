@@ -226,7 +226,9 @@ println!("{}", doc.to_xml_with_options(&opts));
 ### External XSLT parameters
 
 XPath expressions and XSLT match patterns recognize the implicit `xml` prefix
-without an explicit namespace declaration or registration.
+without an explicit namespace declaration or registration. Attempts to rebind
+`xml` through `XPathEvaluator::add_namespace` are ignored. Stylesheet namespace
+contexts preserve the reserved binding even for programmatically mutated DOMs.
 
 `Stylesheet::transform_with_params(&source, &[(name, value)])` applies parameters
 to one invocation without changing the compiled stylesheet. Use
