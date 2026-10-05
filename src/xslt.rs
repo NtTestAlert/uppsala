@@ -312,6 +312,36 @@ impl Default for OutputOptions {
 
 // ─── Stylesheet model ─────────────────────────────────────
 
+/// An XPath expression and the namespace bindings at its declaration site.
+struct ScopedXPath {
+    expression: CompiledXPath,
+    namespaces: HashMap<String, String>,
+}
+
+impl ScopedXPath {
+    fn compile(
+        text: &str,
+        max_depth: u32,
+        namespaces: &HashMap<String, String>,
+    ) -> XmlResult<Self> {
+        Ok(Self {
+            expression: CompiledXPath::compile(text, max_depth)?,
+            namespaces: namespaces.clone(),
+        })
+    }
+}
+
+/// An external top-level parameter supplied for one transformation.
+/// Expressions are evaluated against the source document root and retain their
+/// XPath type. Literal strings bypass XPath parsing entirely.
+#[derive(Clone, Debug)]
+pub enum ParameterValue {
+    /// Literal Unicode text, without XML or XPath escaping.
+    String(String),
+    /// An XPath 1.0 expression using the stylesheet's namespace bindings.
+    Expression(String),
+}
+
 /// A compiled XSLT stylesheet, ready to transform source documents.
 ///
 /// Build one with [`Stylesheet::compile`] and apply it with
@@ -363,6 +393,7 @@ struct GlobalVar {
 struct Template {
     /// The compiled `match` pattern, if this is a match template.
     pattern: Option<CompiledPattern>,
+    namespaces: HashMap<String, String>,
     /// Precomputed dispatch descriptor for `pattern`, used to skip
     /// non-applicable templates cheaply during per-node template selection.
     dispatch: Option<PatternDispatch>,
@@ -388,7 +419,7 @@ enum Instruction {
     },
     /// `xsl:value-of`.
     ValueOf {
-        select: CompiledXPath,
+        select: ScopedXPath,
         disable_escaping: bool,
     },
     /// `xsl:text`.
@@ -399,22 +430,22 @@ enum Instruction {
     /// `xsl:apply-templates` with an optional `select` (defaults to the
     /// children of the current node) and `xsl:with-param` children.
     ApplyTemplates {
-        select: Option<CompiledXPath>,
+        select: Option<ScopedXPath>,
         params: Vec<WithParam>,
     },
     /// `xsl:if`.
     If {
-        test: CompiledXPath,
+        test: ScopedXPath,
         body: Vec<Instruction>,
     },
     /// `xsl:choose` — the first `when` whose test is true, else `otherwise`.
     Choose {
-        whens: Vec<(CompiledXPath, Vec<Instruction>)>,
+        whens: Vec<(ScopedXPath, Vec<Instruction>)>,
         otherwise: Vec<Instruction>,
     },
     /// `xsl:for-each` — execute the body for each selected node.
     ForEach {
-        select: CompiledXPath,
+        select: ScopedXPath,
         body: Vec<Instruction>,
     },
     /// `xsl:variable` declaration (scoped to following siblings).
@@ -422,7 +453,7 @@ enum Instruction {
     /// `xsl:copy` — shallow-copy the current node, then execute the body.
     Copy { body: Vec<Instruction> },
     /// `xsl:copy-of` — deep-copy the selected nodes / fragment.
-    CopyOf { select: CompiledXPath },
+    CopyOf { select: ScopedXPath },
     /// `xsl:element` with a computed (AVT) name.
     Element { name: Avt, body: Vec<Instruction> },
     /// `xsl:attribute` with a computed (AVT) name; the body is its value.
@@ -444,7 +475,7 @@ enum Instruction {
 /// The value of an `xsl:variable`/`xsl:param`/`xsl:with-param`: either a
 /// `select` expression or a body (result-tree fragment) sequence constructor.
 enum ValueSource {
-    Select(CompiledXPath),
+    Select(ScopedXPath),
     Body(Vec<Instruction>),
 }
 
@@ -469,7 +500,7 @@ struct Avt {
 
 enum AvtPart {
     Literal(String),
-    Expr(CompiledXPath),
+    Expr(ScopedXPath),
 }
 
 // ─── Public API ───────────────────────────────────────────
@@ -555,6 +586,23 @@ impl Stylesheet {
     /// any expression or pattern uses the attribute axis. The one-shot
     /// [`crate::transform`] helper does this for you.
     pub fn transform(&self, source: &Document<'_>) -> XmlResult<String> {
+        self.transform_with_params(source, &[])
+    }
+
+    /// Transform with invocation-local parameters, without modifying this sheet.
+    ///
+    /// Call parameters override `with_param` defaults. Literals bind first, then
+    /// expressions in input order; the last binding of a duplicate name wins.
+    /// Undeclared parameters and names of variables do not override declarations.
+    /// Expressions are evaluated even for unused names, using the source root
+    /// (position and size 1) and stylesheet namespaces. Expressions may reference
+    /// literal arguments and earlier expression arguments, but not stylesheet globals.
+    /// The source must be prepared for XPath, as for [`Self::transform`].
+    pub fn transform_with_params(
+        &self,
+        source: &Document<'_>,
+        params: &[(String, ParameterValue)],
+    ) -> XmlResult<String> {
         let mut engine = Engine {
             source,
             stylesheet: self,
@@ -564,8 +612,9 @@ impl Stylesheet {
             max_depth: self.max_depth,
             max_result_tree_bytes: self.max_result_tree_bytes,
             result_tree_bytes_used: 0,
+            pending_global_messages: None,
         };
-        engine.init_globals()?;
+        engine.init_globals(params)?;
         let root = source.root();
         let result = engine.apply_to_node(
             Focus {
@@ -646,12 +695,18 @@ fn compile_stylesheet(doc: &Document<'_>, root: NodeId) -> XmlResult<Stylesheet>
             "output" => parse_output(doc, child, &mut output)?,
             "template" => templates.push(compile_template(doc, child, &namespaces)?),
             "variable" | "param" => {
-                let name = el
-                    .get_attribute("name")
-                    .ok_or_else(|| XmlError::xpath("top-level variable/param requires name"))?
-                    .to_string();
+                let name = expanded_param_name(
+                    el.get_attribute("name")
+                        .ok_or_else(|| XmlError::xpath("top-level variable/param requires name"))?,
+                    &in_scope_namespaces(doc, child),
+                )?;
                 let value = compile_value_source(doc, child, el, &namespaces)?;
                 let is_param = el.name.local_name.as_ref() == "param";
+                if globals.iter().any(|g: &GlobalVar| g.name == name) {
+                    return Err(XmlError::xpath(format!(
+                        "duplicate global variable or parameter: {name}"
+                    )));
+                }
                 globals.push(GlobalVar {
                     name,
                     value,
@@ -751,10 +806,11 @@ fn compile_template(
                         "xsl:param must come before all other template content",
                     ));
                 }
-                let name = ce
-                    .get_attribute("name")
-                    .ok_or_else(|| XmlError::xpath("xsl:param requires name"))?
-                    .to_string();
+                let name = expanded_param_name(
+                    ce.get_attribute("name")
+                        .ok_or_else(|| XmlError::xpath("xsl:param requires name"))?,
+                    &in_scope_namespaces(doc, child),
+                )?;
                 let value = compile_value_source(doc, child, ce, ns)?;
                 params.push(WithParam { name, value });
             }
@@ -770,6 +826,7 @@ fn compile_template(
 
     Ok(Template {
         pattern,
+        namespaces: in_scope_namespaces(doc, node),
         dispatch,
         explicit_priority,
         name: name_attr,
@@ -790,12 +847,15 @@ fn compile_value_source(
     doc: &Document<'_>,
     node: NodeId,
     el: &crate::dom::Element<'_>,
-    ns: &HashMap<String, String>,
+    _ns: &HashMap<String, String>,
 ) -> XmlResult<ValueSource> {
+    let local_namespaces = in_scope_namespaces(doc, node);
+    let ns = &local_namespaces;
     if let Some(sel) = el.get_attribute("select") {
-        Ok(ValueSource::Select(CompiledXPath::compile(
+        Ok(ValueSource::Select(ScopedXPath::compile(
             sel,
             DEFAULT_MAX_XPATH_DEPTH,
+            ns,
         )?))
     } else {
         Ok(ValueSource::Body(compile_sequence(doc, node, ns)?))
@@ -812,10 +872,11 @@ fn compile_with_params(
     for child in doc.children(node) {
         if let Some(NodeKind::Element(ce)) = doc.node_kind(child) {
             if is_xsl(ce, "with-param") {
-                let name = ce
-                    .get_attribute("name")
-                    .ok_or_else(|| XmlError::xpath("xsl:with-param requires name"))?
-                    .to_string();
+                let name = expanded_param_name(
+                    ce.get_attribute("name")
+                        .ok_or_else(|| XmlError::xpath("xsl:with-param requires name"))?,
+                    &in_scope_namespaces(doc, child),
+                )?;
                 let value = compile_value_source(doc, child, ce, ns)?;
                 params.push(WithParam { name, value });
             }
@@ -874,14 +935,16 @@ fn compile_xsl_instruction(
     doc: &Document<'_>,
     node: NodeId,
     el: &crate::dom::Element<'_>,
-    ns: &HashMap<String, String>,
+    _ns: &HashMap<String, String>,
 ) -> XmlResult<Option<Instruction>> {
+    let local_namespaces = in_scope_namespaces(doc, node);
+    let ns = &local_namespaces;
     // Helper closures for common attribute reads.
-    let compile_sel = |name: &str| -> XmlResult<CompiledXPath> {
+    let compile_sel = |name: &str| -> XmlResult<ScopedXPath> {
         let s = el.get_attribute(name).ok_or_else(|| {
             XmlError::xpath(format!("xsl:{} requires {}", el.name.local_name, name))
         })?;
-        CompiledXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH)
+        ScopedXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH, ns)
     };
 
     let instr = match el.name.local_name.as_ref() {
@@ -907,7 +970,7 @@ fn compile_xsl_instruction(
         }
         "apply-templates" => Instruction::ApplyTemplates {
             select: match el.get_attribute("select") {
-                Some(s) => Some(CompiledXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH)?),
+                Some(s) => Some(ScopedXPath::compile(s, DEFAULT_MAX_XPATH_DEPTH, ns)?),
                 None => None,
             },
             params: compile_with_params(doc, node, ns)?,
@@ -922,10 +985,11 @@ fn compile_xsl_instruction(
             body: compile_sequence(doc, node, ns)?,
         },
         "variable" => {
-            let name = el
-                .get_attribute("name")
-                .ok_or_else(|| XmlError::xpath("xsl:variable requires name"))?
-                .to_string();
+            let name = expanded_param_name(
+                el.get_attribute("name")
+                    .ok_or_else(|| XmlError::xpath("xsl:variable requires name"))?,
+                &in_scope_namespaces(doc, node),
+            )?;
             Instruction::Variable {
                 name,
                 value: compile_value_source(doc, node, el, ns)?,
@@ -1002,7 +1066,11 @@ fn compile_choose(
                     .get_attribute("test")
                     .ok_or_else(|| XmlError::xpath("xsl:when requires test"))?;
                 whens.push((
-                    CompiledXPath::compile(test, DEFAULT_MAX_XPATH_DEPTH)?,
+                    ScopedXPath::compile(
+                        test,
+                        DEFAULT_MAX_XPATH_DEPTH,
+                        &in_scope_namespaces(doc, child),
+                    )?,
                     compile_sequence(doc, child, ns)?,
                 ));
             } else if is_xsl(ce, "otherwise") {
@@ -1016,8 +1084,10 @@ fn compile_choose(
 fn compile_literal_element(
     doc: &Document<'_>,
     node: NodeId,
-    ns: &HashMap<String, String>,
+    _ns: &HashMap<String, String>,
 ) -> XmlResult<Instruction> {
+    let local_namespaces = in_scope_namespaces(doc, node);
+    let ns = &local_namespaces;
     let el = match doc.node_kind(node) {
         Some(NodeKind::Element(e)) => e,
         _ => unreachable!(),
@@ -1078,7 +1148,7 @@ fn compile_literal_element(
 
 /// Parse an attribute value template: text with `{expr}` placeholders and
 /// `{{`/`}}` escapes.
-fn compile_avt(value: &str, _ns: &HashMap<String, String>) -> XmlResult<Avt> {
+fn compile_avt(value: &str, ns: &HashMap<String, String>) -> XmlResult<Avt> {
     // Fast path: no braces means a single literal part, so skip the char buffer
     // and the placeholder scan entirely (the overwhelmingly common attribute).
     if !value.contains(['{', '}']) {
@@ -1119,9 +1189,10 @@ fn compile_avt(value: &str, _ns: &HashMap<String, String>) -> XmlResult<Avt> {
                     ));
                 }
                 let expr: String = chars[start..i].iter().collect();
-                parts.push(AvtPart::Expr(CompiledXPath::compile(
+                parts.push(AvtPart::Expr(ScopedXPath::compile(
                     &expr,
                     DEFAULT_MAX_XPATH_DEPTH,
+                    ns,
                 )?));
                 i += 1; // consume '}'
             }
@@ -1169,17 +1240,21 @@ struct Engine<'a, 'b> {
     /// when temporary fragments are dropped; the budget limits work performed,
     /// not exact live heap.
     result_tree_bytes_used: usize,
+    /// Messages produced by a speculative global initializer. Publish only
+    /// after successful evaluation; a deferred or failed attempt discards them.
+    pending_global_messages: Option<Vec<String>>,
 }
 
 /// Resolves `$variable` references against the engine's local then global scope.
 struct ScopeResolver<'s> {
     locals: &'s [(String, VarValue)],
     globals: &'s [(String, VarValue)],
+    namespaces: &'s HashMap<String, String>,
 }
 
 impl VariableResolver for ScopeResolver<'_> {
     fn resolve_variable(&self, prefix: Option<&str>, local: &str) -> Option<XPathValue> {
-        let key = var_key(prefix, local);
+        let key = expanded_param_name(&var_key(prefix, local), self.namespaces).ok()?;
         self.locals
             .iter()
             .rev()
@@ -1208,8 +1283,35 @@ impl FunctionResolver for ExsltResolver<'_, '_> {
     }
 }
 
-/// XSLT variable key: the expanded-name approximation. Tier A variable names are
-/// unprefixed; a prefixed name is keyed by its literal `prefix:local` form.
+/// Resolve API Clark names or QNames to an expanded variable name. Unprefixed
+/// variables have no namespace, regardless of the default namespace binding.
+fn expanded_param_name(name: &str, namespaces: &HashMap<String, String>) -> XmlResult<String> {
+    if name.starts_with('{') {
+        if let Some((_, local)) = name.split_once('}') {
+            if crate::writer::is_valid_xml_ncname(local) {
+                return Ok(name.to_string());
+            }
+        }
+        return Err(XmlError::xpath("invalid expanded parameter name"));
+    }
+    if !crate::writer::is_valid_xml_qname(name) {
+        return Err(XmlError::xpath(format!("invalid parameter name: {name}")));
+    }
+    if let Some((prefix, local)) = name.split_once(':') {
+        let uri = if prefix == "xml" {
+            "http://www.w3.org/XML/1998/namespace"
+        } else {
+            namespaces
+                .get(prefix)
+                .map(String::as_str)
+                .ok_or_else(|| XmlError::xpath(format!("unbound parameter prefix: {prefix}")))?
+        };
+        return Ok(format!("{{{uri}}}{local}"));
+    }
+    Ok(name.to_string())
+}
+
+/// Reconstruct the lexical QName delivered by the XPath variable resolver.
 fn var_key(prefix: Option<&str>, local: &str) -> String {
     match prefix {
         Some(p) => format!("{}:{}", p, local),
@@ -1311,36 +1413,117 @@ impl<'a, 'b> Engine<'a, 'b> {
         Ok(())
     }
 
-    /// Evaluate top-level variables/params into `self.globals`, in document
-    /// order, so each can reference those declared before it.
-    fn init_globals(&mut self) -> XmlResult<()> {
+    /// Bind invocation parameters, then resolve global defaults in dependency
+    /// order. Missing or circular global dependencies fail the invocation.
+    fn init_globals(&mut self, params: &[(String, ParameterValue)]) -> XmlResult<()> {
         let stylesheet = self.stylesheet;
         let focus = Focus {
             node: self.source.root(),
             position: 1,
             size: 1,
         };
-        for g in &stylesheet.globals {
-            // A top-level xsl:param may be overridden externally (last value for
-            // the name wins); xsl:variable and un-overridden params evaluate their
-            // default. Overrides bind as a string value.
-            let override_val = if g.is_param {
+        let params = params
+            .iter()
+            .map(|(name, value)| Ok((expanded_param_name(name, &stylesheet.namespaces)?, value)))
+            .collect::<XmlResult<Vec<_>>>()?;
+        let defaults = stylesheet
+            .param_overrides
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = expanded_param_name(name, &stylesheet.namespaces).ok()?;
                 stylesheet
-                    .param_overrides
+                    .globals
                     .iter()
-                    .rev()
-                    .find(|(n, _)| *n == g.name)
-                    .map(|(_, v)| v.clone())
-            } else {
-                None
+                    .any(|g| g.is_param && g.name == name)
+                    .then_some((name, value))
+            })
+            .collect::<Vec<_>>();
+        // Literal parameters are bound first, matching lxml's strparam behavior.
+        // Expressions then see literals and earlier expressions, in input order.
+        // Evaluate even unused names to report malformed expressions.
+        for (name, value) in defaults {
+            self.globals.retain(|(key, _)| key != &name);
+            self.globals
+                .push((name, VarValue::Value(XPathValue::String(value.clone()))));
+        }
+        let (literals, expressions): (Vec<_>, Vec<_>) = params
+            .into_iter()
+            .partition(|(_, value)| matches!(value, ParameterValue::String(_)));
+        for (name, value) in literals.into_iter().chain(expressions) {
+            let value = match value {
+                ParameterValue::String(value) => XPathValue::String(value.clone()),
+                ParameterValue::Expression(expr) => {
+                    let compiled = ScopedXPath::compile(
+                        expr,
+                        DEFAULT_MAX_XPATH_DEPTH,
+                        &stylesheet.namespaces,
+                    )?;
+                    self.eval(&compiled, focus)?
+                }
             };
-            let val = match override_val {
-                Some(v) => VarValue::Value(XPathValue::String(v)),
-                None => self.eval_value_source(&g.value, focus)?,
-            };
-            self.globals.push((g.name.clone(), val));
+            self.globals.retain(|(key, _)| key != &name);
+            self.globals.push((name, VarValue::Value(value)));
+        }
+        // Only declared parameters override stylesheet bindings. Install them
+        // before resolving defaults, regardless of declaration order.
+        self.globals.retain(|(name, _)| {
+            stylesheet
+                .globals
+                .iter()
+                .any(|g| g.is_param && &g.name == name)
+        });
+        let mut pending: Vec<_> = stylesheet
+            .globals
+            .iter()
+            .filter(|g| !self.globals.iter().any(|(name, _)| name == &g.name))
+            .collect();
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut deferred = Vec::new();
+            let mut unresolved = None;
+            for g in pending {
+                match self.eval_global_value(&g.value, focus) {
+                    Ok(value) => self.globals.push((g.name.clone(), value)),
+                    Err(XmlError::XPath(ref err))
+                        if err.message.starts_with("Undefined variable:") =>
+                    {
+                        unresolved = Some(err.message.clone());
+                        deferred.push(g);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if deferred.len() == before {
+                return Err(XmlError::xpath(format!(
+                    "unresolved or circular global dependency: {}",
+                    unresolved.unwrap_or_default()
+                )));
+            }
+            pending = deferred;
         }
         Ok(())
+    }
+
+    /// Evaluate a global initializer transactionally. Result nodes are private
+    /// until success; messages are the engine's only externally visible effect
+    /// and are buffered through nested template calls. Restore the local frame
+    /// on every exit, including errors in template parameter defaults.
+    ///
+    /// Work accounting deliberately stays monotonic: discarded construction
+    /// still consumes the configured budget, so retries cannot bypass limits.
+    fn eval_global_value(&mut self, value: &ValueSource, focus: Focus) -> XmlResult<VarValue> {
+        debug_assert!(self.pending_global_messages.is_none());
+        self.pending_global_messages = Some(Vec::new());
+        let saved_locals = std::mem::take(&mut self.locals);
+        let result = self.eval_value_source(value, focus);
+        self.locals = saved_locals;
+        let messages = self.pending_global_messages.take().unwrap_or_default();
+        if result.is_ok() {
+            for message in messages {
+                eprintln!("xsl:message: {}", message);
+            }
+        }
+        result
     }
 
     /// Process `focus.node`: run the best-matching template (with `params`), or
@@ -1490,13 +1673,14 @@ impl<'a, 'b> Engine<'a, 'b> {
     /// `priority` if given, else the matching pattern alternative's default
     /// priority.
     fn best_matching_template(&self, node: NodeId) -> Option<usize> {
-        let vars = ScopeResolver {
-            locals: &self.locals,
-            globals: &self.globals,
-        };
         let mut best: Option<(usize, f64)> = None;
         for (i, tmpl) in self.stylesheet.templates.iter().enumerate() {
             if let Some(pattern) = &tmpl.pattern {
+                let vars = ScopeResolver {
+                    locals: &self.locals,
+                    globals: &self.globals,
+                    namespaces: &tmpl.namespaces,
+                };
                 // Cheap O(1) pre-filter: skip the full pattern match for nodes
                 // this template's pattern can never match (by kind/name). This
                 // turns per-node selection from "test every template" into "test
@@ -1511,7 +1695,7 @@ impl<'a, 'b> Engine<'a, 'b> {
                     self.source,
                     node,
                     node,
-                    &self.stylesheet.namespaces,
+                    &tmpl.namespaces,
                     &vars,
                     &self.funcs(),
                     DEFAULT_MAX_XPATH_NODE_VISITS,
@@ -1540,7 +1724,10 @@ impl<'a, 'b> Engine<'a, 'b> {
         let mark = self.locals.len();
         let mut out = Vec::new();
         for instr in body {
-            self.execute_instruction(instr, focus, &mut out)?;
+            if let Err(error) = self.execute_instruction(instr, focus, &mut out) {
+                self.locals.truncate(mark);
+                return Err(error);
+            }
         }
         self.locals.truncate(mark);
         Ok(out)
@@ -1688,7 +1875,11 @@ impl<'a, 'b> Engine<'a, 'b> {
                 // Emit to stderr; treat terminate="yes" as a non-fatal log.
                 let items = self.execute_sequence(body, focus)?;
                 let text = rtf_string_value(&items_to_nodes(items));
-                eprintln!("xsl:message: {}", text);
+                if let Some(messages) = &mut self.pending_global_messages {
+                    messages.push(text);
+                } else {
+                    eprintln!("xsl:message: {}", text);
+                }
             }
         }
         Ok(())
@@ -1753,21 +1944,25 @@ impl<'a, 'b> Engine<'a, 'b> {
     /// a scalar, or a result-tree-fragment variable verbatim.
     fn execute_copy_of(
         &mut self,
-        select: &CompiledXPath,
+        select: &ScopedXPath,
         focus: Focus,
         out: &mut Vec<ResultItem>,
     ) -> XmlResult<()> {
         // copy-of of a bare RTF variable copies the fragment, not its string.
-        if let Some((prefix, local)) = select.as_variable() {
-            if let Some(cloned_bytes) = self.lookup_var_ref(prefix, local).and_then(|value| {
-                if let VarValue::Rtf(nodes) = value {
-                    Some(accounted_node_forest_bytes(nodes))
-                } else {
-                    None
-                }
-            }) {
+        if let Some((prefix, local)) = select.expression.as_variable() {
+            if let Some(cloned_bytes) = self
+                .lookup_var_ref(prefix, local, &select.namespaces)
+                .and_then(|value| {
+                    if let VarValue::Rtf(nodes) = value {
+                        Some(accounted_node_forest_bytes(nodes))
+                    } else {
+                        None
+                    }
+                })
+            {
                 self.charge_result_bytes(cloned_bytes)?;
-                let Some(VarValue::Rtf(nodes)) = self.lookup_var(prefix, local) else {
+                let Some(VarValue::Rtf(nodes)) = self.lookup_var(prefix, local, &select.namespaces)
+                else {
                     return Ok(());
                 };
                 for n in nodes {
@@ -1904,12 +2099,22 @@ impl<'a, 'b> Engine<'a, 'b> {
     }
 
     /// Look up the raw (un-coerced) value of a variable in scope.
-    fn lookup_var(&self, prefix: Option<&str>, local: &str) -> Option<VarValue> {
-        self.lookup_var_ref(prefix, local).cloned()
+    fn lookup_var(
+        &self,
+        prefix: Option<&str>,
+        local: &str,
+        namespaces: &HashMap<String, String>,
+    ) -> Option<VarValue> {
+        self.lookup_var_ref(prefix, local, namespaces).cloned()
     }
 
-    fn lookup_var_ref(&self, prefix: Option<&str>, local: &str) -> Option<&VarValue> {
-        let key = var_key(prefix, local);
+    fn lookup_var_ref(
+        &self,
+        prefix: Option<&str>,
+        local: &str,
+        namespaces: &HashMap<String, String>,
+    ) -> Option<&VarValue> {
+        let key = expanded_param_name(&var_key(prefix, local), namespaces).ok()?;
         self.locals
             .iter()
             .rev()
@@ -1952,19 +2157,20 @@ impl<'a, 'b> Engine<'a, 'b> {
         }
     }
 
-    fn eval(&self, expr: &CompiledXPath, focus: Focus) -> XmlResult<XPathValue> {
+    fn eval(&self, expr: &ScopedXPath, focus: Focus) -> XmlResult<XPathValue> {
         let vars = ScopeResolver {
             locals: &self.locals,
             globals: &self.globals,
+            namespaces: &expr.namespaces,
         };
         eval_compiled(
-            expr,
+            &expr.expression,
             self.source,
             focus.node,
             focus.node,
             focus.position,
             focus.size,
-            &self.stylesheet.namespaces,
+            &expr.namespaces,
             &vars,
             &self.funcs(),
             DEFAULT_MAX_XPATH_NODE_VISITS,
