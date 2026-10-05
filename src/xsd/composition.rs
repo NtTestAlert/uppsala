@@ -1131,6 +1131,30 @@ fn process_redefine_children(
                                         new_ct.base_type =
                                             Some((old_key.0.clone(), old_key.1.clone()));
                                         new_ct.unqualified_base = None;
+                                        // The value reference must follow the same
+                                        // original definition as the derivation link.
+                                        // An unprefixed base is still deferred here;
+                                        // it matches under the same target-namespace
+                                        // reading that made `base_type` a self-reference.
+                                        if let ContentModel::SimpleContent(value_ref) =
+                                            &mut new_ct.content
+                                        {
+                                            let self_ref = match value_ref.as_ref() {
+                                                TypeRef::Named(ns, name) => {
+                                                    ns == &base.0 && name == &base.1
+                                                }
+                                                TypeRef::Unqualified(u) => {
+                                                    u.target_ns == base.0 && u.local == base.1
+                                                }
+                                                _ => false,
+                                            };
+                                            if self_ref {
+                                                **value_ref = TypeRef::Named(
+                                                    old_key.0.clone(),
+                                                    old_key.1.clone(),
+                                                );
+                                            }
+                                        }
                                     }
                                     declare_own(
                                         &mut validator.types,

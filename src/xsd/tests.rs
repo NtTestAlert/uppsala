@@ -301,3 +301,40 @@ fn extension_chain_content_is_built_in_linear_work() {
         );
     }
 }
+
+#[test]
+fn test_simple_content_value_cycle_guard_handles_independent_and_inline_links() {
+    use super::types::{ContentModel, TypeDef, TypeRef};
+
+    // The value traversal follows the content reference, which is a separate
+    // field from base_type. Exercise its termination backstop directly, with the
+    // base_type chain cleared so the earlier cycle check cannot fire first.
+    for inline in [false, true] {
+        let schema = parse(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+          <xs:complexType name="A"><xs:simpleContent>
+            <xs:extension base="A"/>
+          </xs:simpleContent></xs:complexType>
+          <xs:element name="r" type="A"/>
+        </xs:schema>"#,
+        )
+        .unwrap();
+        let mut validator = XsdValidator::from_schema(&schema).unwrap();
+        let TypeDef::Complex(ct) = validator.types.get_mut(&(None, "A".into())).unwrap() else {
+            panic!("expected complex type");
+        };
+        ct.base_type = None;
+        if inline {
+            ct.content = ContentModel::SimpleContent(Box::new(TypeRef::Inline(Box::new(
+                TypeDef::Complex(ct.clone()),
+            ))));
+        }
+        let errors = validator.validate(&parse("<r>12.50</r>").unwrap());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message == "Complex type derivation cycle detected"),
+            "inline={inline}: {errors:?}"
+        );
+    }
+}

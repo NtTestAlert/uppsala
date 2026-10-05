@@ -223,6 +223,40 @@ let opts = XmlWriteOptions::pretty("  ");
 println!("{}", doc.to_xml_with_options(&opts));
 ```
 
+### External XSLT parameters
+
+XPath expressions and XSLT match patterns recognize the implicit `xml` prefix
+without an explicit namespace declaration or registration. Attempts to rebind
+`xml` through `XPathEvaluator::add_namespace` are ignored. Stylesheet namespace
+contexts preserve the reserved binding even for programmatically mutated DOMs.
+
+`Stylesheet::transform_with_params(&source, &[(name, value)])` applies parameters
+to one invocation without changing the compiled stylesheet. Use
+`uppsala::xslt::ParameterValue::String(text)` for literal text or
+`ParameterValue::Expression(xpath)` for an XPath expression. Expressions use the
+source document root (position and size 1) and stylesheet namespace bindings,
+and preserve XPath types, including source node sets. Prepare the source for
+XPath before calling, as for `transform`.
+
+Unresolvable or unmatched builder `with_param` names are ignored; invocation-local
+parameter names remain strictly validated. Ignored builder defaults are never
+visible to invocation-local expressions.
+
+Call values override `with_param` defaults. Literals bind first, followed by
+expressions in supplied order; the last binding of a duplicate name wins. Names
+may be QNames using stylesheet prefixes or `{namespace}local` expanded names.
+Unprefixed names have no namespace. Undeclared names and variable declarations
+are not overridden. Expressions can refer to literal arguments and earlier
+expression arguments, but not stylesheet globals. Stylesheet expressions retain
+the namespace bindings in scope on their own declaration elements, including
+local prefix rebinding. Defaults resolve global dependencies, reporting unresolved
+or circular dependencies as errors. The compiled sheet remains reusable after
+success and failure. Global initializers buffer `xsl:message` output until they
+succeed, discarding messages and local state from deferred or failed attempts.
+Construction work from discarded attempts still counts against resource limits.
+This does not add unsupported XSLT instructions such as
+imports, includes, or sorting.
+
 ## Architecture
 
 Uppsala uses an arena-based DOM where all nodes live in a flat `Vec<NodeData>`

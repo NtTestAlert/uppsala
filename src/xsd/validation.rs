@@ -2693,15 +2693,21 @@ impl XsdValidator {
     /// restriction's facets. Empty for element-only, mixed or empty content.
     fn simple_content_types(&self, ct: &ComplexTypeDef) -> Result<Vec<TypeRef>, String> {
         match self.content_type(ct) {
-            ContentType::Simple(owner) => self.simple_content_types_inner(owner, 0),
+            ContentType::Simple(owner) => {
+                self.simple_content_types_inner(owner, 0, &mut Vec::new())
+            }
             ContentType::Model(..) => Ok(Vec::new()),
         }
     }
 
+    /// `seen` holds the named types already followed as value references:
+    /// those links are separate from the `base_type` chain that the
+    /// derivation cycle check walks, so a cycle through them is caught here.
     fn simple_content_types_inner(
         &self,
         ct: &ComplexTypeDef,
         depth: usize,
+        seen: &mut Vec<(Option<String>, String)>,
     ) -> Result<Vec<TypeRef>, String> {
         if depth > MAX_SIMPLE_TYPE_DEPTH {
             return Err(format!(
@@ -2717,12 +2723,18 @@ impl XsdValidator {
             TypeRef::BuiltIn(_) => vec![base.as_ref().clone()],
             TypeRef::Inline(td) => match td.as_ref() {
                 TypeDef::Simple(_) => vec![base.as_ref().clone()],
-                TypeDef::Complex(inner) => self.simple_content_types_inner(inner, depth + 1)?,
+                TypeDef::Complex(inner) => self.simple_content_types_inner(inner, depth + 1, seen)?,
             },
             TypeRef::Named(ns, name) => match self.types.get(&(ns.clone(), name.clone())) {
                 Some(TypeDef::Simple(_)) => vec![base.as_ref().clone()],
+                Some(TypeDef::Complex(_)) if seen.iter().any(|(n, l)| n == ns && l == name) => {
+                    return Err("Complex type derivation cycle detected".to_string());
+                }
                 Some(TypeDef::Complex(base_ct)) => match self.content_type(base_ct) {
-                    ContentType::Simple(owner) => self.simple_content_types_inner(owner, depth + 1)?,
+                    ContentType::Simple(owner) => {
+                        seen.push((ns.clone(), name.clone()));
+                        self.simple_content_types_inner(owner, depth + 1, seen)?
+                    }
                     // src-ct.2: the base of a simpleContent derivation has
                     // simple content, or, for a restriction with its own
                     // simpleType, mixed content that can be empty.
@@ -2743,9 +2755,8 @@ impl XsdValidator {
                         ))
                     }
                 },
-                None => {
-                    return Err(format!("Base type '{}' not found", qname_display(ns, name)))
-                }
+                // The wording of any other unresolved type reference.
+                None => return Err(format!("Type '{}' not found", qname_display(ns, name))),
             },
             // Decided at build; never present in a built validator.
             TypeRef::Unqualified(name) => {
