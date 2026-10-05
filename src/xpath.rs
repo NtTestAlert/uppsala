@@ -198,11 +198,14 @@ pub struct XPathEvaluator {
 }
 
 impl XPathEvaluator {
-    /// Create a new evaluator with no namespace bindings and the default
+    /// Create a new evaluator with the implicit `xml` namespace binding and the default
     /// expression-nesting cap ([`DEFAULT_MAX_XPATH_DEPTH`]).
     pub fn new() -> Self {
         XPathEvaluator {
-            namespaces: HashMap::new(),
+            namespaces: HashMap::from([(
+                "xml".to_string(),
+                crate::namespace::XML_NAMESPACE.to_string(),
+            )]),
             max_depth: DEFAULT_MAX_XPATH_DEPTH,
             max_node_visits: DEFAULT_MAX_XPATH_NODE_VISITS,
         }

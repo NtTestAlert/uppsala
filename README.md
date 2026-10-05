@@ -225,6 +225,9 @@ println!("{}", doc.to_xml_with_options(&opts));
 
 ### External XSLT parameters
 
+XPath expressions and XSLT match patterns recognize the implicit `xml` prefix
+without an explicit namespace declaration or registration.
+
 `Stylesheet::transform_with_params(&source, &[(name, value)])` applies parameters
 to one invocation without changing the compiled stylesheet. Use
 `uppsala::xslt::ParameterValue::String(text)` for literal text or
