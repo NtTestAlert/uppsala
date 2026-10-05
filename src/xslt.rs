@@ -612,6 +612,7 @@ impl Stylesheet {
             max_depth: self.max_depth,
             max_result_tree_bytes: self.max_result_tree_bytes,
             result_tree_bytes_used: 0,
+            pending_global_messages: None,
         };
         engine.init_globals(params)?;
         let root = source.root();
@@ -1239,6 +1240,9 @@ struct Engine<'a, 'b> {
     /// when temporary fragments are dropped; the budget limits work performed,
     /// not exact live heap.
     result_tree_bytes_used: usize,
+    /// Messages produced by a speculative global initializer. Publish only
+    /// after successful evaluation; a deferred or failed attempt discards them.
+    pending_global_messages: Option<Vec<String>>,
 }
 
 /// Resolves `$variable` references against the engine's local then global scope.
@@ -1426,9 +1430,12 @@ impl<'a, 'b> Engine<'a, 'b> {
             .param_overrides
             .iter()
             .filter_map(|(name, value)| {
-                expanded_param_name(name, &stylesheet.namespaces)
-                    .ok()
-                    .map(|name| (name, value))
+                let name = expanded_param_name(name, &stylesheet.namespaces).ok()?;
+                stylesheet
+                    .globals
+                    .iter()
+                    .any(|g| g.is_param && g.name == name)
+                    .then_some((name, value))
             })
             .collect::<Vec<_>>();
         // Literal parameters are bound first, matching lxml's strparam behavior.
@@ -1475,7 +1482,7 @@ impl<'a, 'b> Engine<'a, 'b> {
             let mut deferred = Vec::new();
             let mut unresolved = None;
             for g in pending {
-                match self.eval_value_source(&g.value, focus) {
+                match self.eval_global_value(&g.value, focus) {
                     Ok(value) => self.globals.push((g.name.clone(), value)),
                     Err(XmlError::XPath(ref err))
                         if err.message.starts_with("Undefined variable:") =>
@@ -1495,6 +1502,28 @@ impl<'a, 'b> Engine<'a, 'b> {
             pending = deferred;
         }
         Ok(())
+    }
+
+    /// Evaluate a global initializer transactionally. Result nodes are private
+    /// until success; messages are the engine's only externally visible effect
+    /// and are buffered through nested template calls. Restore the local frame
+    /// on every exit, including errors in template parameter defaults.
+    ///
+    /// Work accounting deliberately stays monotonic: discarded construction
+    /// still consumes the configured budget, so retries cannot bypass limits.
+    fn eval_global_value(&mut self, value: &ValueSource, focus: Focus) -> XmlResult<VarValue> {
+        debug_assert!(self.pending_global_messages.is_none());
+        self.pending_global_messages = Some(Vec::new());
+        let saved_locals = std::mem::take(&mut self.locals);
+        let result = self.eval_value_source(value, focus);
+        self.locals = saved_locals;
+        let messages = self.pending_global_messages.take().unwrap_or_default();
+        if result.is_ok() {
+            for message in messages {
+                eprintln!("xsl:message: {}", message);
+            }
+        }
+        result
     }
 
     /// Process `focus.node`: run the best-matching template (with `params`), or
@@ -1846,7 +1875,11 @@ impl<'a, 'b> Engine<'a, 'b> {
                 // Emit to stderr; treat terminate="yes" as a non-fatal log.
                 let items = self.execute_sequence(body, focus)?;
                 let text = rtf_string_value(&items_to_nodes(items));
-                eprintln!("xsl:message: {}", text);
+                if let Some(messages) = &mut self.pending_global_messages {
+                    messages.push(text);
+                } else {
+                    eprintln!("xsl:message: {}", text);
+                }
             }
         }
         Ok(())

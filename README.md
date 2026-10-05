@@ -234,7 +234,8 @@ and preserve XPath types, including source node sets. Prepare the source for
 XPath before calling, as for `transform`.
 
 Unresolvable or unmatched builder `with_param` names are ignored; invocation-local
-parameter names remain strictly validated.
+parameter names remain strictly validated. Ignored builder defaults are never
+visible to invocation-local expressions.
 
 Call values override `with_param` defaults. Literals bind first, followed by
 expressions in supplied order; the last binding of a duplicate name wins. Names
@@ -245,7 +246,10 @@ expression arguments, but not stylesheet globals. Stylesheet expressions retain
 the namespace bindings in scope on their own declaration elements, including
 local prefix rebinding. Defaults resolve global dependencies, reporting unresolved
 or circular dependencies as errors. The compiled sheet remains reusable after
-success and failure. This does not add unsupported XSLT instructions such as
+success and failure. Global initializers buffer `xsl:message` output until they
+succeed, discarding messages and local state from deferred or failed attempts.
+Construction work from discarded attempts still counts against resource limits.
+This does not add unsupported XSLT instructions such as
 imports, includes, or sorting.
 
 ## Architecture

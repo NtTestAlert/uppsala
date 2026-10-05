@@ -341,3 +341,109 @@ fn local_namespaces_apply_to_paths_and_patterns() {
         "1212"
     );
 }
+
+/// Ignored builder defaults must not become a temporary external-expression scope.
+#[test]
+fn ignored_builder_defaults_are_invisible_to_call_expressions() {
+    let style = Parser::new().parse(STYLE).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    for name in ["helper", "derived"] {
+        let sheet = Stylesheet::compile(&style)
+            .unwrap()
+            .with_param(name, "hidden");
+        let params = [(
+            "p:value".into(),
+            ParameterValue::Expression(format!("${name}")),
+        )];
+        assert!(sheet
+            .transform_with_params(&source, &params)
+            .unwrap_err()
+            .to_string()
+            .contains("Undefined variable"));
+        assert_eq!(sheet.transform(&source).unwrap(), "default|default!");
+    }
+    // Declared builder parameters remain visible, including namespace aliases.
+    let sheet = Stylesheet::compile(&style)
+        .unwrap()
+        .with_param("q:value", "builder");
+    let params = [(
+        "p:value".into(),
+        ParameterValue::Expression("concat($p:value, '!')".into()),
+    )];
+    assert_eq!(
+        sheet.transform_with_params(&source, &params).unwrap(),
+        "builder!|builder!!"
+    );
+}
+
+/// Run in a child test process so real stderr can be checked without changing
+/// the public API or depending on the Rust test harness's output capture.
+#[test]
+fn global_message_child() {
+    let Ok(case) = std::env::var("UPPSALA_GLOBAL_MESSAGE_CASE") else {
+        return;
+    };
+    let later = match case.as_str() {
+        "success" => "'ready'",
+        "cycle" => "$first",
+        "failure" => "unknown-function()",
+        _ => panic!("unexpected test case"),
+    };
+    let xml = format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+      <xsl:output method="text"/>
+      <xsl:variable name="first">
+        <xsl:message>outer-once</xsl:message>
+        <xsl:call-template name="build"/>
+      </xsl:variable>
+      <xsl:variable name="middle" select="$later"/>
+      <xsl:variable name="later" select="{later}"/>
+      <xsl:template name="build">
+        <xsl:variable name="local" select="'private'"/>
+        <xsl:message>nested-once</xsl:message>
+        <xsl:value-of select="$middle"/>
+      </xsl:template>
+      <xsl:template match="/"><xsl:message>template-once</xsl:message><xsl:value-of select="$first"/></xsl:template>
+    </xsl:stylesheet>"#
+    );
+    let style = Parser::new().parse(&xml).unwrap();
+    let source = Parser::new().parse("<r/>").unwrap();
+    let result = Stylesheet::compile(&style).unwrap().transform(&source);
+    if case == "success" {
+        assert_eq!(result.unwrap(), "ready");
+    } else {
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn deferred_globals_publish_messages_only_after_success() {
+    for case in ["success", "cycle", "failure"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "global_message_child", "--nocapture"])
+            .env("UPPSALA_GLOBAL_MESSAGE_CASE", case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child failed: {:?}", output);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let messages: Vec<_> = stderr
+            .lines()
+            .filter(|line| line.starts_with("xsl:message:"))
+            .collect();
+        if case == "success" {
+            assert_eq!(
+                messages,
+                [
+                    "xsl:message: outer-once",
+                    "xsl:message: nested-once",
+                    "xsl:message: template-once"
+                ]
+            );
+        } else {
+            assert!(
+                messages.is_empty(),
+                "failed initializer leaked messages: {stderr}"
+            );
+        }
+    }
+}
