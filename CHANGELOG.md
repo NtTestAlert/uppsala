@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-07
+
+### Added
+
+- Add `xslt::ParameterValue` and `Stylesheet::transform_with_params()` for
+  invocation-local top-level XSLT parameters. Parameters accept literal Unicode
+  strings or XPath expressions that retain their result types, including node
+  sets. Call parameters override builder defaults without changing the compiled
+  stylesheet or leaking values between transformations.
+- Support unprefixed, namespace-qualified, and expanded parameter names. Literal
+  arguments bind before expression arguments, which evaluate in supplied order.
+
 ### Fixed
+
+- Resolve XSLT global variable and parameter dependencies, including forward
+  references, and report unresolved or circular dependencies. Buffer
+  `xsl:message` output during deferred global initialization so retries do not
+  emit duplicate messages.
+- Preserve declaration-site namespace bindings for XSLT expressions, match
+  patterns, and local variable and parameter names.
+- Ignore `with_param()` defaults that do not name declared top-level parameters
+  before evaluating invocation-local expressions, preventing ignored defaults
+  from becoming visible as variables.
+- Provide the implicit reserved `xml` namespace binding in XPath and XSLT,
+  including match patterns, and prevent public XPath namespace additions or
+  programmatically constructed stylesheet declarations from rebinding it.
 
 - Validate inherited simple-content values against their underlying simple type
   and reject child elements inside simple-content elements ([#43](https://github.com/kushaldas/uppsala/issues/43)).

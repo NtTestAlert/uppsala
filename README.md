@@ -97,7 +97,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-uppsala = "0.10"
+uppsala = "0.11"
 ```
 
 ### Parse and query
