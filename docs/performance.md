@@ -202,7 +202,8 @@ conformance suites) and measured with the new criterion harness
    adding `rustc-hash` would break. Applied to `Document.attribute_nodes`
    (hot on XPath attribute axis and `prepare_xpath`) and internal NodeId sets.
    Entity maps and namespace-prefix maps/sets retain randomized standard-library
-   hashing because their string keys come from XML input.
+   hashing because their string keys come from XML input. The `fasthash` module
+   is private and is not part of the supported public API.
 4. **E4 — build profiles** (09): `[profile.release]` (fat LTO, codegen-units 1,
    strip), `[profile.dev] debug = "line-tables-only"`, and a
    `[profile.profiling]` for flamegraph sessions. Note: consumers building
@@ -212,7 +213,11 @@ conformance suites) and measured with the new criterion harness
 ### Results (criterion medians, full before/after, same machine)
 
 These measurements predate the security-review corrections to traversal,
-cache limits, and string hashing above; they have not been remeasured.
+cache limits, and string hashing above; they have not been remeasured. The
+preparation benchmark now times only `prepare_xpath()` on a fresh, unprepared
+document per iteration, with parsing and destruction outside the timed routine.
+Its historical results below included those costs and are not directly
+comparable with the corrected benchmark.
 
 | Benchmark | before | after | Delta |
 |---|---:|---:|---:|

@@ -7,7 +7,7 @@
 //! Run:    cargo bench --bench uppsala
 //! Save:   cargo bench --bench uppsala -- --save-baseline main
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 /// SAML-shaped, namespace-heavy response (the realistic uppsala consumer case).
 fn saml_shaped(assertions: usize) -> String {
@@ -152,11 +152,16 @@ fn bench_prepare(c: &mut Criterion) {
     let xml = attr_heavy();
     let mut group = c.benchmark_group("prepare");
     group.bench_function("attribute_nodes_attr_heavy", |b| {
-        b.iter(|| {
-            let mut doc = uppsala::Parser::new().parse(black_box(&xml)).unwrap();
-            doc.prepare_xpath();
-            black_box(&doc);
-        });
+        // Each timed call prepares a fresh document; parsing and destruction
+        // are untimed, and no iteration measures the clean-cache early return.
+        b.iter_batched_ref(
+            || uppsala::Parser::new().parse(black_box(&xml)).unwrap(),
+            |doc| {
+                doc.prepare_xpath();
+                black_box(doc);
+            },
+            BatchSize::PerIteration,
+        );
     });
     group.finish();
 }

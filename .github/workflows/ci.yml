@@ -48,7 +48,7 @@ jobs:
       # asserts pull-parser/DOM agreement on every fixture, and
       # pull_differential adds the dedicated pull-parser regression corpus.
       - name: Unit and hand-crafted tests
-        run: cargo test --lib --test xml_conformance --test namespace_conformance --test xpath_conformance --test xsd_conformance --test serialization_conformance --test range_conformance --test xsd_composition --test pull_differential
+        run: cargo test --lib --test xml_conformance --test namespace_conformance --test xpath_conformance --test xsd_conformance --test serialization_conformance --test range_conformance --test xsd_composition --test pull_differential --test perf_regressions
 
       # Security regression coverage. The fail-closed assertions run by
       # default; `#[ignore]`-marked process-fatal reproducers in
