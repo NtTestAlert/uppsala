@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefixes.
 - Enable fat LTO, a single codegen unit, and stripping for this crate's release
   builds. Applications using Uppsala as a dependency control their own profiles.
+- Stream XPath child and attribute steps directly into their result, compact
+  predicate results in place, and skip redundant document-order sorting.
+  Node-visit budgets and per-parent predicate positions remain enforced.
+- Reserve virtual-attribute arena and index capacity before initial XPath
+  preparation to avoid repeated growth on attribute-heavy documents.
+
+
 
 ### Fixed
 

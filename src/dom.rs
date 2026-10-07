@@ -661,6 +661,20 @@ impl<'a> Document<'a> {
                 _ => None,
             })
             .collect();
+        if self.attribute_nodes.is_empty() {
+            // First preparation knows the number of virtual attributes up
+            // front. Reserve once instead of repeatedly moving the growing
+            // node arena as each element's attributes are appended. Existing
+            // recycled slots do not need new arena space. Reservations remain
+            // best-effort, like the parser's arena capacity hint.
+            let attributes = element_ids.iter().fold(0usize, |count, &id| {
+                count.saturating_add(self.element(id).map_or(0, |e| e.attributes.len()))
+            });
+            let _ = self
+                .nodes
+                .try_reserve(attributes.saturating_sub(self.attr_node_pool.len()));
+            let _ = self.attribute_nodes.try_reserve(element_ids.len());
+        }
         if !self.attribute_nodes.is_empty() {
             let live: FastHashSet<NodeId> = element_ids.iter().copied().collect();
             let stale: Vec<NodeId> = self

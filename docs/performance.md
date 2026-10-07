@@ -239,3 +239,116 @@ Reproduce:
 cargo bench --bench uppsala -- --baseline u0full   # if the baseline exists
 cargo bench --bench uppsala                        # absolute numbers
 ```
+
+## Second pass: 2026-10-07 (XPath result construction and preparation)
+
+Baseline: `fix/perf` at `1751d355`, including the review corrections above.
+After: the uncommitted second-pass changes to `src/xpath.rs` and `src/dom.rs`.
+The new `xpath_shapes` benchmarks were also run against the unchanged baseline
+library before implementation. These results do not replace the historical
+libxml2 comparison; no cross-library comparison was run in this pass.
+
+Environment: x86_64 Linux KVM guest, Intel Core Ultra 7 155H, 8 vCPUs;
+rustc 1.98.0 (`88d9e12ae`), Cargo 1.98.0. The bench profile used opt-level 3,
+fat LTO, one codegen unit and stripped symbols, with no custom RUSTFLAGS or
+CPU pinning. Hardware profiling was unavailable (`perf stat` reported no
+supported events), so phase-separated Criterion measurements guided the work.
+
+Changes:
+
+- Child and attribute steps filter directly into the final result vector,
+  eliminating intermediate axis and per-parent result vectors. Child scans
+  charge each candidate before pushing, including candidates that do not match.
+- Predicates compact only the current parent's suffix in place, retaining its
+  `position()`/`last()` context and predicate-scan budget charges.
+- A single child/attribute context needs no document-order sort. Prepared
+  multi-context results are checked for ordering before allocating cached sort
+  keys; unordered results retain the stable sorting fallback.
+- Initial XPath preparation makes best-effort arena/index reservations for
+  virtual attributes, accounting for recycled slots before growing the arena.
+
+### Measured latency
+
+Criterion medians in microseconds, 30 samples, 1-second warmup and 2-second
+measurement per case. SAML has 40 assertions (29,955 bytes); preparation uses
+400 elements with 8 attributes each (62,883 bytes). Wide cases use 1,024
+`<item id='x'/>` children (13,319 bytes), prepared except where stated.
+Parsing and destruction are excluded from the preparation timing; query
+timings exclude document parsing/preparation and include returned-vector drop.
+
+| Benchmark | Before (us) | After (us) | Delta |
+|---|---:|---:|---:|
+| SAML one-shot XPath | 60.99 | 45.55 | -25.3% |
+| SAML repeated XPath | 56.34 | 40.33 | -28.4% |
+| SAML attribute selection (`repeat_position`) | 61.13 | 41.97 | -31.3% |
+| Cached `1 + 1` | 0.182 | 0.176 | -3.2% |
+| Wide child selection | 24.43 | 11.07 | -54.7% |
+| Wide child selection, no matches | 17.59 | 8.84 | -49.8% |
+| Wide attribute selection | 126.50 | 40.13 | -68.3% |
+| Wide chained predicates | 282.52 | 265.58 | -6.0% |
+| Wide child selection, unprepared DOM | 185.65 | 10.09 | -94.6% |
+| Initial attribute preparation | 705.09 | 282.74 | -59.9% |
+
+The small-expression and predicate improvements were not consistent across
+every run; the substantial wins were result construction and preparation.
+The full suite initially flagged text parsing and pull-to-DOM slowdowns.
+Back-to-back reruns of the saved binaries (40 samples, 3-second measurement)
+did not reproduce them: text parsing was 246.08 -> 226.47 us and pull-to-DOM
+292.77 -> 274.35 us. Neither path was optimized; treat these fluctuations as
+host/build variability, not as parser speedup claims.
+
+Reproduction, with the same benchmark source present in both builds:
+
+```sh
+# Baseline library, then modified library:
+cargo bench --offline --bench uppsala -- --save-baseline round2-before \
+  --warm-up-time 1 --measurement-time 2 --sample-size 30 --noplot
+cargo bench --offline --bench uppsala -- --baseline round2-before \
+  --warm-up-time 1 --measurement-time 2 --sample-size 30 --noplot
+```
+
+Raw estimates are local artifacts under `target/criterion/`; the table uses
+`median.point_estimate`, not Criterion's printed regression slope. Saved
+executables in `target/perf-round2/{before,after}` allowed the control reruns:
+
+```sh
+for stage in before after; do
+  target/perf-round2/$stage --bench 'parse/text_heavy|pull/to_dom_saml' \
+    --save-baseline round2-check-$stage --warm-up-time 1 \
+    --measurement-time 3 --sample-size 40 --noplot
+done
+```
+
+### Process memory observations and limits
+
+Fresh processes were run with `/usr/bin/time`, selecting one timed benchmark
+per process. Criterion still executes other groups' untimed fixture setup, so
+these are **whole-harness high-water RSS**, not per-input or live-heap figures.
+Profile mode runs for a fixed duration: its elapsed time is not query latency.
+
+| Selected benchmark | Before elapsed / peak RSS | After elapsed / peak RSS |
+|---|---:|---:|
+| Repeated SAML XPath | 1.91 s / 5,696 KiB | 1.35 s / 5,456 KiB |
+| Wide attribute selection | 1.04 s / 5,664 KiB | 1.39 s / 5,460 KiB |
+| Attribute preparation | 1.04 s / 6,168 KiB | 1.59 s / 6,512 KiB |
+
+```sh
+for stage in before after; do
+  for query in '^xpath/repeat_axis$' '^xpath_shapes/attributes$' '^prepare/'; do
+    /usr/bin/time -f 'elapsed_s=%e peak_rss_kib=%M' \
+      target/perf-round2/$stage --bench "$query" --profile-time 1
+  done
+done
+```
+
+No peak-memory reduction is claimed. Preparation's reservation trades earlier
+capacity allocation for fewer growth operations; its observed harness RSS was
+slightly higher. Dedicated allocator profiling is needed to quantify live
+heap and allocation counts.
+
+Validation: `cargo test --offline --quiet` passed 747 tests (5 ignored),
+including conformance, XSLT, security, mutation/recycling and new per-parent
+predicate/budget regressions. Formatting and diff checks passed. Two small
+XPath fuzz seeds cover chained predicates and overlapping contexts; no fuzz
+campaign was run in this pass. No public API, dependency, cache-limit or
+default-budget changes were made.

@@ -48,3 +48,69 @@ fn descendant_predicates_use_document_order() {
         .select_nodes(&doc, root, "descendant::item")
         .is_err());
 }
+
+#[test]
+fn step_predicates_remain_local_to_each_parent() {
+    let xml = "<r><g><item id='a'/><item id='b'/><item id='c'/></g><g><item id='d'/><item id='e'/></g></r>";
+    for prepare in [false, true] {
+        let mut doc = parse(xml).unwrap();
+        if prepare {
+            doc.prepare_xpath();
+        }
+        let root = doc.document_element().unwrap();
+        let eval = XPathEvaluator::new();
+        for (query, expected) in [
+            ("g/item[position() mod 2 = 1][last()]", vec!["c", "d"]),
+            ("g/item[last()][1]", vec!["c", "e"]),
+            ("g/item/preceding-sibling::item[1]", vec!["a", "b", "d"]),
+        ] {
+            let nodes = eval.select_nodes(&doc, root, query).unwrap();
+            let ids: Vec<_> = nodes
+                .iter()
+                .map(|&n| doc.get_attribute(n, "id").unwrap())
+                .collect();
+            assert_eq!(ids, expected, "{query}, prepared={prepare}");
+        }
+        if prepare {
+            let attrs = eval.select_nodes(&doc, root, "g/item/@*[last()]").unwrap();
+            assert_eq!(attrs.len(), 5);
+        }
+        // Multiple contexts produce an initially unordered stream; duplicates
+        // from the union must also disappear before returning the node-set.
+        let nodes = eval
+            .select_nodes(&doc, root, "descendant-or-self::*/child::* | g/item")
+            .unwrap();
+        assert_eq!(nodes, doc.descendants(root));
+    }
+}
+
+#[test]
+fn streamed_axis_filtering_preserves_visit_budgets() {
+    let mut doc = parse("<r x='1' y='2' z='3'><a/><b/><a/></r>").unwrap();
+    doc.prepare_xpath();
+    let root = doc.document_element().unwrap();
+    // Unmatched nodes still cost a visit; filtering must not bypass accounting.
+    for query in ["missing", "@missing", "*", "@*"] {
+        assert!(XPathEvaluator::new()
+            .with_max_node_visits(2)
+            .select_nodes(&doc, root, query)
+            .is_err());
+        assert!(XPathEvaluator::new()
+            .with_max_node_visits(3)
+            .select_nodes(&doc, root, query)
+            .is_ok());
+    }
+    let doc = parse("<r><g><item/><item/></g><g><item/><item/></g></r>").unwrap();
+    let root = doc.document_element().unwrap();
+    let query = "g/item[position() <= 2][last()]";
+    // Two g visits, then two item visits and two scans of two predicates per g.
+    assert!(XPathEvaluator::new()
+        .with_max_node_visits(13)
+        .select_nodes(&doc, root, query)
+        .is_err());
+    let nodes = XPathEvaluator::new()
+        .with_max_node_visits(14)
+        .select_nodes(&doc, root, query)
+        .unwrap();
+    assert_eq!(nodes.len(), 2);
+}

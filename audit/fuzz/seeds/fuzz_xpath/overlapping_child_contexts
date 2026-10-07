@@ -1,0 +1,2 @@
+descendant-or-self::*/child::* | g/item
+<r><g><item/><item><nested/></item></g><g><item/></g></r>
