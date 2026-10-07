@@ -10,6 +10,25 @@ readme = "README.md"
 categories = ["parser-implementations", "encoding", "web-programming"]
 exclude = ["test-data/", "perf.data"]
 
+# Performance profiles (playbook lesson 09). Note: when uppsala is built as a
+# dependency, the CONSUMER's profile governs; these apply to uppsala's own
+# benches, harness, and binaries. Document LTO/codegen-units in the README for
+# consumers who want the same shape.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = "full"
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -28,3 +47,8 @@ fuzzing = []
 [dependencies]
 
 [dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "uppsala"
+harness = false

@@ -195,6 +195,16 @@ pub struct XPathEvaluator {
     max_depth: u32,
     /// Maximum number of axis/predicate node visits per evaluation.
     max_node_visits: usize,
+    /// Compiled-expression cache, keyed by expression text.
+    ///
+    /// Tokenizing + parsing an XPath expression is a significant fraction of
+    /// evaluation cost, so repeated evaluation of the same string through one
+    /// evaluator skips it. Bounded: at the cap new expressions are evaluated
+    /// without being cached (the cache is an advisory optimization).
+    ///
+    /// `Mutex` + `Arc` rather than `RefCell` + `Rc`: the evaluator is wrapped
+    /// in a pyclass by pyuppsala, and pyclasses must be `Send + Sync`.
+    program_cache: std::sync::Mutex<HashMap<String, std::sync::Arc<Expr>>>,
 }
 
 impl XPathEvaluator {
@@ -208,6 +218,7 @@ impl XPathEvaluator {
             )]),
             max_depth: DEFAULT_MAX_XPATH_DEPTH,
             max_node_visits: DEFAULT_MAX_XPATH_NODE_VISITS,
+            program_cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -237,21 +248,43 @@ impl XPathEvaluator {
     }
 
     /// Evaluate an XPath expression from the given context node.
+    /// Evaluate an expression from the given context node.
+    ///
+    /// Repeated evaluation of the same expression through one evaluator
+    /// reuses the parsed AST instead of re-tokenizing and re-parsing per
+    /// call; a one-shot evaluation pays the same parse cost as before.
     pub fn evaluate(
         &self,
         doc: &Document<'_>,
         context: NodeId,
         expr: &str,
     ) -> XmlResult<XPathValue> {
-        let tokens = tokenize(expr)?;
-        let mut parser = XPathParser::new(&tokens, self.max_depth);
-        let ast = parser.parse_expr()?;
-        if parser.peek().is_some() {
-            return Err(XmlError::xpath(format!(
-                "Unexpected trailing tokens in XPath expression: {:?}",
-                expr
-            )));
-        }
+        const CACHE_LIMIT: usize = 128;
+        // Compute the lookup result before matching: a `match self.cache.borrow()…`
+        // scrutinee would keep the borrow alive across the arms and collide
+        // with the `borrow_mut` in the miss arm.
+        let cached = self.program_cache.lock().unwrap().get(expr).cloned();
+        let program = match cached {
+            Some(hit) => hit,
+            None => {
+                let tokens = tokenize(expr)?;
+                let mut parser = XPathParser::new(&tokens, self.max_depth);
+                let ast = parser.parse_expr()?;
+                if parser.peek().is_some() {
+                    return Err(XmlError::xpath(format!(
+                        "Unexpected trailing tokens in XPath expression: {:?}",
+                        expr
+                    )));
+                }
+                let ast = std::sync::Arc::new(ast);
+                let mut cache = self.program_cache.lock().unwrap();
+                if cache.len() < CACHE_LIMIT {
+                    cache.insert(expr.to_string(), ast.clone());
+                }
+                ast
+            }
+        };
+
         let budget = EvalBudget::new(self.max_node_visits);
         let ctx = EvalContext {
             node: context,
@@ -264,7 +297,7 @@ impl XPathEvaluator {
             funcs: &NoFunctions,
             budget: &budget,
         };
-        evaluate_expr(&ast, &ctx)
+        evaluate_expr(&program, &ctx)
     }
 
     /// Convenience: evaluate and return the resulting node set.
@@ -1971,8 +2004,13 @@ fn select_axis(axis: &Axis, node: NodeId, ctx: &EvalContext) -> XmlResult<Vec<No
     let doc = ctx.doc;
     match axis {
         Axis::Child => {
-            let nodes = doc.children(node);
-            ctx.budget.charge(nodes.len())?;
+            // Zero-allocation iteration into a right-sized result: the old
+            // `doc.children(node)` allocated an intermediate Vec per call,
+            // and child-axis is the most frequent axis in practice.
+            let count = doc.children_count(node);
+            ctx.budget.charge(count)?;
+            let mut nodes = Vec::with_capacity(count);
+            nodes.extend(doc.children_iter(node));
             Ok(nodes)
         }
         Axis::Descendant => collect_descendants(doc, node, false, ctx.budget),
@@ -2034,22 +2072,21 @@ fn collect_descendants(
     include_self: bool,
     budget: &EvalBudget,
 ) -> XmlResult<Vec<NodeId>> {
+    // FIFO queue over the zero-allocation child iterator: preserves document
+    // order without the per-node `children()` Vec + reverse the previous
+    // version paid for every visited node.
     let mut result = Vec::new();
-    let mut stack = if include_self {
-        vec![node]
+    let mut queue = std::collections::VecDeque::new();
+    if include_self {
+        queue.push_back(node);
     } else {
-        let mut children = doc.children(node);
-        children.reverse();
-        children
-    };
+        queue.extend(doc.children_iter(node));
+    }
 
-    while let Some(current) = stack.pop() {
+    while let Some(current) = queue.pop_front() {
         budget.charge(1)?;
         result.push(current);
-
-        let mut children = doc.children(current);
-        children.reverse();
-        stack.extend(children);
+        queue.extend(doc.children_iter(current));
     }
 
     Ok(result)
@@ -2561,9 +2598,9 @@ fn collect_elements_with_id(
             }
         }
 
-        let mut children = doc.children(current);
-        children.reverse();
-        stack.extend(children);
+        for child in doc.children_iter(current).rev() {
+            stack.push(child);
+        }
     }
 
     Ok(())
@@ -2643,7 +2680,7 @@ struct SiblingOrderIndex {
 impl SiblingOrderIndex {
     fn child_pos(&mut self, doc: &Document<'_>, parent: NodeId, child: NodeId) -> Option<usize> {
         if self.children_indexed.insert(parent) {
-            for (i, c) in doc.children(parent).into_iter().enumerate() {
+            for (i, c) in doc.children_iter(parent).enumerate() {
                 self.pos.insert(c, i);
             }
         }

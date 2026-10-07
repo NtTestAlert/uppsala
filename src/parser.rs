@@ -5,17 +5,17 @@
 //! defined in the XML 1.0 specification.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use crate::fasthash::FastHashMap;
 
 use crate::dom::{Document, ProcessingInstruction, XmlDeclaration};
 use crate::error::{XmlError, XmlResult};
 
 /// A map of general entity names to their replacement text.
-pub(crate) type EntityMap = HashMap<String, String>;
+pub(crate) type EntityMap = FastHashMap<String, String>;
 
 /// Cache of already-validated entity expansion results.
 /// Key: entity name, Value: expanded text.
-pub(crate) type EntityCache = HashMap<String, String>;
+pub(crate) type EntityCache = FastHashMap<String, String>;
 
 /// Default maximum element-nesting depth.
 ///
@@ -607,8 +607,8 @@ fn parse_quoted_value<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     let mut budget = DEFAULT_MAX_ENTITY_EXPANSION;
     parse_quoted_value_with_entities(
         cursor,
-        &HashMap::new(),
-        &mut EntityCache::new(),
+        &EntityMap::default(),
+        &mut EntityCache::default(),
         &mut budget,
     )
 }
@@ -723,8 +723,8 @@ fn parse_reference(cursor: &mut Cursor) -> XmlResult<String> {
     let mut budget = DEFAULT_MAX_ENTITY_EXPANSION;
     parse_reference_with_entities(
         cursor,
-        &HashMap::new(),
-        &mut EntityCache::new(),
+        &EntityMap::default(),
+        &mut EntityCache::default(),
         &mut budget,
     )
 }
@@ -1989,7 +1989,7 @@ fn parse_att_value_in_dtd(
                 let resolved = parse_reference_with_entities(
                     cursor,
                     entities,
-                    &mut EntityCache::new(),
+                    &mut EntityCache::default(),
                     entity_budget,
                 )?;
                 value.push_str(&resolved);

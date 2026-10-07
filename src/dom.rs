@@ -6,7 +6,7 @@
 //! mutation straightforward.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use crate::fasthash::{FastHashMap, FastHashSet};
 use std::fmt;
 
 /// A unique identifier for a node within a [`Document`].
@@ -147,6 +147,7 @@ fn own_qname(q: &QName<'_>) -> QName<'static> {
 pub struct ChildrenIter<'d, 'a> {
     doc: &'d Document<'a>,
     next: Option<NodeId>,
+    next_back: Option<NodeId>,
 }
 
 impl<'d, 'a> Iterator for ChildrenIter<'d, 'a> {
@@ -155,6 +156,14 @@ impl<'d, 'a> Iterator for ChildrenIter<'d, 'a> {
     fn next(&mut self) -> Option<NodeId> {
         let id = self.next?;
         self.next = self.doc.nodes.get(id.0).and_then(|n| n.next_sibling);
+        Some(id)
+    }
+}
+
+impl<'d, 'a> DoubleEndedIterator for ChildrenIter<'d, 'a> {
+    fn next_back(&mut self) -> Option<NodeId> {
+        let id = self.next_back?;
+        self.next_back = self.doc.nodes.get(id.0).and_then(|n| n.prev_sibling);
         Some(id)
     }
 }
@@ -399,7 +408,7 @@ pub struct Document<'a> {
     pub doctype: Option<Cow<'a, str>>,
     /// Attribute nodes for each element, keyed by element NodeId.
     /// These are virtual nodes used by XPath attribute axis traversal.
-    pub(crate) attribute_nodes: HashMap<NodeId, Vec<NodeId>>,
+    pub(crate) attribute_nodes: FastHashMap<NodeId, Vec<NodeId>>,
     /// Precomputed document-order position per node, indexed by `NodeId`.
     /// Populated by [`Self::prepare_xpath`]; empty otherwise. Lets node-set
     /// deduplication sort by an O(1) key instead of walking each node to the root
@@ -446,7 +455,7 @@ impl<'a> Document<'a> {
             root: NodeId(0),
             xml_declaration: None,
             doctype: None,
-            attribute_nodes: HashMap::new(),
+            attribute_nodes: FastHashMap::default(),
             doc_order: Vec::new(),
             xpath_dirty: true,
             attr_node_pool: Vec::new(),
@@ -476,8 +485,7 @@ impl<'a> Document<'a> {
 
     /// Returns the document element (the single top-level element), if any.
     pub fn document_element(&self) -> Option<NodeId> {
-        self.children(self.root)
-            .into_iter()
+        self.children_iter(self.root)
             .find(|&id| matches!(self.node_kind(id), Some(NodeKind::Element(_))))
     }
 
@@ -643,7 +651,7 @@ impl<'a> Document<'a> {
             })
             .collect();
         if !self.attribute_nodes.is_empty() {
-            let live: HashSet<NodeId> = element_ids.iter().copied().collect();
+            let live: FastHashSet<NodeId> = element_ids.iter().copied().collect();
             let stale: Vec<NodeId> = self
                 .attribute_nodes
                 .keys()
@@ -924,6 +932,11 @@ impl<'a> Document<'a> {
         result
     }
 
+    /// Count the children of a node in O(children) time without allocating.
+    pub fn children_count(&self, id: NodeId) -> usize {
+        self.children_iter(id).count()
+    }
+
     /// Return a zero-allocation iterator over the children of a node.
     ///
     /// This is more efficient than [`children()`](Self::children) when you
@@ -943,6 +956,7 @@ impl<'a> Document<'a> {
     pub fn children_iter(&self, id: NodeId) -> ChildrenIter<'_, 'a> {
         ChildrenIter {
             doc: self,
+            next_back: self.nodes.get(id.0).and_then(|n| n.last_child),
             next: self.nodes.get(id.0).and_then(|n| n.first_child),
         }
     }
@@ -1052,7 +1066,7 @@ impl<'a> Document<'a> {
                 results.push(id);
             }
         }
-        for child in self.children(id) {
+        for child in self.children_iter(id) {
             self.collect_elements_by_tag_name(child, local_name, results);
         }
     }
@@ -1082,7 +1096,7 @@ impl<'a> Document<'a> {
                 results.push(id);
             }
         }
-        for child in self.children(id) {
+        for child in self.children_iter(id) {
             self.collect_elements_by_tag_name_ns(child, namespace_uri, local_name, results);
         }
     }
@@ -1166,7 +1180,7 @@ impl<'a> Document<'a> {
             Some(NodeKind::Text(t)) => buf.push_str(t),
             Some(NodeKind::CData(t)) => buf.push_str(t),
             _ => {
-                for child in self.children(id) {
+                for child in self.children_iter(id) {
                     self.collect_text(child, buf);
                 }
             }
@@ -1618,15 +1632,20 @@ impl<'a> Document<'a> {
     /// Depth-first pre-order traversal of descendants (not including the node itself).
     pub fn descendants(&self, id: NodeId) -> Vec<NodeId> {
         let mut result = Vec::new();
-        self.collect_descendants(id, &mut result);
-        result
-    }
-
-    fn collect_descendants(&self, id: NodeId, result: &mut Vec<NodeId>) {
-        for child in self.children(id) {
-            result.push(child);
-            self.collect_descendants(child, result);
+        // Iterative pre-order walk using the zero-allocation child iterator:
+        // the previous recursive `collect_descendants` allocated a `Vec` per
+        // node (children()), which dominated wide-tree traversal cost.
+        let mut stack = Vec::new();
+        for child in self.children_iter(id).rev() {
+            stack.push(child);
         }
+        while let Some(current) = stack.pop() {
+            result.push(current);
+            for child in self.children_iter(current).rev() {
+                stack.push(child);
+            }
+        }
+        result
     }
 
     // ─── Serialization ───
@@ -1810,7 +1829,7 @@ impl<'a> Document<'a> {
                 //
                 // Precompute the last index per prefix so the "last binding wins"
                 // dedup is O(n) rather than O(n^2) in the number of bindings.
-                let mut last_idx: HashMap<&str, usize> = HashMap::with_capacity(child_local.len());
+                let mut last_idx: FastHashMap<&str, usize> = FastHashMap::default();
                 for (i, (prefix, _)) in child_local.iter().enumerate() {
                     last_idx.insert(prefix.as_ref(), i);
                 }
@@ -2060,7 +2079,7 @@ impl<'a> NsScope<'a> {
         // Track seen prefixes by reference (no cloning); the innermost binding
         // for each prefix is its effective one, so a prefix seen earlier shadows
         // any later (outer) binding.
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: FastHashSet<&str> = FastHashSet::default();
         let mut cur = Some(self);
         while let Some(s) = cur {
             for (p, u) in s.local.iter().rev() {
