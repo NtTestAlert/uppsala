@@ -105,6 +105,7 @@ use std::borrow::Cow;
 pub mod dom;
 /// Error types: [`XmlError`], [`XmlResult`], and per-domain error structs.
 pub mod error;
+mod fasthash;
 
 mod exslt;
 /// Namespace prefix resolution with scope stack.

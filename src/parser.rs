@@ -607,8 +607,8 @@ fn parse_quoted_value<'a>(cursor: &mut Cursor<'a>) -> XmlResult<Cow<'a, str>> {
     let mut budget = DEFAULT_MAX_ENTITY_EXPANSION;
     parse_quoted_value_with_entities(
         cursor,
-        &HashMap::new(),
-        &mut EntityCache::new(),
+        &EntityMap::default(),
+        &mut EntityCache::default(),
         &mut budget,
     )
 }
@@ -723,8 +723,8 @@ fn parse_reference(cursor: &mut Cursor) -> XmlResult<String> {
     let mut budget = DEFAULT_MAX_ENTITY_EXPANSION;
     parse_reference_with_entities(
         cursor,
-        &HashMap::new(),
-        &mut EntityCache::new(),
+        &EntityMap::default(),
+        &mut EntityCache::default(),
         &mut budget,
     )
 }
@@ -1989,7 +1989,7 @@ fn parse_att_value_in_dtd(
                 let resolved = parse_reference_with_entities(
                     cursor,
                     entities,
-                    &mut EntityCache::new(),
+                    &mut EntityCache::default(),
                     entity_budget,
                 )?;
                 value.push_str(&resolved);

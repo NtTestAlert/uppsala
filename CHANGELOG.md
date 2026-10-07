@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-07
+
+### Added
+
+- Add allocation-free `Document::children_count()` and double-ended child
+  iteration, including mixed forward/backward traversal.
+- Add `XPathEvaluator::clear_cache()` to release cached compiled expressions.
+- Add a Criterion benchmark harness covering parsing, DOM traversal, XPath,
+  attribute-node preparation, serialization, and pull parsing, plus a dedicated
+  profiling build profile.
+
+### Changed
+
+- Reduce temporary allocations in DOM and XPath traversal by using child
+  iterators. `Document::descendants()` now uses an iterative depth-first walk
+  instead of recursive traversal.
+- Cache compiled XPath expressions within each evaluator to avoid repeated
+  tokenization and parsing. Oversized expressions still evaluate without being
+  cached, and only successful evaluations populate the cache.
+- Use dependency-free fast hashing for internal node-ID maps and sets while
+  retaining randomized hashing for XML-derived entity names and namespace
+  prefixes.
+- Enable fat LTO, a single codegen unit, and stripping for this crate's release
+  builds. Applications using Uppsala as a dependency control their own profiles.
+
+### Fixed
+
+- Preserve document order before evaluating positional XPath descendant
+  predicates, and share exhaustion state between both ends of child iterators
+  so mixed traversal cannot return the same child twice.
+- Register the SAML namespace in the one-shot XPath benchmark so it performs
+  the same query as the repeated-evaluation benchmark.
+- Use fixed-width values in the hash byte-equivalence test for portability to
+  both 32-bit and 64-bit targets.
+
+### Security
+
+- Bound the XPath cache to 128 entries, 4 KiB of source per entry, 64 KiB of
+  owned key/AST capacity per entry, and 1 MiB of that capacity overall, plus
+  bounded table and allocator overhead. These limits bound retained cache data,
+  not total parsing or evaluation memory.
+- Clear compiled expressions when the evaluator's depth limit changes so
+  cached programs cannot bypass the new limit. Bypass a poisoned advisory
+  cache instead of panicking.
+
 ## [0.11.0] - 2026-10-07
 
 ### Added

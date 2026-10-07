@@ -163,3 +163,79 @@ per-instruction sample counts.
 On this container, hardware counters such as `branch-misses` and `cycles` were
 reported as unsupported even under `sudo perf stat`; use a host with PMU access
 for branch-prediction measurements.
+
+---
+
+## Playbook pass: 2026-10-07 (traversal, XPath compile-once, fast hashing)
+
+Four experiments from the same performance playbook used on bergshamra
+(allocation hygiene, algorithmic wins, string/hash choices, build profiles),
+each validated against the full test suite (738 tests, 0 failed — including
+the 68-test XML conformance, 66-test XPath conformance, and serialization
+conformance suites) and measured with the new criterion harness
+(`benches/uppsala.rs`, baselines `u0full` = original, `e4final` = final).
+
+### Changes
+
+1. **E1 — zero-alloc traversal** (01/08): converted hot internal `.children()`
+   (Vec-per-call) sites to the existing `children_iter`; `descendants()` is now
+   an iterative walk instead of recursion with a `Vec` per node; XPath
+   `collect_descendants` uses a depth-first stack over reversed `children_iter`
+   (no per-node Vec + reverse), preserving document order before predicates;
+   `Child` axis pre-sizes its result via the new `children_count()`;
+   `ChildrenIter` supports mixed forward/backward traversal with shared exhaustion.
+2. **E2 — XPath compile-once** (08): `XPathEvaluator` caches the parsed AST
+   keyed by expression text (`Mutex`-protected map of `Arc<Expr>`). Admission
+   is limited to 128 entries, 4 KiB of source per entry, 64 KiB of owned key/AST
+   capacity per entry, and 1 MiB of that capacity in total, plus bounded
+   hash-table and allocator overhead. Only successful evaluations are admitted;
+   larger expressions still evaluate without caching. `clear_cache()` releases
+   cached programs, and changing `with_max_depth()` clears them automatically.
+   These bounds cover retained cache data, not total parsing/evaluation memory;
+   applications should still bound input sizes and concurrent work.
+   Repeated evaluation of the same expression through one
+   evaluator — the pyuppsala `XPath` pattern — skips tokenize+parse entirely.
+   Measured: cheap repeated expressions **~6.5x faster** (671 -> 103 ns for
+   `1 + 1`; tokenize+parse of even a 5-char expression costs ~3.2 us).
+3. **E3 — FxHash for internal maps** (05): vendored `src/fasthash.rs`
+   (`FastHashMap`/`FastHashSet`) — keeps the zero-dependency property that
+   adding `rustc-hash` would break. Applied to `Document.attribute_nodes`
+   (hot on XPath attribute axis and `prepare_xpath`) and internal NodeId sets.
+   Entity maps and namespace-prefix maps/sets retain randomized standard-library
+   hashing because their string keys come from XML input. The `fasthash` module
+   is private and is not part of the supported public API.
+4. **E4 — build profiles** (09): `[profile.release]` (fat LTO, codegen-units 1,
+   strip), `[profile.dev] debug = "line-tables-only"`, and a
+   `[profile.profiling]` for flamegraph sessions. Note: consumers building
+   uppsala as a dependency govern their own profile; copy the release shape
+   (LTO + codegen-units) if you want the same code in your binary.
+
+### Results (criterion medians, full before/after, same machine)
+
+These measurements predate the security-review corrections to traversal,
+cache limits, and string hashing above; they have not been remeasured. The
+preparation benchmark now times only `prepare_xpath()` on a fresh, unprepared
+document per iteration, with parsing and destruction outside the timed routine.
+Its historical results below included those costs and are not directly
+comparable with the corrected benchmark.
+
+| Benchmark | before | after | Delta |
+|---|---:|---:|---:|
+| traverse/descendants | 16.8 us | 4.3 us | **-74%** |
+| xpath/repeat_cheap (cached eval) | 671 ns | 110 ns | **-84%** |
+| xpath/repeat_position | 103.9 us | 81.2 us | **-22%** |
+| prepare/attribute_nodes (attr_heavy) | 1155 us | 920 us | **-20%** |
+| serialize/saml | 192 us | 158 us | -18% |
+| pull/to_dom_saml | 289 us | 233 us | -19% |
+| xpath/oneshot_axis | 70.7 us | 61.6 us | -13% |
+| xpath/repeat_axis | 86.7 us | 77.2 us | -11% |
+| traverse/children_root | 41.4 ns | 32.2 ns | -22% |
+| pull/scan_saml | 274 us | 258 us | -6% |
+| parse/* (parser untouched) | — | — | noise |
+
+Reproduce:
+
+```sh
+cargo bench --bench uppsala -- --baseline u0full   # if the baseline exists
+cargo bench --bench uppsala                        # absolute numbers
+```
