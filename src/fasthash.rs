@@ -105,11 +105,11 @@ mod tests {
 
     #[test]
     fn write_matches_bytes() {
-        // write_usize(5) on a 64-bit target hashes the same 8 bytes.
+        // write_u64(5) hashes the same 8 bytes on every target.
         let mut a = FxHasher::default();
-        a.write_usize(5);
+        a.write_u64(5);
         let mut b = FxHasher::default();
-        b.write(&5usize.to_le_bytes());
+        b.write(&5u64.to_le_bytes());
         assert_eq!(a.finish(), b.finish());
     }
 

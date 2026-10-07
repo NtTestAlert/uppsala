@@ -99,7 +99,8 @@ fn bench_xpath(c: &mut Criterion) {
     // Fresh evaluator per call: measures parse+tokenize+eval (one-shot usage).
     group.bench_function("oneshot_axis", |b| {
         b.iter(|| {
-            let ev = uppsala::XPathEvaluator::new();
+            let mut ev = uppsala::XPathEvaluator::new();
+            ev.add_namespace("saml", "urn:oasis:names:tc:SAML:2.0:assertion");
             black_box(
                 ev.select_nodes(
                     black_box(&doc),
