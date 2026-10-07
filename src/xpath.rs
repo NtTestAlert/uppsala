@@ -2126,9 +2126,9 @@ fn select_axis(axis: &Axis, node: NodeId, ctx: &EvalContext) -> XmlResult<Vec<No
     let doc = ctx.doc;
     match axis {
         Axis::Child => {
-            // Zero-allocation iteration into a right-sized result: the old
-            // `doc.children(node)` allocated an intermediate Vec per call,
-            // and child-axis is the most frequent axis in practice.
+            // Count children and check the budget before allocating the result.
+            // Exact capacity avoids Vec growth, at the cost of traversing the
+            // sibling list twice instead of once as doc.children(node) does.
             let count = doc.children_count(node);
             ctx.budget.charge(count)?;
             let mut nodes = Vec::with_capacity(count);
