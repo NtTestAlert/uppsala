@@ -193,20 +193,9 @@ fn bench_xpath_shapes(c: &mut Criterion) {
         });
     }
     let unprepared = uppsala::parse(&xml).unwrap();
-    let unprepared_root = unprepared.document_element().unwrap();
-    assert_eq!(
-        ev.select_nodes(&unprepared, unprepared_root, "*")
-            .unwrap()
-            .len(),
-        1024
-    );
+    assert_eq!(ev.select_nodes(&unprepared, root, "*").unwrap().len(), 1024);
     group.bench_function("unprepared_children", |b| {
-        b.iter(|| {
-            black_box(
-                ev.select_nodes(black_box(&unprepared), unprepared_root, "*")
-                    .unwrap(),
-            )
-        });
+        b.iter(|| black_box(ev.select_nodes(black_box(&unprepared), root, "*").unwrap()));
     });
     group.finish();
 }

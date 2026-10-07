@@ -13,41 +13,72 @@ small documents are dominated by fixed parser and allocation overhead.
 
 ## Current libxml2 comparison
 
-The tables below compare a native x86_64 server build of Uppsala against a
-local sibling checkout of libxml2, called directly through `xmlReadMemory`.
-The harness reports median parse time from in-memory strings; file I/O and
-process startup are not included.
+The tables below compare Uppsala against a local sibling checkout of libxml2,
+called directly through `xmlReadMemory`. The harness reports median parse time
+from in-memory strings; file I/O and process startup are not included.
 
-Build setup used for these numbers (`just bench-libxml2 101`):
+Measured 2026-10-08 after ADR 0019 restored direct DOM construction (the
+0.9.0 to 0.12.0 releases routed `Parser::parse` through pull events and were
+roughly 2x slower on node-dense inputs; see the ADR for the before/after).
+
+Build setup used for these numbers:
 
 - Uppsala: `RUSTFLAGS='-C target-cpu=native' cargo build --release`
-- libxml2: static release library from `../libxml2`, built with
-  `-O3 -DNDEBUG -fno-semantic-interposition -march=native`
-- CPU pinning: `taskset -c 0`
+- libxml2: static release library from `../libxml2` (commit `c8eaf223`,
+  2026-07-02), built with `-O3 -DNDEBUG -fno-semantic-interposition -march=native`
+- CPU pinning: `taskset -c <core>`
 
-The `Ratio` column is `libxml2 / Uppsala`; values above `1.0` mean Uppsala
-parsed faster.
+The `Ratio` columns are `libxml2 / Uppsala`; values above `1.0` mean Uppsala
+parsed faster. `Uppsala ns` is the stable namespace-aware `Parser::parse`,
+`no-ns` disables namespace resolution, `Pull scan` drains the `PullParser`
+event stream without a DOM, and `Pull DOM` is `document_from_pull` (the
+explicit event-to-DOM path, kept for differential tests and expected to be
+slower than `Parser::parse`).
 
-### Full libxml2 report
+### Server: AMD EPYC 7551 (4 vCPU VM, Debian 13), 301 samples
 
-The report includes SAML-shaped request/response documents, larger generated
-real-life-shaped XML documents, one local pyFF metadata fixture, and two larger
-fixtures from the libxml2 checkout.
+| Input | Size | Uppsala ns | Uppsala no-ns | Pull scan | Pull DOM | libxml2 | Ratio ns | Ratio no-ns |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SAML small | 3.4 KB | 17.2 us | 16.1 us | 20.0 us | 24.9 us | 55.2 us | 3.21x | 3.43x |
+| SAML medium | 8.9 KB | 39.3 us | 35.9 us | 42.7 us | 55.6 us | 119.0 us | 3.03x | 3.32x |
+| SAML large | 27.2 KB | 113.1 us | 104.4 us | 123.9 us | 159.4 us | 341.6 us | 3.02x | 3.27x |
+| SAML metadata aggregate | 666.3 KB | 3.985 ms | 3.666 ms | 4.117 ms | 5.439 ms | 8.999 ms | 2.26x | 2.45x |
+| Atom feed archive | 848.2 KB | 6.808 ms | 6.936 ms | 6.400 ms | 9.517 ms | 13.431 ms | 1.97x | 1.94x |
+| SOAP invoice batch | 715.2 KB | 5.870 ms | 5.564 ms | 6.573 ms | 9.560 ms | 11.734 ms | 2.00x | 2.11x |
+| pyFF sample metadata | 3.5 KB | 23.5 us | 17.9 us | 21.3 us | 33.8 us | 66.7 us | 2.84x | 3.73x |
+| libxml2 `nvdcve_0.xml` | 287.4 KB | 2.705 ms | 2.706 ms | 2.465 ms | 3.392 ms | 4.905 ms | 1.81x | 1.81x |
+| libxml2 `comps_0.xml` | 607.9 KB | 5.472 ms | 5.784 ms | 5.117 ms | 8.796 ms | 10.489 ms | 1.92x | 1.81x |
 
-| Input | Size | Uppsala ns | Uppsala no-ns | libxml2 | Ratio ns | Ratio no-ns |
-|---|---:|---:|---:|---:|---:|---:|
-| SAML small | 3.4 KB | 9.494 us | 6.053 us | 23.435 us | 2.47x | 3.87x |
-| SAML medium | 8.9 KB | 16.169 us | 19.331 us | 75.494 us | 4.67x | 3.91x |
-| SAML large | 27.2 KB | 64.384 us | 39.515 us | 161.087 us | 2.50x | 4.08x |
-| SAML metadata aggregate | 666.3 KB | 2.000 ms | 1.794 ms | 4.506 ms | 2.25x | 2.51x |
-| Atom feed archive | 848.2 KB | 3.573 ms | 3.342 ms | 6.310 ms | 1.77x | 1.89x |
-| SOAP invoice batch | 715.2 KB | 3.568 ms | 3.350 ms | 5.753 ms | 1.61x | 1.72x |
-| pyFF sample metadata | 3.5 KB | 12.178 us | 10.712 us | 37.922 us | 3.11x | 3.54x |
-| libxml2 `nvdcve_0.xml` | 287.4 KB | 1.442 ms | 1.385 ms | 2.571 ms | 1.78x | 1.86x |
-| libxml2 `comps_0.xml` | 607.9 KB | 2.990 ms | 2.996 ms | 5.658 ms | 1.89x | 1.89x |
+This VM is shared; timings for inputs under 30 KB vary by up to 2x between
+runs (libxml2 included), so the large rows are the reliable ones.
+
+### Laptop: Intel Core Ultra 7 155H, 101 samples
+
+| Input | Size | Uppsala ns | Uppsala no-ns | Pull scan | Pull DOM | libxml2 | Ratio ns | Ratio no-ns |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SAML small | 3.4 KB | 17.0 us | 15.3 us | 18.6 us | 26.5 us | 64.0 us | 3.77x | 4.19x |
+| SAML medium | 8.9 KB | 39.1 us | 35.6 us | 40.5 us | 62.6 us | 133.5 us | 3.42x | 3.75x |
+| SAML large | 27.2 KB | 121.1 us | 103.5 us | 116.5 us | 181.3 us | 350.0 us | 2.89x | 3.38x |
+| SAML metadata aggregate | 666.3 KB | 3.601 ms | 3.439 ms | 3.779 ms | 5.673 ms | 8.502 ms | 2.36x | 2.47x |
+| Atom feed archive | 848.2 KB | 6.238 ms | 6.108 ms | 7.323 ms | 12.288 ms | 11.818 ms | 1.89x | 1.93x |
+| SOAP invoice batch | 715.2 KB | 6.197 ms | 5.983 ms | 6.905 ms | 11.205 ms | 10.608 ms | 1.71x | 1.77x |
+| pyFF sample metadata | 3.5 KB | 23.4 us | 21.8 us | 25.3 us | 38.2 us | 73.4 us | 3.14x | 3.37x |
+| libxml2 `nvdcve_0.xml` | 287.4 KB | 2.778 ms | 2.739 ms | 2.555 ms | 4.040 ms | 5.024 ms | 1.81x | 1.83x |
+| libxml2 `comps_0.xml` | 607.9 KB | 5.861 ms | 5.802 ms | 6.623 ms | 11.422 ms | 10.660 ms | 1.82x | 1.84x |
+
+Real SAML files on the same laptop (1001 samples; eduGAIN 5 samples):
+
+| Input | Size | Uppsala ns | libxml2 | Ratio |
+|---|---:|---:|---:|---:|
+| saml-authn-request.xml | 3.7 KB | 10.1 us | 35.4 us | 3.50x |
+| saml-metadata.xml | 5.2 KB | 14.8 us | 48.2 us | 3.26x |
+| saml-response.xml | 11.5 KB | 38.4 us | 126.0 us | 3.28x |
+| eduGAIN aggregate | 91.9 MB | 711 ms | 1060 ms | 1.49x |
 
 These are local measurements, not a universal claim. Re-run the harness on the
-target server class before making capacity decisions.
+target server class before making capacity decisions, and re-run it after any
+change to the parse path (ADR 0019 records a 2x regression that went unnoticed
+for three months because the table was not re-measured).
 
 ## Running the performance harness
 

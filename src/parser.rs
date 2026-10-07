@@ -124,18 +124,16 @@ impl Parser {
     }
 
     /// Parse an XML string into a [`Document`].
+    ///
+    /// Drives the shared tokenizer straight into the arena (see
+    /// `pull::build_document`); no pull event is materialized per node.
     pub fn parse<'a>(&self, input: &'a str) -> XmlResult<Document<'a>> {
-        let mut pull = if self.namespace_aware {
-            crate::pull::PullParser::new(input)
-        } else {
-            crate::pull::PullParser::with_namespace_aware(input, false)
-        };
-        pull = pull
+        let tokenizer = crate::pull::Tokenizer::new(input, self.namespace_aware)
             .with_max_depth(self.max_depth)
             .with_max_entity_expansion(self.max_entity_expansion)
             .with_forbid_dtd(self.forbid_dtd)
             .with_forbid_entities(self.forbid_entities);
-        crate::pull::document_from_pull(input, pull)
+        crate::pull::build_document(input, tokenizer)
     }
 }
 
@@ -1240,13 +1238,11 @@ pub(crate) fn parse_pi<'a>(cursor: &mut Cursor<'a>) -> XmlResult<ProcessingInstr
 /// charge against the same cap as document content.
 pub(crate) fn parse_doctype<'a>(
     cursor: &mut Cursor<'a>,
-    doc: &mut Document<'a>,
     entities: &mut EntityMap,
     entity_budget: &mut usize,
     forbid_entities: bool,
     max_depth: u32,
 ) -> XmlResult<()> {
-    let start_pos = cursor.pos;
     cursor.expect("<!DOCTYPE")?;
 
     // Must have whitespace after <!DOCTYPE
@@ -1307,10 +1303,9 @@ pub(crate) fn parse_doctype<'a>(
         cursor.skip_whitespace();
     }
 
-    // Must end with >
+    // Must end with >. The caller captures the raw DOCTYPE text from the
+    // cursor range for round-trip serialization.
     cursor.expect(">")?;
-    // Capture the raw DOCTYPE text for round-trip serialization (borrowed from input)
-    doc.doctype = Some(Cow::Borrowed(&cursor.input[start_pos..cursor.pos]));
     Ok(())
 }
 

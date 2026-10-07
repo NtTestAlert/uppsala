@@ -1,14 +1,30 @@
-//! Pull-based XML event parser.
+//! Pull-based XML event parser and the shared tokenizer behind it.
 //!
-//! This module exposes the parser's token/event stream without forcing callers
-//! to build a full [`Document`](crate::Document). It reuses the same scanner and
-//! well-formedness helpers as the DOM parser, while maintaining its own explicit
-//! element stack.
+//! The module has three layers:
+//!
+//! 1. `Tokenizer` (crate-private): the prolog/content/trailing state machine,
+//!    start-tag scanning with namespace checks and QName resolution, text-run
+//!    scanning, and the open-element stack. It is driven one syntactic unit at
+//!    a time and reports each unit to a `TokenSink`.
+//! 2. [`PullParser`] (public): drives the tokenizer with a sink that turns
+//!    tokens into [`PullEvent`]s, buffered so one tag can yield several events
+//!    (namespace bindings, self-closing elements).
+//! 3. `DomSink` (crate-private): a sink that allocates arena nodes directly.
+//!    [`Parser::parse`](crate::Parser::parse) uses it, so the DOM path never
+//!    materializes a `PullEvent`. [`document_from_pull`](crate::pull::document_from_pull)
+//!    remains the explicit
+//!    event-stream-to-DOM path used by the differential tests.
+//!
+//! Both sinks share one tokenizer, so well-formedness checks, namespace rules,
+//! entity-expansion budgets, and depth limits have a single implementation.
+//! See ADR 0019 for why the DOM path does not consume events.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
-use crate::dom::{Attribute, Document, Element, ProcessingInstruction, QName, XmlDeclaration};
+use crate::dom::{
+    Attribute, Document, Element, NodeId, NodeKind, ProcessingInstruction, QName, XmlDeclaration,
+};
 use crate::error::{XmlError, XmlResult};
 use crate::namespace::NamespaceResolver;
 use crate::parser::{
@@ -107,6 +123,36 @@ pub enum PullEvent<'a> {
     },
 }
 
+/// Receiver for the syntactic units produced by [`Tokenizer::step`].
+///
+/// A sink is called at most a few times per step: a self-closing tag produces
+/// `start_element` immediately followed by `end_element`; everything else is
+/// one call. Sinks never fail: structural errors are the tokenizer's job, and
+/// end-of-document checks belong to whoever drives the tokenizer to completion.
+pub(crate) trait TokenSink<'a> {
+    fn xml_declaration(&mut self, decl: XmlDeclaration<'a>);
+    fn doctype(&mut self, raw: Cow<'a, str>);
+    fn start_element(
+        &mut self,
+        name: QName<'a>,
+        attributes: Vec<Attribute<'a>>,
+        namespace_declarations: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        byte_start: usize,
+        byte_end: usize,
+        depth: u32,
+    );
+    fn end_element(&mut self, byte_start: usize, byte_end: usize, depth: u32);
+    fn text(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize);
+    fn cdata(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize);
+    fn comment(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize);
+    fn processing_instruction(
+        &mut self,
+        pi: ProcessingInstruction<'a>,
+        byte_start: usize,
+        byte_end: usize,
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Start,
@@ -116,19 +162,20 @@ enum Phase {
     Done,
 }
 
-#[derive(Debug, Clone)]
+/// What the tokenizer must remember about an open element: the raw tag name
+/// for end-tag matching and whether this element pushed a namespace scope.
+/// Anything a sink needs (resolved name, node id, namespace count) lives on the
+/// sink's own stack.
+#[derive(Debug)]
 struct OpenElement<'a> {
     raw_name: Cow<'a, str>,
-    name: QName<'a>,
     pushed_ns_scope: bool,
-    namespace_count: usize,
-    depth: u32,
 }
 
-/// XML pull parser over a complete decoded string.
-pub struct PullParser<'a> {
+/// Shared XML tokenizer: one syntactic unit per [`Tokenizer::step`], reported
+/// to a [`TokenSink`]. Fuses to the done state after any error.
+pub(crate) struct Tokenizer<'a> {
     cursor: Cursor<'a>,
-    namespace_aware: bool,
     max_depth: u32,
     forbid_dtd: bool,
     forbid_entities: bool,
@@ -138,23 +185,13 @@ pub struct PullParser<'a> {
     entity_cache: EntityCache,
     entity_budget: usize,
     stack: Vec<OpenElement<'a>>,
-    pending: VecDeque<PullEvent<'a>>,
     phase: Phase,
-    scratch_doc: Document<'a>,
 }
 
-impl<'a> PullParser<'a> {
-    /// Create a new pull parser with namespace awareness enabled and default
-    /// safety limits.
-    pub fn new(input: &'a str) -> Self {
-        Self::with_namespace_aware(input, true)
-    }
-
-    /// Create a new pull parser with configurable namespace awareness.
-    pub fn with_namespace_aware(input: &'a str, namespace_aware: bool) -> Self {
-        PullParser {
+impl<'a> Tokenizer<'a> {
+    pub(crate) fn new(input: &'a str, namespace_aware: bool) -> Self {
+        Tokenizer {
             cursor: Cursor::new(input),
-            namespace_aware,
             max_depth: DEFAULT_MAX_DEPTH,
             forbid_dtd: false,
             forbid_entities: false,
@@ -164,217 +201,198 @@ impl<'a> PullParser<'a> {
             entity_cache: EntityCache::default(),
             entity_budget: DEFAULT_MAX_ENTITY_EXPANSION,
             stack: Vec::new(),
-            pending: VecDeque::new(),
             phase: Phase::Start,
-            scratch_doc: Document::new(),
         }
     }
 
-    /// Override the maximum element-nesting depth.
-    pub fn with_max_depth(mut self, max_depth: u32) -> Self {
+    pub(crate) fn with_max_depth(mut self, max_depth: u32) -> Self {
         self.max_depth = max_depth;
         self
     }
 
-    /// Override the maximum total bytes of entity expansion.
-    pub fn with_max_entity_expansion(mut self, max_bytes: usize) -> Self {
+    pub(crate) fn with_max_entity_expansion(mut self, max_bytes: usize) -> Self {
         self.entity_budget = max_bytes;
         self
     }
 
-    /// Reject any `<!DOCTYPE` declaration at parse time.
-    pub fn with_forbid_dtd(mut self, forbid: bool) -> Self {
+    pub(crate) fn with_forbid_dtd(mut self, forbid: bool) -> Self {
         self.forbid_dtd = forbid;
         self
     }
 
-    /// Reject `<!ENTITY>` declarations inside a DTD.
-    pub fn with_forbid_entities(mut self, forbid: bool) -> Self {
+    pub(crate) fn with_forbid_entities(mut self, forbid: bool) -> Self {
         self.forbid_entities = forbid;
         self
     }
 
-    /// Return the next event, or `Ok(None)` at end of document.
-    pub fn next_event(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
+    /// Consume one syntactic unit and report it to `sink`.
+    ///
+    /// Returns `Ok(true)` while more input may follow and `Ok(false)` once the
+    /// document is complete. After an error the tokenizer is fused: further
+    /// calls return `Ok(false)`.
+    #[inline]
+    pub(crate) fn step<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<bool> {
         if self.phase == Phase::Done {
-            return Ok(None);
+            return Ok(false);
         }
-
-        match self.next_event_inner() {
-            Ok(event) => Ok(event),
+        match self.step_inner(sink) {
+            Ok(more) => Ok(more),
             Err(err) => {
                 self.phase = Phase::Done;
-                self.pending.clear();
                 self.stack.clear();
                 Err(err)
             }
         }
     }
 
-    fn next_event_inner(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(Some(event));
-            }
-
-            match self.phase {
-                Phase::Start => {
-                    self.cursor.skip_bom();
-                    self.phase = Phase::Prolog;
-                    if self.cursor.starts_with("<?xml ")
-                        || self.cursor.starts_with("<?xml\t")
-                        || self.cursor.starts_with("<?xml\r")
-                        || self.cursor.starts_with("<?xml\n")
-                    {
-                        let decl = parse_xml_declaration(&mut self.cursor)?;
-                        return Ok(Some(PullEvent::XmlDeclaration(decl)));
-                    }
+    fn step_inner<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<bool> {
+        match self.phase {
+            Phase::Start => {
+                self.cursor.skip_bom();
+                self.phase = Phase::Prolog;
+                if self.cursor.starts_with("<?xml ")
+                    || self.cursor.starts_with("<?xml\t")
+                    || self.cursor.starts_with("<?xml\r")
+                    || self.cursor.starts_with("<?xml\n")
+                {
+                    let decl = parse_xml_declaration(&mut self.cursor)?;
+                    sink.xml_declaration(decl);
                 }
-                Phase::Prolog => {
-                    self.cursor.skip_whitespace();
-                    if self.cursor.is_eof() {
-                        return Err(XmlError::well_formedness(
-                            "Document must have a root element",
-                            0,
-                            0,
-                        ));
-                    }
-                    if self.cursor.starts_with("<!--") {
-                        return self.parse_comment_event();
-                    }
-                    if self.cursor.starts_with("<?") {
-                        return self.parse_pi_event();
-                    }
-                    if self.cursor.starts_with("<!DOCTYPE") {
-                        if self.forbid_dtd {
-                            return Err(XmlError::parse(
-                                "DOCTYPE declarations are not allowed (forbid_dtd)",
-                                self.cursor.line(),
-                                self.cursor.column(),
-                            ));
-                        }
-                        if self.seen_doctype {
-                            return Err(XmlError::well_formedness(
-                                "Only one DOCTYPE declaration is allowed",
-                                self.cursor.line(),
-                                self.cursor.column(),
-                            ));
-                        }
-                        let start = self.cursor.pos;
-                        parse_doctype(
-                            &mut self.cursor,
-                            &mut self.scratch_doc,
-                            &mut self.entities,
-                            &mut self.entity_budget,
-                            self.forbid_entities,
-                            self.max_depth,
-                        )?;
-                        self.seen_doctype = true;
-                        return Ok(Some(PullEvent::Doctype(Cow::Borrowed(
-                            &self.cursor.input[start..self.cursor.pos],
-                        ))));
-                    }
-                    if self.cursor.starts_with("<") {
-                        self.parse_start_element()?;
-                        self.phase = Phase::Content;
-                        continue;
-                    }
+                Ok(true)
+            }
+            Phase::Prolog => {
+                self.cursor.skip_whitespace();
+                if self.cursor.is_eof() {
                     return Err(XmlError::well_formedness(
-                        "Content found outside of root element",
-                        self.cursor.line(),
-                        self.cursor.column(),
+                        "Document must have a root element",
+                        0,
+                        0,
                     ));
                 }
-                Phase::Content => {
-                    if self.stack.is_empty() {
-                        self.phase = Phase::Trailing;
-                        continue;
-                    }
-                    if self.cursor.starts_with("</") {
-                        self.parse_end_element()?;
-                        continue;
-                    }
-                    if self.cursor.starts_with("<![CDATA[") {
-                        return self.parse_cdata_event();
-                    }
-                    if self.cursor.starts_with("<!--") {
-                        return self.parse_comment_event();
-                    }
-                    if self.cursor.starts_with("<?") {
-                        return self.parse_pi_event();
-                    }
-                    if self.cursor.starts_with("<") {
-                        self.parse_start_element()?;
-                        continue;
-                    }
-                    // A text run can produce no event (e.g. an entity that
-                    // expands to nothing); that is not end-of-document.
-                    match self.parse_text_event()? {
-                        Some(event) => return Ok(Some(event)),
-                        None => continue,
-                    }
+                if self.cursor.starts_with("<!--") {
+                    self.scan_comment(sink)?;
+                    return Ok(true);
                 }
-                Phase::Trailing => {
-                    self.cursor.skip_whitespace();
-                    if self.cursor.is_eof() {
-                        self.phase = Phase::Done;
-                        return Ok(None);
-                    }
-                    if self.cursor.starts_with("<!--") {
-                        return self.parse_comment_event();
-                    }
-                    if self.cursor.starts_with("<?") {
-                        return self.parse_pi_event();
-                    }
-                    if self.cursor.starts_with("<") {
-                        return Err(XmlError::well_formedness(
-                            "Only one root element is allowed",
+                if self.cursor.starts_with("<?") {
+                    self.scan_pi(sink)?;
+                    return Ok(true);
+                }
+                if self.cursor.starts_with("<!DOCTYPE") {
+                    if self.forbid_dtd {
+                        return Err(XmlError::parse(
+                            "DOCTYPE declarations are not allowed (forbid_dtd)",
                             self.cursor.line(),
                             self.cursor.column(),
                         ));
                     }
+                    if self.seen_doctype {
+                        return Err(XmlError::well_formedness(
+                            "Only one DOCTYPE declaration is allowed",
+                            self.cursor.line(),
+                            self.cursor.column(),
+                        ));
+                    }
+                    let start = self.cursor.pos;
+                    parse_doctype(
+                        &mut self.cursor,
+                        &mut self.entities,
+                        &mut self.entity_budget,
+                        self.forbid_entities,
+                        self.max_depth,
+                    )?;
+                    self.seen_doctype = true;
+                    sink.doctype(Cow::Borrowed(&self.cursor.input[start..self.cursor.pos]));
+                    return Ok(true);
+                }
+                if self.cursor.starts_with("<") {
+                    self.scan_start_element(sink)?;
+                    self.phase = Phase::Content;
+                    return Ok(true);
+                }
+                Err(XmlError::well_formedness(
+                    "Content found outside of root element",
+                    self.cursor.line(),
+                    self.cursor.column(),
+                ))
+            }
+            Phase::Content => {
+                if self.stack.is_empty() {
+                    self.phase = Phase::Trailing;
+                    return Ok(true);
+                }
+                let bytes = self.cursor.input.as_bytes();
+                if bytes.get(self.cursor.pos) == Some(&b'<') {
+                    if self.cursor.starts_with("</") {
+                        self.scan_end_element(sink)?;
+                    } else if self.cursor.starts_with("<![CDATA[") {
+                        self.scan_cdata(sink)?;
+                    } else if self.cursor.starts_with("<!--") {
+                        self.scan_comment(sink)?;
+                    } else if self.cursor.starts_with("<?") {
+                        self.scan_pi(sink)?;
+                    } else {
+                        self.scan_start_element(sink)?;
+                    }
+                } else {
+                    // A text run can produce no token (e.g. an entity that
+                    // expands to nothing); that is not end-of-document.
+                    self.scan_text(sink)?;
+                }
+                Ok(true)
+            }
+            Phase::Trailing => {
+                self.cursor.skip_whitespace();
+                if self.cursor.is_eof() {
+                    self.phase = Phase::Done;
+                    return Ok(false);
+                }
+                if self.cursor.starts_with("<!--") {
+                    self.scan_comment(sink)?;
+                    return Ok(true);
+                }
+                if self.cursor.starts_with("<?") {
+                    self.scan_pi(sink)?;
+                    return Ok(true);
+                }
+                if self.cursor.starts_with("<") {
                     return Err(XmlError::well_formedness(
-                        "Content found outside of root element",
+                        "Only one root element is allowed",
                         self.cursor.line(),
                         self.cursor.column(),
                     ));
                 }
-                Phase::Done => return Ok(None),
+                Err(XmlError::well_formedness(
+                    "Content found outside of root element",
+                    self.cursor.line(),
+                    self.cursor.column(),
+                ))
             }
+            Phase::Done => Ok(false),
         }
     }
 
-    fn parse_comment_event(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
+    fn scan_comment<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<()> {
         let start = self.cursor.pos;
         let content = parse_comment(&mut self.cursor)?;
-        Ok(Some(PullEvent::Comment {
-            content,
-            byte_start: start,
-            byte_end: self.cursor.pos,
-        }))
+        sink.comment(content, start, self.cursor.pos);
+        Ok(())
     }
 
-    fn parse_pi_event(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
+    fn scan_pi<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<()> {
         let start = self.cursor.pos;
         let pi = parse_pi(&mut self.cursor)?;
-        Ok(Some(PullEvent::ProcessingInstruction {
-            pi,
-            byte_start: start,
-            byte_end: self.cursor.pos,
-        }))
+        sink.processing_instruction(pi, start, self.cursor.pos);
+        Ok(())
     }
 
-    fn parse_cdata_event(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
+    fn scan_cdata<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<()> {
         let start = self.cursor.pos;
         let content = parse_cdata(&mut self.cursor)?;
-        Ok(Some(PullEvent::CData {
-            content,
-            byte_start: start,
-            byte_end: self.cursor.pos,
-        }))
+        sink.cdata(content, start, self.cursor.pos);
+        Ok(())
     }
 
-    fn parse_text_event(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
+    fn scan_text<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<()> {
         enum TextBuf {
             Empty,
             Borrowed { start: usize },
@@ -416,19 +434,19 @@ impl<'a> PullParser<'a> {
                 }
             }
 
-            fn into_event<'a>(self, input: &'a str, end_pos: usize) -> Option<PullEvent<'a>> {
+            fn into_parts<'a>(
+                self,
+                input: &'a str,
+                end_pos: usize,
+            ) -> Option<(Cow<'a, str>, usize)> {
                 match self {
                     TextBuf::Empty => None,
-                    TextBuf::Borrowed { start } if start < end_pos => Some(PullEvent::Text {
-                        content: Cow::Borrowed(&input[start..end_pos]),
-                        byte_start: start,
-                        byte_end: end_pos,
-                    }),
-                    TextBuf::Owned { start, text } if !text.is_empty() => Some(PullEvent::Text {
-                        content: Cow::Owned(text),
-                        byte_start: start,
-                        byte_end: end_pos,
-                    }),
+                    TextBuf::Borrowed { start } if start < end_pos => {
+                        Some((Cow::Borrowed(&input[start..end_pos]), start))
+                    }
+                    TextBuf::Owned { start, text } if !text.is_empty() => {
+                        Some((Cow::Owned(text), start))
+                    }
                     _ => None,
                 }
             }
@@ -474,7 +492,13 @@ impl<'a> PullParser<'a> {
             }
 
             match bytes[self.cursor.pos] {
-                b'<' => return Ok(text_buf.into_event(self.cursor.input, self.cursor.pos)),
+                b'<' => {
+                    let end = self.cursor.pos;
+                    if let Some((content, start)) = text_buf.into_parts(self.cursor.input, end) {
+                        sink.text(content, start, end);
+                    }
+                    return Ok(());
+                }
                 b'&' => {
                     let before_pos = self.cursor.pos;
                     let resolved = parse_reference_with_entities(
@@ -547,7 +571,7 @@ impl<'a> PullParser<'a> {
         }
     }
 
-    fn parse_start_element(&mut self) -> XmlResult<()> {
+    fn scan_start_element<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<()> {
         let depth = self.stack.len() as u32;
         if depth >= self.max_depth {
             return Err(XmlError::parse(
@@ -564,7 +588,7 @@ impl<'a> PullParser<'a> {
         self.cursor.expect("<")?;
         let tag_name = parse_name(&mut self.cursor)?;
 
-        let mut raw_attrs: Vec<(Cow<'a, str>, Cow<'a, str>)> = Vec::with_capacity(8);
+        let mut raw_attrs: Vec<(Cow<'a, str>, Cow<'a, str>)> = Vec::new();
         let mut ns_decls: Vec<(Cow<'a, str>, Cow<'a, str>)> = Vec::new();
 
         loop {
@@ -687,10 +711,10 @@ impl<'a> PullParser<'a> {
         // Resolve names and consume the tag close. Every step here is fallible
         // (undeclared prefix, duplicate attribute, missing `>`), and we have
         // already pushed a namespace scope above — so any error must unwind
-        // that scope to keep `push_scope`/`pop_scope` balanced. `next_event`
-        // fuses the parser to `Done` on error today, which hides an unbalanced
-        // resolver, but the balance must not depend on that: keep it correct so
-        // the resolver stays reusable and the parser could become resumable.
+        // that scope to keep `push_scope`/`pop_scope` balanced. `step` fuses
+        // the tokenizer on error today, which hides an unbalanced resolver,
+        // but the balance must not depend on that: keep it correct so the
+        // resolver stays reusable and the tokenizer could become resumable.
         let (qname, resolved_attrs, self_closing, byte_end) =
             match self.resolve_and_close_start_tag(&tag_name, raw_attrs) {
                 Ok(parts) => parts,
@@ -704,52 +728,19 @@ impl<'a> PullParser<'a> {
                 }
             };
 
-        if self.namespace_aware {
-            for (prefix, uri) in &ns_decls {
-                self.pending.push_back(PullEvent::StartNamespace {
-                    prefix: if prefix.is_empty() {
-                        None
-                    } else {
-                        Some(prefix.clone())
-                    },
-                    uri: uri.clone(),
-                });
-            }
-        }
-
-        self.pending.push_back(PullEvent::StartElement {
-            name: qname.clone(),
-            attributes: resolved_attrs,
-            namespace_declarations: ns_decls.clone(),
-            byte_start: start_pos,
-            byte_end,
-            depth,
-        });
+        sink.start_element(qname, resolved_attrs, ns_decls, start_pos, byte_end, depth);
 
         if self_closing {
-            self.pending.push_back(PullEvent::EndElement {
-                name: qname,
-                byte_start: start_pos,
-                byte_end,
-                depth,
-            });
+            sink.end_element(start_pos, byte_end, depth);
             if pushed_ns_scope {
                 if let Some(resolver) = self.ns_resolver.as_mut() {
                     resolver.pop_scope();
                 }
             }
-            if self.namespace_aware {
-                for _ in 0..ns_decls.len() {
-                    self.pending.push_back(PullEvent::EndNamespace);
-                }
-            }
         } else {
             self.stack.push(OpenElement {
                 raw_name: tag_name,
-                name: qname,
                 pushed_ns_scope,
-                namespace_count: ns_decls.len(),
-                depth,
             });
         }
         Ok(())
@@ -757,7 +748,7 @@ impl<'a> PullParser<'a> {
 
     /// Resolve the element and attribute QNames against the current namespace
     /// scope and consume the tag's `>` or `/>`. Split out from
-    /// [`Self::parse_start_element`] so its single caller can unwind a
+    /// [`Self::scan_start_element`] so its single caller can unwind a
     /// just-pushed namespace scope on any error (see the call site). Returns
     /// the resolved name, resolved attributes, whether the tag self-closes, and
     /// the byte offset immediately after the close.
@@ -839,7 +830,7 @@ impl<'a> PullParser<'a> {
         Ok((qname, resolved_attrs, self_closing, byte_end))
     }
 
-    fn parse_end_element(&mut self) -> XmlResult<()> {
+    fn scan_end_element<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<()> {
         let Some(open) = self.stack.pop() else {
             return Err(XmlError::well_formedness(
                 "Unexpected end tag",
@@ -863,23 +854,193 @@ impl<'a> PullParser<'a> {
             ));
         }
 
-        self.pending.push_back(PullEvent::EndElement {
-            name: open.name,
-            byte_start: start,
-            byte_end: self.cursor.pos,
-            depth: open.depth,
-        });
+        // After the pop, the stack length equals this element's depth.
+        sink.end_element(start, self.cursor.pos, self.stack.len() as u32);
         if open.pushed_ns_scope {
             if let Some(resolver) = self.ns_resolver.as_mut() {
                 resolver.pop_scope();
             }
         }
+        Ok(())
+    }
+}
+
+/// Sink that turns tokens into buffered [`PullEvent`]s.
+struct EventSink<'a> {
+    namespace_aware: bool,
+    pending: VecDeque<PullEvent<'a>>,
+    /// Resolved name and namespace-declaration count per open element, so
+    /// `EndElement` can carry the name and the matching `EndNamespace` count.
+    open: Vec<(QName<'a>, usize)>,
+}
+
+impl<'a> TokenSink<'a> for EventSink<'a> {
+    fn xml_declaration(&mut self, decl: XmlDeclaration<'a>) {
+        self.pending.push_back(PullEvent::XmlDeclaration(decl));
+    }
+
+    fn doctype(&mut self, raw: Cow<'a, str>) {
+        self.pending.push_back(PullEvent::Doctype(raw));
+    }
+
+    fn start_element(
+        &mut self,
+        name: QName<'a>,
+        attributes: Vec<Attribute<'a>>,
+        namespace_declarations: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        byte_start: usize,
+        byte_end: usize,
+        depth: u32,
+    ) {
         if self.namespace_aware {
-            for _ in 0..open.namespace_count {
+            for (prefix, uri) in &namespace_declarations {
+                self.pending.push_back(PullEvent::StartNamespace {
+                    prefix: if prefix.is_empty() {
+                        None
+                    } else {
+                        Some(prefix.clone())
+                    },
+                    uri: uri.clone(),
+                });
+            }
+        }
+        self.open.push((name.clone(), namespace_declarations.len()));
+        self.pending.push_back(PullEvent::StartElement {
+            name,
+            attributes,
+            namespace_declarations,
+            byte_start,
+            byte_end,
+            depth,
+        });
+    }
+
+    fn end_element(&mut self, byte_start: usize, byte_end: usize, depth: u32) {
+        // The tokenizer only reports an end for an element it reported a
+        // start for, so the stack is never empty here; if it ever were, there
+        // is no name to report and the event is dropped rather than invented.
+        let Some((name, namespace_count)) = self.open.pop() else {
+            return;
+        };
+        self.pending.push_back(PullEvent::EndElement {
+            name,
+            byte_start,
+            byte_end,
+            depth,
+        });
+        if self.namespace_aware {
+            for _ in 0..namespace_count {
                 self.pending.push_back(PullEvent::EndNamespace);
             }
         }
-        Ok(())
+    }
+
+    fn text(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize) {
+        self.pending.push_back(PullEvent::Text {
+            content,
+            byte_start,
+            byte_end,
+        });
+    }
+
+    fn cdata(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize) {
+        self.pending.push_back(PullEvent::CData {
+            content,
+            byte_start,
+            byte_end,
+        });
+    }
+
+    fn comment(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize) {
+        self.pending.push_back(PullEvent::Comment {
+            content,
+            byte_start,
+            byte_end,
+        });
+    }
+
+    fn processing_instruction(
+        &mut self,
+        pi: ProcessingInstruction<'a>,
+        byte_start: usize,
+        byte_end: usize,
+    ) {
+        self.pending.push_back(PullEvent::ProcessingInstruction {
+            pi,
+            byte_start,
+            byte_end,
+        });
+    }
+}
+
+/// XML pull parser over a complete decoded string.
+pub struct PullParser<'a> {
+    core: Tokenizer<'a>,
+    sink: EventSink<'a>,
+}
+
+impl<'a> PullParser<'a> {
+    /// Create a new pull parser with namespace awareness enabled and default
+    /// safety limits.
+    pub fn new(input: &'a str) -> Self {
+        Self::with_namespace_aware(input, true)
+    }
+
+    /// Create a new pull parser with configurable namespace awareness.
+    pub fn with_namespace_aware(input: &'a str, namespace_aware: bool) -> Self {
+        PullParser {
+            core: Tokenizer::new(input, namespace_aware),
+            sink: EventSink {
+                namespace_aware,
+                pending: VecDeque::new(),
+                open: Vec::new(),
+            },
+        }
+    }
+
+    /// Override the maximum element-nesting depth.
+    pub fn with_max_depth(mut self, max_depth: u32) -> Self {
+        self.core = self.core.with_max_depth(max_depth);
+        self
+    }
+
+    /// Override the maximum total bytes of entity expansion.
+    pub fn with_max_entity_expansion(mut self, max_bytes: usize) -> Self {
+        self.core = self.core.with_max_entity_expansion(max_bytes);
+        self
+    }
+
+    /// Reject any `<!DOCTYPE` declaration at parse time.
+    pub fn with_forbid_dtd(mut self, forbid: bool) -> Self {
+        self.core = self.core.with_forbid_dtd(forbid);
+        self
+    }
+
+    /// Reject `<!ENTITY>` declarations inside a DTD.
+    pub fn with_forbid_entities(mut self, forbid: bool) -> Self {
+        self.core = self.core.with_forbid_entities(forbid);
+        self
+    }
+
+    /// Return the next event, or `Ok(None)` at end of document.
+    ///
+    /// Fused after any error: once an error is returned, later calls return
+    /// `Ok(None)`.
+    pub fn next_event(&mut self) -> XmlResult<Option<PullEvent<'a>>> {
+        loop {
+            if let Some(event) = self.sink.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            match self.core.step(&mut self.sink) {
+                Ok(true) => continue,
+                Ok(false) => return Ok(None),
+                Err(err) => {
+                    self.sink.pending.clear();
+                    self.sink.open.clear();
+                    return Err(err);
+                }
+            }
+        }
     }
 }
 
@@ -895,121 +1056,224 @@ impl<'a> Iterator for PullParser<'a> {
     }
 }
 
+/// Sink that allocates arena nodes directly: each token becomes exactly one
+/// `NodeData` move into the arena, with no intermediate event value.
+struct DomSink<'a> {
+    doc: Document<'a>,
+    stack: Vec<NodeId>,
+}
+
+impl<'a> DomSink<'a> {
+    fn new(input: &'a str) -> Self {
+        let mut doc = Document::new();
+        doc.input = input;
+        // Pre-allocate based on input size. Markup-heavy documents such as
+        // plist files can be closer to 14 bytes per node once whitespace text
+        // nodes are included, so larger inputs use a denser estimate to avoid
+        // repeated arena growth during parsing.
+        //
+        // Use `try_reserve` (not `reserve`) so a hostile or simply huge input
+        // cannot trigger an aborting upfront allocation via the global
+        // allocation-error handler. The reservation is only a hint: if the
+        // dense estimate fails on a memory-constrained host, fall back to the
+        // sparser estimate, and if that also fails just proceed — parsing still
+        // succeeds by regrowing the arena on demand.
+        let dense = if input.len() >= 256 * 1024 {
+            input.len() / 14
+        } else {
+            input.len() / 40
+        };
+        let sparse = input.len() / 40;
+        if doc.nodes.try_reserve(dense).is_err() && dense != sparse {
+            let _ = doc.nodes.try_reserve(sparse);
+        }
+        let root = doc.root();
+        DomSink {
+            doc,
+            stack: vec![root],
+        }
+    }
+
+    #[inline]
+    fn parent(&self) -> NodeId {
+        match self.stack.last() {
+            Some(&id) => id,
+            None => self.doc.root(),
+        }
+    }
+
+    #[inline]
+    fn append_leaf(&mut self, kind: NodeKind<'a>, byte_start: usize, byte_end: usize) {
+        let parent = self.parent();
+        let id = self.doc.alloc_node(kind, byte_start);
+        self.doc.set_byte_end_pos(id, byte_end);
+        self.doc.append_child_unchecked(parent, id);
+    }
+
+    fn finish(self, input: &'a str) -> XmlResult<Document<'a>> {
+        let DomSink { mut doc, stack } = self;
+        if stack.len() != 1 {
+            return Err(XmlError::UnexpectedEof);
+        }
+        if doc.document_element().is_none() {
+            return Err(XmlError::well_formedness(
+                "Document must have a root element",
+                0,
+                0,
+            ));
+        }
+        let root = doc.root();
+        doc.set_byte_end_pos(root, input.len());
+        Ok(doc)
+    }
+}
+
+impl<'a> TokenSink<'a> for DomSink<'a> {
+    #[inline]
+    fn xml_declaration(&mut self, decl: XmlDeclaration<'a>) {
+        self.doc.xml_declaration = Some(decl);
+    }
+
+    #[inline]
+    fn doctype(&mut self, raw: Cow<'a, str>) {
+        self.doc.doctype = Some(raw);
+    }
+
+    #[inline]
+    fn start_element(
+        &mut self,
+        name: QName<'a>,
+        attributes: Vec<Attribute<'a>>,
+        namespace_declarations: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        byte_start: usize,
+        _byte_end: usize,
+        _depth: u32,
+    ) {
+        let parent = self.parent();
+        let id = self.doc.alloc_node(
+            NodeKind::Element(Element {
+                name,
+                attributes,
+                namespace_declarations,
+            }),
+            byte_start,
+        );
+        self.doc.append_child_unchecked(parent, id);
+        self.stack.push(id);
+    }
+
+    #[inline]
+    fn end_element(&mut self, _byte_start: usize, byte_end: usize, _depth: u32) {
+        // Never pop the document root: the tokenizer only reports an end for
+        // an element it reported a start for, so this guard is belt-and-braces.
+        if self.stack.len() > 1 {
+            if let Some(id) = self.stack.pop() {
+                self.doc.set_byte_end_pos(id, byte_end);
+            }
+        }
+    }
+
+    #[inline]
+    fn text(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize) {
+        self.append_leaf(NodeKind::Text(content), byte_start, byte_end);
+    }
+
+    #[inline]
+    fn cdata(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize) {
+        self.append_leaf(NodeKind::CData(content), byte_start, byte_end);
+    }
+
+    #[inline]
+    fn comment(&mut self, content: Cow<'a, str>, byte_start: usize, byte_end: usize) {
+        self.append_leaf(NodeKind::Comment(content), byte_start, byte_end);
+    }
+
+    #[inline]
+    fn processing_instruction(
+        &mut self,
+        pi: ProcessingInstruction<'a>,
+        byte_start: usize,
+        byte_end: usize,
+    ) {
+        self.append_leaf(NodeKind::ProcessingInstruction(pi), byte_start, byte_end);
+    }
+}
+
+/// Build a DOM by driving `tokenizer` straight into the arena. This is the
+/// path behind [`Parser::parse`](crate::Parser::parse): no `PullEvent` is
+/// constructed, buffered, or destructured per node.
+pub(crate) fn build_document<'a>(
+    input: &'a str,
+    mut tokenizer: Tokenizer<'a>,
+) -> XmlResult<Document<'a>> {
+    let mut sink = DomSink::new(input);
+    while tokenizer.step(&mut sink)? {}
+    sink.finish(input)
+}
+
 /// Build a DOM document from a stream of pull events.
 ///
-/// This is primarily useful for differential tests and for callers that want to
-/// share the pull parser's validation path while still materializing a DOM.
+/// This is the explicit event-stream-to-DOM path. It is primarily useful for
+/// differential tests and for callers that already hold a `PullParser` (for
+/// example after inspecting its first events) and want the rest of the
+/// document materialized. `Parser::parse` does not go through events: it
+/// drives the same tokenizer straight into the arena (`build_document`,
+/// crate-private), so this function is measurably slower and is not the way
+/// to parse a document you only want as a DOM.
 pub fn document_from_pull<'a>(
     input: &'a str,
     mut parser: PullParser<'a>,
 ) -> XmlResult<Document<'a>> {
-    let mut doc = Document::new();
-    doc.input = input;
-    let dense = if input.len() >= 256 * 1024 {
-        input.len() / 14
-    } else {
-        input.len() / 40
-    };
-    let sparse = input.len() / 40;
-    if doc.nodes.try_reserve(dense).is_err() && dense != sparse {
-        let _ = doc.nodes.try_reserve(sparse);
-    }
-    let root = doc.root();
-    let mut stack = vec![root];
-
-    fn current_parent(stack: &[crate::dom::NodeId]) -> XmlResult<crate::dom::NodeId> {
-        stack
-            .last()
-            .copied()
-            .ok_or_else(|| XmlError::well_formedness("DOM builder stack unexpectedly empty", 0, 0))
-    }
-
+    let mut sink = DomSink::new(input);
     while let Some(event) = parser.next_event()? {
         match event {
-            PullEvent::XmlDeclaration(decl) => doc.xml_declaration = Some(decl),
-            PullEvent::Doctype(dt) => doc.doctype = Some(dt),
+            PullEvent::XmlDeclaration(decl) => sink.xml_declaration(decl),
+            PullEvent::Doctype(dt) => sink.doctype(dt),
             PullEvent::StartNamespace { .. } | PullEvent::EndNamespace => {}
             PullEvent::StartElement {
                 name,
                 attributes,
                 namespace_declarations,
                 byte_start,
+                byte_end,
+                depth,
+            } => sink.start_element(
+                name,
+                attributes,
+                namespace_declarations,
+                byte_start,
+                byte_end,
+                depth,
+            ),
+            PullEvent::EndElement {
+                byte_start,
+                byte_end,
+                depth,
                 ..
-            } => {
-                let id = doc.alloc_node(
-                    crate::dom::NodeKind::Element(Element {
-                        name,
-                        attributes,
-                        namespace_declarations,
-                    }),
-                    byte_start,
-                );
-                let parent = current_parent(&stack)?;
-                doc.append_child_unchecked(parent, id);
-                stack.push(id);
-            }
-            PullEvent::EndElement { byte_end, .. } => {
-                let id = stack
-                    .pop()
-                    .ok_or_else(|| XmlError::well_formedness("Unexpected end tag", 0, 0))?;
-                doc.set_byte_end_pos(id, byte_end);
-            }
+            } => sink.end_element(byte_start, byte_end, depth),
             PullEvent::Text {
                 content,
                 byte_start,
                 byte_end,
-            } => {
-                let id = doc.alloc_node(crate::dom::NodeKind::Text(content), byte_start);
-                doc.set_byte_end_pos(id, byte_end);
-                let parent = current_parent(&stack)?;
-                doc.append_child_unchecked(parent, id);
-            }
+            } => sink.text(content, byte_start, byte_end),
             PullEvent::CData {
                 content,
                 byte_start,
                 byte_end,
-            } => {
-                let id = doc.alloc_node(crate::dom::NodeKind::CData(content), byte_start);
-                doc.set_byte_end_pos(id, byte_end);
-                let parent = current_parent(&stack)?;
-                doc.append_child_unchecked(parent, id);
-            }
+            } => sink.cdata(content, byte_start, byte_end),
             PullEvent::Comment {
                 content,
                 byte_start,
                 byte_end,
-            } => {
-                let id = doc.alloc_node(crate::dom::NodeKind::Comment(content), byte_start);
-                doc.set_byte_end_pos(id, byte_end);
-                let parent = current_parent(&stack)?;
-                doc.append_child_unchecked(parent, id);
-            }
+            } => sink.comment(content, byte_start, byte_end),
             PullEvent::ProcessingInstruction {
                 pi,
                 byte_start,
                 byte_end,
-            } => {
-                let id =
-                    doc.alloc_node(crate::dom::NodeKind::ProcessingInstruction(pi), byte_start);
-                doc.set_byte_end_pos(id, byte_end);
-                let parent = current_parent(&stack)?;
-                doc.append_child_unchecked(parent, id);
-            }
+            } => sink.processing_instruction(pi, byte_start, byte_end),
         }
     }
-
-    if stack.len() != 1 {
-        return Err(XmlError::UnexpectedEof);
-    }
-    if doc.document_element().is_none() {
-        return Err(XmlError::well_formedness(
-            "Document must have a root element",
-            0,
-            0,
-        ));
-    }
-    doc.set_byte_end_pos(root, input.len());
-    Ok(doc)
+    sink.finish(input)
 }
 
 /// Parse a string into a DOM document using the pull parser defaults.
@@ -1078,6 +1342,32 @@ mod tests {
     }
 
     #[test]
+    fn end_element_carries_name_and_depth() {
+        let events: Vec<_> = PullParser::new(r#"<r><a:b xmlns:a="urn:a"/><c></c></r>"#)
+            .map(|e| e.unwrap())
+            .collect();
+        let ends: Vec<(String, Option<String>, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                PullEvent::EndElement { name, depth, .. } => Some((
+                    name.local_name.to_string(),
+                    name.namespace_uri.as_ref().map(|u| u.to_string()),
+                    *depth,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            vec![
+                ("b".to_string(), Some("urn:a".to_string()), 1),
+                ("c".to_string(), None, 1),
+                ("r".to_string(), None, 0),
+            ]
+        );
+    }
+
+    #[test]
     fn text_cdata_comment_pi_events() {
         assert_eq!(
             event_names("<r>t<![CDATA[c]]><!--m--><?pi x?></r>"),
@@ -1117,10 +1407,22 @@ mod tests {
         }
         assert!(errored, "undeclared attribute prefix should error");
         assert_eq!(
-            p.ns_resolver.as_ref().unwrap().scope_depth(),
+            p.core.ns_resolver.as_ref().unwrap().scope_depth(),
             1,
             "namespace scope leaked after a resolution error"
         );
+    }
+
+    #[test]
+    fn fused_after_error() {
+        let mut p = PullParser::new("<r></x><!--ok-->");
+        assert!(matches!(
+            p.next_event(),
+            Ok(Some(PullEvent::StartElement { .. }))
+        ));
+        assert!(p.next_event().is_err());
+        assert!(matches!(p.next_event(), Ok(None)));
+        assert!(matches!(p.next_event(), Ok(None)));
     }
 
     #[test]
@@ -1149,5 +1451,21 @@ mod tests {
             from_pull.node_range(from_pull.document_element().unwrap()),
             normal.node_range(normal.document_element().unwrap())
         );
+    }
+
+    #[test]
+    fn direct_dom_sets_ranges_doctype_and_declaration() {
+        let xml = "<?xml version=\"1.0\"?><!DOCTYPE r><r><a/>x<!--c--><?p d?></r>";
+        let doc = crate::Parser::new().parse(xml).unwrap();
+        assert_eq!(doc.xml_declaration.as_ref().unwrap().version, "1.0");
+        assert_eq!(doc.doctype.as_deref(), Some("<!DOCTYPE r>"));
+        let root = doc.document_element().unwrap();
+        assert_eq!(doc.node_source(root), Some("<r><a/>x<!--c--><?p d?></r>"));
+        let kids = doc.children(root);
+        assert_eq!(doc.node_source(kids[0]), Some("<a/>"));
+        assert_eq!(doc.node_source(kids[1]), Some("x"));
+        assert_eq!(doc.node_source(kids[2]), Some("<!--c-->"));
+        assert_eq!(doc.node_source(kids[3]), Some("<?p d?>"));
+        assert_eq!(doc.node_range(doc.root()), Some(0..xml.len()));
     }
 }
