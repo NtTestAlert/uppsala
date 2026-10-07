@@ -5,8 +5,9 @@
 //! the [`Document`]. This avoids reference-counting overhead and makes tree
 //! mutation straightforward.
 
-use std::borrow::Cow;
 use crate::fasthash::{FastHashMap, FastHashSet};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// A unique identifier for a node within a [`Document`].
@@ -155,7 +156,12 @@ impl<'d, 'a> Iterator for ChildrenIter<'d, 'a> {
 
     fn next(&mut self) -> Option<NodeId> {
         let id = self.next?;
-        self.next = self.doc.nodes.get(id.0).and_then(|n| n.next_sibling);
+        if Some(id) == self.next_back {
+            self.next = None;
+            self.next_back = None;
+        } else {
+            self.next = self.doc.nodes.get(id.0).and_then(|n| n.next_sibling);
+        }
         Some(id)
     }
 }
@@ -163,7 +169,12 @@ impl<'d, 'a> Iterator for ChildrenIter<'d, 'a> {
 impl<'d, 'a> DoubleEndedIterator for ChildrenIter<'d, 'a> {
     fn next_back(&mut self) -> Option<NodeId> {
         let id = self.next_back?;
-        self.next_back = self.doc.nodes.get(id.0).and_then(|n| n.prev_sibling);
+        if Some(id) == self.next {
+            self.next = None;
+            self.next_back = None;
+        } else {
+            self.next_back = self.doc.nodes.get(id.0).and_then(|n| n.prev_sibling);
+        }
         Some(id)
     }
 }
@@ -1829,7 +1840,7 @@ impl<'a> Document<'a> {
                 //
                 // Precompute the last index per prefix so the "last binding wins"
                 // dedup is O(n) rather than O(n^2) in the number of bindings.
-                let mut last_idx: FastHashMap<&str, usize> = FastHashMap::default();
+                let mut last_idx: HashMap<&str, usize> = HashMap::with_capacity(child_local.len());
                 for (i, (prefix, _)) in child_local.iter().enumerate() {
                     last_idx.insert(prefix.as_ref(), i);
                 }
@@ -2079,7 +2090,7 @@ impl<'a> NsScope<'a> {
         // Track seen prefixes by reference (no cloning); the innermost binding
         // for each prefix is its effective one, so a prefix seen earlier shadows
         // any later (outer) binding.
-        let mut seen: FastHashSet<&str> = FastHashSet::default();
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut cur = Some(self);
         while let Some(s) = cur {
             for (p, u) in s.local.iter().rev() {

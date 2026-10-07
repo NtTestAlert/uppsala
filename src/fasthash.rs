@@ -1,10 +1,8 @@
 //! A small, dependency-free fast hasher for internal hash maps.
 //!
-//! Internal maps key on small integers and short arena-local strings that are
-//! never attacker-chosen *hash* inputs (the data itself may be hostile, but a
-//! hash collision cannot corrupt anything — only slow a lookup). SipHash's
-//! DoS resistance is therefore unnecessary here, and its cost is real:
-//! `usize` keys are its worst case. This is the FxHash algorithm
+//! Used only for internal arena node IDs. XML-derived strings (including
+//! entity names and namespace prefixes) must use randomized standard-library
+//! hashing to resist collision-driven denial of service. This is the FxHash algorithm
 //! (rotate-add-xor with a fixed multiplier), vendored to keep uppsala's
 //! zero-dependency property instead of pulling in `rustc-hash`.
 //!

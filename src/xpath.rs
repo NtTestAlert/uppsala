@@ -186,6 +186,43 @@ fn split_qname(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+const CACHE_LIMIT: usize = 128;
+const CACHE_SOURCE_LIMIT: usize = 4 * 1024;
+const CACHE_ENTRY_BYTES: usize = 64 * 1024;
+const CACHE_TOTAL_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct ProgramCache {
+    programs: HashMap<String, std::sync::Arc<Expr>>,
+    retained_bytes: usize,
+}
+
+impl ProgramCache {
+    fn insert(&mut self, source: &str, program: std::sync::Arc<Expr>) {
+        if source.len() > CACHE_SOURCE_LIMIT
+            || self.programs.len() >= CACHE_LIMIT
+            || self.programs.contains_key(source)
+        {
+            return;
+        }
+        let key = source.to_owned();
+        // Count allocated capacities, including the root Arc payload/counters.
+        // Hash-table metadata is separately bounded by CACHE_LIMIT.
+        let bytes = key
+            .capacity()
+            .saturating_add(std::mem::size_of::<Expr>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(program.heap_bytes());
+        if bytes > CACHE_ENTRY_BYTES
+            || bytes > CACHE_TOTAL_BYTES.saturating_sub(self.retained_bytes)
+        {
+            return;
+        }
+        self.programs.insert(key, program);
+        self.retained_bytes += bytes;
+    }
+}
+
 /// The XPath evaluator.
 pub struct XPathEvaluator {
     /// Namespace prefix mappings for XPath expressions.
@@ -204,7 +241,7 @@ pub struct XPathEvaluator {
     ///
     /// `Mutex` + `Arc` rather than `RefCell` + `Rc`: the evaluator is wrapped
     /// in a pyclass by pyuppsala, and pyclasses must be `Send + Sync`.
-    program_cache: std::sync::Mutex<HashMap<String, std::sync::Arc<Expr>>>,
+    program_cache: std::sync::Mutex<ProgramCache>,
 }
 
 impl XPathEvaluator {
@@ -218,7 +255,7 @@ impl XPathEvaluator {
             )]),
             max_depth: DEFAULT_MAX_XPATH_DEPTH,
             max_node_visits: DEFAULT_MAX_XPATH_NODE_VISITS,
-            program_cache: std::sync::Mutex::new(HashMap::new()),
+            program_cache: std::sync::Mutex::new(ProgramCache::default()),
         }
     }
 
@@ -234,10 +271,19 @@ impl XPathEvaluator {
     }
 
     /// Override the maximum expression-nesting depth. Returns `self` so it
-    /// can chain with other builder methods.
+    /// can chain with other builder methods. Changing the limit clears cached
+    /// programs so subsequent calls enforce the new parsing limit.
     pub fn with_max_depth(mut self, max_depth: u32) -> Self {
-        self.max_depth = max_depth;
+        if self.max_depth != max_depth {
+            self.clear_cache();
+            self.max_depth = max_depth;
+        }
         self
+    }
+
+    /// Release all cached XPath programs and reset their memory accounting.
+    pub fn clear_cache(&mut self) {
+        self.program_cache = std::sync::Mutex::new(ProgramCache::default());
     }
 
     /// Override the maximum number of axis/predicate node visits permitted
@@ -247,23 +293,28 @@ impl XPathEvaluator {
         self
     }
 
-    /// Evaluate an XPath expression from the given context node.
     /// Evaluate an expression from the given context node.
     ///
     /// Repeated evaluation of the same expression through one evaluator
     /// reuses the parsed AST instead of re-tokenizing and re-parsing per
-    /// call; a one-shot evaluation pays the same parse cost as before.
+    /// call. Only successful evaluations are cached, with at most 128 entries,
+    /// 4 KiB of source per entry, 64 KiB of owned key/AST allocations per entry,
+    /// and 1 MiB of those allocations in total (plus bounded table/allocator
+    /// overhead). Larger expressions still evaluate without being cached.
     pub fn evaluate(
         &self,
         doc: &Document<'_>,
         context: NodeId,
         expr: &str,
     ) -> XmlResult<XPathValue> {
-        const CACHE_LIMIT: usize = 128;
-        // Compute the lookup result before matching: a `match self.cache.borrow()…`
-        // scrutinee would keep the borrow alive across the arms and collide
-        // with the `borrow_mut` in the miss arm.
-        let cached = self.program_cache.lock().unwrap().get(expr).cloned();
+        // End the lock before parsing/evaluation; a poisoned advisory cache
+        // is bypassed rather than turning a query into a panic.
+        let cached = self
+            .program_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.programs.get(expr).cloned());
+        let cache_hit = cached.is_some();
         let program = match cached {
             Some(hit) => hit,
             None => {
@@ -276,12 +327,7 @@ impl XPathEvaluator {
                         expr
                     )));
                 }
-                let ast = std::sync::Arc::new(ast);
-                let mut cache = self.program_cache.lock().unwrap();
-                if cache.len() < CACHE_LIMIT {
-                    cache.insert(expr.to_string(), ast.clone());
-                }
-                ast
+                std::sync::Arc::new(ast)
             }
         };
 
@@ -297,7 +343,13 @@ impl XPathEvaluator {
             funcs: &NoFunctions,
             budget: &budget,
         };
-        evaluate_expr(&program, &ctx)
+        let result = evaluate_expr(&program, &ctx);
+        if result.is_ok() && !cache_hit {
+            if let Ok(mut cache) = self.program_cache.lock() {
+                cache.insert(expr, program);
+            }
+        }
+        result
     }
 
     /// Convenience: evaluate and return the resulting node set.
@@ -1154,6 +1206,76 @@ enum Expr {
     Variable(Option<String>, String),
     // Function call
     FunctionCall(String, Vec<Expr>),
+}
+
+impl Expr {
+    /// Owned heap capacity below this expression; excludes its inline storage.
+    /// Walk iteratively so accounting adds no recursive call-stack pressure.
+    fn heap_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        let mut pending = vec![self];
+        while let Some(expr) = pending.pop() {
+            match expr {
+                Expr::Path(steps) | Expr::AbsolutePath(steps) => {
+                    bytes = bytes.saturating_add(
+                        steps.capacity().saturating_mul(std::mem::size_of::<Step>()),
+                    );
+                    for step in steps {
+                        let name_bytes = match &step.node_test {
+                            NodeTest::Name(s)
+                            | NodeTest::PrefixWildcard(s)
+                            | NodeTest::NodeType(s) => s.capacity(),
+                            NodeTest::PrefixedName(p, s) => {
+                                p.capacity().saturating_add(s.capacity())
+                            }
+                            NodeTest::Wildcard => 0,
+                        };
+                        bytes = bytes.saturating_add(name_bytes).saturating_add(
+                            step.predicates
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<Expr>()),
+                        );
+                        pending.extend(&step.predicates);
+                    }
+                }
+                Expr::Union(l, r)
+                | Expr::Or(l, r)
+                | Expr::And(l, r)
+                | Expr::Eq(l, r)
+                | Expr::NotEq(l, r)
+                | Expr::Lt(l, r)
+                | Expr::Gt(l, r)
+                | Expr::LtEq(l, r)
+                | Expr::GtEq(l, r)
+                | Expr::Add(l, r)
+                | Expr::Sub(l, r)
+                | Expr::Mul(l, r)
+                | Expr::Div(l, r)
+                | Expr::Mod(l, r) => {
+                    bytes = bytes.saturating_add(2 * std::mem::size_of::<Expr>());
+                    pending.extend([l.as_ref(), r.as_ref()]);
+                }
+                Expr::Negate(inner) => {
+                    bytes = bytes.saturating_add(std::mem::size_of::<Expr>());
+                    pending.push(inner);
+                }
+                Expr::StringLiteral(s) => bytes = bytes.saturating_add(s.capacity()),
+                Expr::NumberLiteral(_) => {}
+                Expr::Variable(prefix, local) => {
+                    bytes = bytes
+                        .saturating_add(prefix.as_ref().map_or(0, String::capacity))
+                        .saturating_add(local.capacity());
+                }
+                Expr::FunctionCall(name, args) => {
+                    bytes = bytes.saturating_add(name.capacity()).saturating_add(
+                        args.capacity().saturating_mul(std::mem::size_of::<Expr>()),
+                    );
+                    pending.extend(args);
+                }
+            }
+        }
+        bytes
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2072,21 +2194,20 @@ fn collect_descendants(
     include_self: bool,
     budget: &EvalBudget,
 ) -> XmlResult<Vec<NodeId>> {
-    // FIFO queue over the zero-allocation child iterator: preserves document
-    // order without the per-node `children()` Vec + reverse the previous
-    // version paid for every visited node.
+    // Depth-first pre-order is required before positional predicates run.
+    // Reverse children onto the stack to visit the first child first.
     let mut result = Vec::new();
-    let mut queue = std::collections::VecDeque::new();
+    let mut stack = Vec::new();
     if include_self {
-        queue.push_back(node);
+        stack.push(node);
     } else {
-        queue.extend(doc.children_iter(node));
+        stack.extend(doc.children_iter(node).rev());
     }
 
-    while let Some(current) = queue.pop_front() {
+    while let Some(current) = stack.pop() {
         budget.charge(1)?;
         result.push(current);
-        queue.extend(doc.children_iter(current));
+        stack.extend(doc.children_iter(current).rev());
     }
 
     Ok(result)
@@ -2735,6 +2856,116 @@ fn document_order_key(
 mod tests {
     use super::*;
     use crate::Parser;
+
+    #[test]
+    fn cache_reuses_programs_and_clears_on_depth_change() {
+        let doc = crate::parse("<r/>").unwrap();
+        let mut eval = XPathEvaluator::new();
+        let expression = "((1 + 1))";
+        for _ in 0..2 {
+            assert_eq!(
+                eval.evaluate(&doc, doc.root(), expression)
+                    .unwrap()
+                    .to_number(&doc),
+                2.0
+            );
+        }
+        assert_eq!(eval.program_cache.lock().unwrap().programs.len(), 1);
+        eval = eval.with_max_depth(1);
+        assert_eq!(eval.program_cache.lock().unwrap().retained_bytes, 0);
+        assert!(eval.evaluate(&doc, doc.root(), expression).is_err());
+        assert!(eval.evaluate(&doc, doc.root(), "1 + 1").is_ok());
+        eval.clear_cache();
+        assert!(eval.program_cache.lock().unwrap().programs.is_empty());
+        assert_eq!(eval.program_cache.lock().unwrap().retained_bytes, 0);
+    }
+
+    #[test]
+    fn cache_skips_large_sources_and_failed_evaluations() {
+        let doc = crate::parse("<r/>").unwrap();
+        let eval = XPathEvaluator::new();
+        let text = "x".repeat(CACHE_SOURCE_LIMIT);
+        let expression = format!("'{text}'");
+        assert_eq!(
+            eval.evaluate(&doc, doc.root(), &expression)
+                .unwrap()
+                .to_string_value(&doc),
+            text
+        );
+        assert!(eval.evaluate(&doc, doc.root(), "$missing").is_err());
+        assert!(eval.program_cache.lock().unwrap().programs.is_empty());
+    }
+
+    #[test]
+    fn cache_enforces_owned_capacity_and_aggregate_limits() {
+        let mut cache = ProgramCache::default();
+        // Capacity, rather than string length, determines retained allocation.
+        cache.insert(
+            "large",
+            std::sync::Arc::new(Expr::StringLiteral(String::with_capacity(
+                CACHE_ENTRY_BYTES,
+            ))),
+        );
+        assert!(cache.programs.is_empty());
+        for i in 0..CACHE_LIMIT {
+            cache.insert(
+                &i.to_string(),
+                std::sync::Arc::new(Expr::StringLiteral(String::with_capacity(32 * 1024))),
+            );
+        }
+        assert!(!cache.programs.is_empty());
+        assert!(cache.programs.len() < CACHE_LIMIT);
+        assert!(cache.retained_bytes <= CACHE_TOTAL_BYTES);
+        let bytes = cache.retained_bytes;
+        cache.insert("0", std::sync::Arc::new(Expr::NumberLiteral(0.0)));
+        assert_eq!(cache.retained_bytes, bytes);
+    }
+
+    #[test]
+    fn cache_accounts_for_nested_ast_allocations() {
+        let literal = String::with_capacity(200);
+        let args = vec![Expr::StringLiteral(literal)];
+        let argument_bytes = args.capacity() * std::mem::size_of::<Expr>() + 200;
+        let name = String::from("string");
+        let call_bytes = name.capacity() + argument_bytes;
+        let predicates = vec![Expr::Negate(Box::new(Expr::FunctionCall(name, args)))];
+        let predicate_bytes = predicates.capacity() * std::mem::size_of::<Expr>()
+            + std::mem::size_of::<Expr>()
+            + call_bytes;
+        let prefix = String::from("p");
+        let local = String::from("item");
+        let names_bytes = prefix.capacity() + local.capacity();
+        let steps = vec![Step {
+            axis: Axis::Child,
+            node_test: NodeTest::PrefixedName(prefix, local),
+            predicates,
+        }];
+        let expected =
+            steps.capacity() * std::mem::size_of::<Step>() + names_bytes + predicate_bytes;
+        assert_eq!(Expr::Path(steps).heap_bytes(), expected);
+    }
+
+    #[test]
+    fn cache_concurrent_misses_do_not_duplicate_accounting() {
+        let doc = crate::parse("<r/>").unwrap();
+        let eval = XPathEvaluator::new();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        assert!(eval.evaluate(&doc, doc.root(), "1 + 1").is_ok());
+                    }
+                });
+            }
+        });
+        let cache = eval.program_cache.lock().unwrap();
+        assert_eq!(cache.programs.len(), 1);
+        let bytes = cache.retained_bytes;
+        drop(cache);
+        let fresh = XPathEvaluator::new();
+        fresh.evaluate(&doc, doc.root(), "1 + 1").unwrap();
+        assert_eq!(fresh.program_cache.lock().unwrap().retained_bytes, bytes);
+    }
 
     fn parse_and_eval(xml: &str, xpath: &str) -> XPathValue {
         let doc = Parser::new().parse(xml).unwrap();

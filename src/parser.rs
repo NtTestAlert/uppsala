@@ -5,17 +5,17 @@
 //! defined in the XML 1.0 specification.
 
 use std::borrow::Cow;
-use crate::fasthash::FastHashMap;
+use std::collections::HashMap;
 
 use crate::dom::{Document, ProcessingInstruction, XmlDeclaration};
 use crate::error::{XmlError, XmlResult};
 
 /// A map of general entity names to their replacement text.
-pub(crate) type EntityMap = FastHashMap<String, String>;
+pub(crate) type EntityMap = HashMap<String, String>;
 
 /// Cache of already-validated entity expansion results.
 /// Key: entity name, Value: expanded text.
-pub(crate) type EntityCache = FastHashMap<String, String>;
+pub(crate) type EntityCache = HashMap<String, String>;
 
 /// Default maximum element-nesting depth.
 ///

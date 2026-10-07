@@ -180,20 +180,29 @@ conformance suites) and measured with the new criterion harness
 1. **E1 — zero-alloc traversal** (01/08): converted hot internal `.children()`
    (Vec-per-call) sites to the existing `children_iter`; `descendants()` is now
    an iterative walk instead of recursion with a `Vec` per node; XPath
-   `collect_descendants` uses a FIFO queue over `children_iter` (no per-node
-   Vec + reverse); `Child` axis pre-sizes its result via the new
-   `children_count()`; `ChildrenIter` is now `DoubleEndedIterator`.
+   `collect_descendants` uses a depth-first stack over reversed `children_iter`
+   (no per-node Vec + reverse), preserving document order before predicates;
+   `Child` axis pre-sizes its result via the new `children_count()`;
+   `ChildrenIter` supports mixed forward/backward traversal with shared exhaustion.
 2. **E2 — XPath compile-once** (08): `XPathEvaluator` caches the parsed AST
-   keyed by expression text (`RefCell<HashMap<String, Rc<Expr>>>`, bounded at
-   128 entries). Repeated evaluation of the same expression through one
+   keyed by expression text (`Mutex`-protected map of `Arc<Expr>`). Admission
+   is limited to 128 entries, 4 KiB of source per entry, 64 KiB of owned key/AST
+   capacity per entry, and 1 MiB of that capacity in total, plus bounded
+   hash-table and allocator overhead. Only successful evaluations are admitted;
+   larger expressions still evaluate without caching. `clear_cache()` releases
+   cached programs, and changing `with_max_depth()` clears them automatically.
+   These bounds cover retained cache data, not total parsing/evaluation memory;
+   applications should still bound input sizes and concurrent work.
+   Repeated evaluation of the same expression through one
    evaluator — the pyuppsala `XPath` pattern — skips tokenize+parse entirely.
    Measured: cheap repeated expressions **~6.5x faster** (671 -> 103 ns for
    `1 + 1`; tokenize+parse of even a 5-char expression costs ~3.2 us).
 3. **E3 — FxHash for internal maps** (05): vendored `src/fasthash.rs`
    (`FastHashMap`/`FastHashSet`) — keeps the zero-dependency property that
    adding `rustc-hash` would break. Applied to `Document.attribute_nodes`
-   (hot on XPath attribute axis and `prepare_xpath`), the entity maps in the
-   parser/pull parser, and small internal sets.
+   (hot on XPath attribute axis and `prepare_xpath`) and internal NodeId sets.
+   Entity maps and namespace-prefix maps/sets retain randomized standard-library
+   hashing because their string keys come from XML input.
 4. **E4 — build profiles** (09): `[profile.release]` (fat LTO, codegen-units 1,
    strip), `[profile.dev] debug = "line-tables-only"`, and a
    `[profile.profiling]` for flamegraph sessions. Note: consumers building
@@ -201,6 +210,9 @@ conformance suites) and measured with the new criterion harness
    (LTO + codegen-units) if you want the same code in your binary.
 
 ### Results (criterion medians, full before/after, same machine)
+
+These measurements predate the security-review corrections to traversal,
+cache limits, and string hashing above; they have not been remeasured.
 
 | Benchmark | before | after | Delta |
 |---|---:|---:|---:|
