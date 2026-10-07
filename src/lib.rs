@@ -103,9 +103,9 @@ use std::borrow::Cow;
 
 /// Arena-based DOM representation of XML documents.
 pub mod dom;
-pub mod fasthash;
 /// Error types: [`XmlError`], [`XmlResult`], and per-domain error structs.
 pub mod error;
+pub mod fasthash;
 
 mod exslt;
 /// Namespace prefix resolution with scope stack.
