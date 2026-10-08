@@ -166,6 +166,53 @@ fn bench_prepare(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_xpath_shapes(c: &mut Criterion) {
+    // Wide sibling sets expose traversal/filtering costs hidden by tiny steps.
+    let xml = format!("<r>{}</r>", "<item id='x'/>".repeat(1024));
+    let mut doc = uppsala::parse(&xml).unwrap();
+    doc.prepare_xpath();
+    let root = doc.document_element().unwrap();
+    let ev = uppsala::XPathEvaluator::new();
+    let mut group = c.benchmark_group("xpath_shapes");
+    for (name, expression, expected) in [
+        ("child_all", "*", 1024),
+        ("child_no_match", "missing", 0),
+        ("attributes", "item/@id", 1024),
+        (
+            "predicates",
+            "*[position() mod 2 = 0][position() <= 16]",
+            16,
+        ),
+    ] {
+        assert_eq!(
+            ev.select_nodes(&doc, root, expression).unwrap().len(),
+            expected
+        );
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(ev.select_nodes(black_box(&doc), root, expression).unwrap()));
+        });
+    }
+    // NodeIds are scoped to one Document: resolve the root from `unprepared`
+    // rather than reusing the prepared document's id.
+    let unprepared = uppsala::parse(&xml).unwrap();
+    let unprepared_root = unprepared.document_element().unwrap();
+    assert_eq!(
+        ev.select_nodes(&unprepared, unprepared_root, "*")
+            .unwrap()
+            .len(),
+        1024
+    );
+    group.bench_function("unprepared_children", |b| {
+        b.iter(|| {
+            black_box(
+                ev.select_nodes(black_box(&unprepared), unprepared_root, "*")
+                    .unwrap(),
+            )
+        });
+    });
+    group.finish();
+}
+
 fn bench_serialize(c: &mut Criterion) {
     let inputs = [("saml", saml_shaped(40)), ("text_heavy", text_heavy())];
     let mut group = c.benchmark_group("serialize");
@@ -209,6 +256,7 @@ criterion_group!(
     bench_parse,
     bench_traverse,
     bench_xpath,
+    bench_xpath_shapes,
     bench_prepare,
     bench_serialize,
     bench_pull

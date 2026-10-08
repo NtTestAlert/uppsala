@@ -128,7 +128,10 @@ The `Ratio` columns are `libxml2 / Uppsala`; values above `1.0` mean Uppsala
 parsed faster. `uppsala_ns_us` is the namespace-aware DOM parser,
 `uppsala_no_ns_us` disables namespace resolution, `uppsala_pull_scan_us` drains
 the pull event stream without materializing a DOM, and `uppsala_pull_dom_us`
-builds a DOM directly from pull events.
+builds a DOM from the pull event stream via `document_from_pull`. That last
+column is the explicit event-to-DOM path kept for differential testing; it is
+expected to be slower than `uppsala_ns_us`, which builds the arena directly
+from the shared tokenizer (ADR 0019).
 
 On x86_64, this harness exercises Uppsala's SSE2 scanners. For server
 deployment benchmarking, prefer `RUSTFLAGS='-C target-cpu=native'` so LLVM can

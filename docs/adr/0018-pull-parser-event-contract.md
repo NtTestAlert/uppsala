@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted
+Accepted, amended by [ADR 0019](0019-direct-dom-construction-from-shared-tokenizer.md):
+`Parser::parse` no longer consumes `PullParser` events. Both the DOM parser and
+the pull parser drive one shared tokenizer; the event contract, the
+differential tests, and the single-implementation rule below still hold.
 
 ## Context
 

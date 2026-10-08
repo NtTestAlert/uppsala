@@ -269,8 +269,8 @@ src/
   lib.rs            Public API, parse(), parse_bytes(), encoding detection
   error.rs          XmlError enum, XmlResult type alias
   dom.rs            Arena-based DOM: Document, NodeId, QName, serialization
-  parser.rs         XML 1.0 recursive-descent parser with full DTD internal subset
-  pull.rs           Pull-based event parser (PullParser); the DOM parser is built on it
+  parser.rs         XML 1.0 scanner helpers and full DTD internal subset
+  pull.rs           Shared tokenizer; DOM sink for Parser::parse, event sink for PullParser
   simd.rs           SSE2-accelerated byte scanning (content + attribute delimiters)
   namespace.rs      Namespace prefix resolution with scope stack
   writer.rs         XmlWriter imperative builder

@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-10-07
+## [0.12.0] - 2026-10-08
+
 
 ### Added
 
@@ -31,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefixes.
 - Enable fat LTO, a single codegen unit, and stripping for this crate's release
   builds. Applications using Uppsala as a dependency control their own profiles.
+- Stream XPath child and attribute steps directly into their result, compact
+  predicate results in place, and skip redundant document-order sorting.
+  Node-visit budgets and per-parent predicate positions remain enforced.
+- Reserve virtual-attribute arena and index capacity before initial XPath
+  preparation to avoid repeated growth on attribute-heavy documents.
+
 
 ### Fixed
 
@@ -41,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same query as the repeated-evaluation benchmark.
 - Use fixed-width values in the hash byte-equivalence test for portability to
   both 32-bit and 64-bit targets.
+- Restore direct DOM construction in `Parser::parse`. Since 0.9.0 the DOM
+  parser consumed `PullParser` events, copying a 144-byte event several times
+  per node; on node-dense inputs that doubled parse time and erased the
+  parse-speed lead over libxml2. A shared crate-private tokenizer now drives
+  either a DOM sink (arena nodes built in place) or the pull-event sink, so
+  the public `PullParser`/`PullEvent` API and the `document_from_pull`
+  signature are unchanged while DOM parsing is back to its pre-0.9.0 speed.
+  See ADR 0019.
+  `document_from_pull` now returns an error when handed a `PullParser` that
+  has already produced events, instead of silently building a tree missing
+  the consumed declaration, DOCTYPE, or ancestors.
+
 
 ### Security
 

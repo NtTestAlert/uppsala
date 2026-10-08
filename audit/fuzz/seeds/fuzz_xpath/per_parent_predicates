@@ -1,0 +1,2 @@
+g/item[position() <= 2][last()]/@*[1]
+<r><g><item a="1" b="2"/><item a="3"/></g><g><item a="4"/><item a="5"/></g></r>

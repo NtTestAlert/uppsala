@@ -2075,30 +2075,66 @@ fn xpath_equal(left: &XPathValue, right: &XPathValue, doc: &Document<'_>) -> boo
 fn apply_step(step: &Step, context_nodes: &[NodeId], ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
     let mut result = Vec::new();
     for &node in context_nodes {
-        let axis_nodes = select_axis(&step.axis, node, ctx)?;
-        let mut step_nodes = Vec::new();
-        for &candidate in &axis_nodes {
-            if matches_node_test(&step.node_test, candidate, ctx.doc, ctx.namespaces) {
-                step_nodes.push(candidate);
+        let start = result.len();
+        match step.axis {
+            Axis::Child => {
+                // Stream into the result instead of counting siblings, copying
+                // the axis, and then allocating a separate filtered vector.
+                // Charge every candidate, including non-matches, before push.
+                for candidate in ctx.doc.children_iter(node) {
+                    ctx.budget.charge(1)?;
+                    if matches_node_test(&step.node_test, candidate, ctx.doc, ctx.namespaces) {
+                        result.push(candidate);
+                    }
+                }
+            }
+            Axis::Attribute => {
+                let candidates = ctx.doc.get_attribute_nodes(node);
+                ctx.budget.charge(candidates.len())?;
+                for &candidate in candidates {
+                    if matches_node_test(&step.node_test, candidate, ctx.doc, ctx.namespaces) {
+                        result.push(candidate);
+                    }
+                }
+            }
+            _ => {
+                for candidate in select_axis(&step.axis, node, ctx)? {
+                    if matches_node_test(&step.node_test, candidate, ctx.doc, ctx.namespaces) {
+                        result.push(candidate);
+                    }
+                }
             }
         }
         for pred in &step.predicates {
-            step_nodes = apply_predicate(pred, &step_nodes, ctx)?;
+            apply_predicate(pred, &mut result, start, ctx)?;
         }
-        result.extend(step_nodes);
+    }
+    // These axes are already unique and in document order for one context,
+    // even without prepare_xpath(). Multiple (possibly nested) contexts still
+    // require global ordering, as do the reverse and overlapping axes.
+    if context_nodes.len() == 1 && matches!(step.axis, Axis::Child | Axis::Attribute) {
+        return Ok(result);
     }
     Ok(dedup_document_order(ctx.doc, result))
 }
 
-fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
-    let size = nodes.len();
+fn apply_predicate(
+    pred: &Expr,
+    nodes: &mut Vec<NodeId>,
+    start: usize,
+    ctx: &EvalContext,
+) -> XmlResult<()> {
+    // Only this parent's suffix participates in position()/last(). Compact it
+    // in place without touching results belonging to earlier context nodes.
+    let size = nodes.len() - start;
     // Charge the candidate scan up front so a query that is already over budget
     // fails before doing the (potentially expensive) per-candidate predicate
     // evaluation, rather than after. This tightens the DoS bound the budget
     // is meant to provide.
     ctx.budget.charge(size)?;
-    let mut result = Vec::new();
-    for (i, &node) in nodes.iter().enumerate() {
+    let mut kept = start;
+    for i in 0..size {
+        let node = nodes[start + i];
         let pred_ctx = EvalContext {
             node,
             current: ctx.current,
@@ -2116,10 +2152,12 @@ fn apply_predicate(pred: &Expr, nodes: &[NodeId], ctx: &EvalContext) -> XmlResul
             _ => val.to_boolean(),
         };
         if keep {
-            result.push(node);
+            nodes[kept] = node;
+            kept += 1;
         }
     }
-    Ok(result)
+    nodes.truncate(kept);
+    Ok(())
 }
 
 fn select_axis(axis: &Axis, node: NodeId, ctx: &EvalContext) -> XmlResult<Vec<NodeId>> {
@@ -2740,7 +2778,12 @@ fn dedup_document_order(doc: &Document<'_>, mut nodes: Vec<NodeId>) -> Vec<NodeI
     // template testing `name/text()` on each of thousands of siblings) linear
     // rather than O(width^2).
     if doc.doc_order_ready() {
-        nodes.sort_by_cached_key(|&node| doc.doc_order_at(node));
+        // Most forward steps already produce ordered nodes. Avoid allocating
+        // cached sort keys in that case; retain the stable fallback for equal
+        // keys (including detached nodes) and out-of-order context streams.
+        if !nodes.is_sorted_by_key(|&node| doc.doc_order_at(node)) {
+            nodes.sort_by_cached_key(|&node| doc.doc_order_at(node));
+        }
         nodes.dedup();
         return nodes;
     }
