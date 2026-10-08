@@ -45,7 +45,7 @@ enum XstsOutcome {
     FalseAccept(String),
     /// Expected valid, but the validator rejected it.
     FalseRefuse(String),
-    /// The validator panicked.
+    /// The parser or the validator panicked.
     Panic(String),
     Skip(String),
 }
@@ -289,19 +289,18 @@ fn run_xsts_cases(
             }
         };
 
-        // Compile the schema; a schema that fails to parse is rejected.
-        let compiled = match uppsala::parse(&schema_str) {
-            Ok(schema_doc) => {
-                if group.schema_valid {
-                    eprintln!("  DEBUG: Compiling schema for group '{}'...", group.name);
-                }
-                panic::catch_unwind(AssertUnwindSafe(|| {
-                    XsdValidator::from_schema_with_base_path(&schema_doc, Some(schema_path))
-                        .map_err(|e| format!("schema error: {}", e))
-                }))
+        // Parse and compile the schema inside one panic boundary, so that a
+        // panic in either is reported for this group only. A schema that
+        // fails to parse is rejected.
+        let compiled = panic::catch_unwind(AssertUnwindSafe(|| {
+            let schema_doc =
+                uppsala::parse(&schema_str).map_err(|e| format!("schema parse error: {}", e))?;
+            if group.schema_valid {
+                eprintln!("  DEBUG: Compiling schema for group '{}'...", group.name);
             }
-            Err(e) => Ok(Err(format!("schema parse error: {}", e))),
-        };
+            XsdValidator::from_schema_with_base_path(&schema_doc, Some(schema_path))
+                .map_err(|e| format!("schema error: {}", e))
+        }));
         let validator = match compiled {
             Ok(Ok(v)) => {
                 if !group.schema_valid {
@@ -328,7 +327,7 @@ fn run_xsts_cases(
             Err(p) => {
                 let message = panic_message(&p);
                 eprintln!(
-                    "  PANIC compiling schema for group '{}' ({} tests skipped): {}",
+                    "  PANIC parsing or compiling schema for group '{}' ({} tests skipped): {}",
                     group.name,
                     group.instance_tests.len(),
                     message
@@ -376,36 +375,38 @@ fn run_xsts_cases(
                 }
             };
 
-            let inst_doc = match uppsala::parse(&inst_str) {
-                Ok(d) => d,
-                Err(e) => {
-                    // Expected invalid and we can't even parse — count as pass
-                    if inst_test.expected_valid {
-                        case.outcome =
-                            XstsOutcome::FalseRefuse(format!("expected valid, parse error: {}", e));
-                    }
-                    results.push(case);
-                    continue;
-                }
-            };
-
-            match panic::catch_unwind(AssertUnwindSafe(|| validator.validate(&inst_doc))) {
-                Ok(errors) => {
-                    let is_valid = errors.is_empty();
-                    if is_valid != inst_test.expected_valid {
-                        case.outcome = if inst_test.expected_valid {
-                            XstsOutcome::FalseRefuse(format!(
-                                "expected valid, got {} error(s): {}",
-                                errors.len(),
-                                errors.first().map(|e| e.to_string()).unwrap_or_default()
-                            ))
+            // Parse and validate the instance inside one panic boundary, so
+            // that a panic in either is reported for this case only.
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                let inst_doc = match uppsala::parse(&inst_str) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // Expected invalid and we can't even parse — count as pass
+                        return if inst_test.expected_valid {
+                            XstsOutcome::FalseRefuse(format!("expected valid, parse error: {}", e))
                         } else {
-                            XstsOutcome::FalseAccept("expected invalid, got valid".to_string())
+                            XstsOutcome::Pass
                         };
                     }
+                };
+                let errors = validator.validate(&inst_doc);
+                let is_valid = errors.is_empty();
+                if is_valid == inst_test.expected_valid {
+                    XstsOutcome::Pass
+                } else if inst_test.expected_valid {
+                    XstsOutcome::FalseRefuse(format!(
+                        "expected valid, got {} error(s): {}",
+                        errors.len(),
+                        errors.first().map(|e| e.to_string()).unwrap_or_default()
+                    ))
+                } else {
+                    XstsOutcome::FalseAccept("expected invalid, got valid".to_string())
                 }
-                Err(p) => case.outcome = XstsOutcome::Panic(panic_message(&p)),
-            }
+            }));
+            case.outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(p) => XstsOutcome::Panic(panic_message(&p)),
+            };
             results.push(case);
         }
     }
@@ -430,8 +431,8 @@ struct XstsCounts {
     skipped: usize,
     /// One line per failed instance test, panics included.
     failures: Vec<String>,
-    /// One line per panic caught while compiling a schema or validating an
-    /// instance.
+    /// One line per panic caught while parsing or compiling a schema, or
+    /// while parsing or validating an instance.
     panics: Vec<String>,
     /// One entry per group with skipped instance tests: the group, the
     /// reason and the number of instance tests skipped.
@@ -439,9 +440,9 @@ struct XstsCounts {
 }
 
 /// Run XSTS instance tests for a given test set file and count them.
-/// A validation panic counts as a failed instance test; a schema
-/// compilation panic skips the group's instance tests. Both are also listed
-/// in `panics`.
+/// A panic while parsing or validating an instance counts as a failed
+/// instance test; a panic while parsing or compiling a schema skips the
+/// group's instance tests. Both are also listed in `panics`.
 /// When `enforce_qname_length_facets` is false, QName/NOTATION length facets are skipped
 /// (needed for NIST tests which expect them to be ignored per W3C Bug #4009).
 fn run_xsts_instance_tests(test_set_path: &Path, enforce_qname_length_facets: bool) -> XstsCounts {
@@ -450,7 +451,8 @@ fn run_xsts_instance_tests(test_set_path: &Path, enforce_qname_length_facets: bo
     for case in run_xsts_cases(test_set_path, enforce_qname_length_facets, false) {
         let line = |detail: &str| format!("{} ({}): {}", case.name, case.path.display(), detail);
         if case.kind == "schema" {
-            // Only a schema compilation panic is reported here.
+            // Only a panic while parsing or compiling the schema is reported
+            // here.
             if let XstsOutcome::Panic(detail) = &case.outcome {
                 counts
                     .panics
