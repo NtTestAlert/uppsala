@@ -60,8 +60,9 @@ One tokenizer, two sinks, no events on the DOM path.
   buffers `PullEvent`s in a `VecDeque` and keeps its own stack of resolved
   names and namespace counts for `EndElement` and `EndNamespace`. The public
   `PullParser`, `PullEvent`, `NamespaceDeclaration`, `document_from_pull`, and
-  `parse_document` signatures and semantics are unchanged, including fusing to
-  `Ok(None)` after an error.
+  `parse_document` signatures are unchanged. `PullParser` keeps its event
+  order and its fusing guarantee (`Ok(None)` after an error). The one
+  semantic change is in `document_from_pull`, described in the next point.
 - `document_from_pull` stays as the explicit event-stream-to-DOM path and now
   feeds a `DomSink` from events. It is the subject of the ADR 0018 differential
   tests, not the way `Parser::parse` works. It requires an unconsumed

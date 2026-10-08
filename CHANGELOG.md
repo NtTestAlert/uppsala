@@ -53,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per node; on node-dense inputs that doubled parse time and erased the
   parse-speed lead over libxml2. A shared crate-private tokenizer now drives
   either a DOM sink (arena nodes built in place) or the pull-event sink, so
-  the public `PullParser`/`PullEvent` API and `document_from_pull` are
-  unchanged while DOM parsing is back to its pre-0.9.0 speed. See ADR 0019.
+  the public `PullParser`/`PullEvent` API and the `document_from_pull`
+  signature are unchanged while DOM parsing is back to its pre-0.9.0 speed.
+  See ADR 0019.
   `document_from_pull` now returns an error when handed a `PullParser` that
   has already produced events, instead of silently building a tree missing
   the consumed declaration, DOCTYPE, or ancestors.
