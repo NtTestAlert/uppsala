@@ -125,10 +125,20 @@ pub enum PullEvent<'a> {
 
 /// Receiver for the syntactic units produced by [`Tokenizer::step`].
 ///
-/// A sink is called at most a few times per step: a self-closing tag produces
-/// `start_element` immediately followed by `end_element`; everything else is
-/// one call. Sinks never fail: structural errors are the tokenizer's job, and
-/// end-of-document checks belong to whoever drives the tokenizer to completion.
+/// One [`Tokenizer::step`] makes zero, one, or two sink calls:
+///
+/// - zero when the step only changes phase (skipping the BOM, entering the
+///   prolog, leaving content for the trailing section) or when a text run
+///   expands to nothing (an entity with empty replacement text);
+/// - one for every ordinary unit (declaration, DOCTYPE, start tag, end tag,
+///   text, CDATA, comment, PI);
+/// - two for a self-closing tag: `start_element` immediately followed by
+///   `end_element`.
+///
+/// Drivers must not infer from `step` returning `Ok(true)` that a token was
+/// delivered. Sinks never fail: structural errors are the tokenizer's job,
+/// and end-of-document checks belong to whoever drives the tokenizer to
+/// completion.
 pub(crate) trait TokenSink<'a> {
     fn xml_declaration(&mut self, decl: XmlDeclaration<'a>);
     fn doctype(&mut self, raw: Cow<'a, str>);
@@ -228,8 +238,10 @@ impl<'a> Tokenizer<'a> {
     /// Consume one syntactic unit and report it to `sink`.
     ///
     /// Returns `Ok(true)` while more input may follow and `Ok(false)` once the
-    /// document is complete. After an error the tokenizer is fused: further
-    /// calls return `Ok(false)`.
+    /// document is complete. `Ok(true)` does not mean a token was delivered:
+    /// a step may make zero sink calls (phase changes, empty text runs) or
+    /// two (self-closing tag); see [`TokenSink`]. After an error the
+    /// tokenizer is fused: further calls return `Ok(false)`.
     #[inline]
     pub(crate) fn step<S: TokenSink<'a>>(&mut self, sink: &mut S) -> XmlResult<bool> {
         if self.phase == Phase::Done {
@@ -1213,17 +1225,27 @@ pub(crate) fn build_document<'a>(
 
 /// Build a DOM document from a stream of pull events.
 ///
-/// This is the explicit event-stream-to-DOM path. It is primarily useful for
-/// differential tests and for callers that already hold a `PullParser` (for
-/// example after inspecting its first events) and want the rest of the
-/// document materialized. `Parser::parse` does not go through events: it
-/// drives the same tokenizer straight into the arena (`build_document`,
-/// crate-private), so this function is measurably slower and is not the way
-/// to parse a document you only want as a DOM.
+/// This is the explicit event-stream-to-DOM path, kept for differential
+/// testing against `Parser::parse`. `Parser::parse` does not go through
+/// events: it drives the same tokenizer straight into the arena
+/// (`build_document`, crate-private), so this function is measurably slower
+/// and is not the way to parse a document you only want as a DOM.
+///
+/// `parser` must be unconsumed. Events already taken with `next_event` cannot
+/// be recovered: the XML declaration, DOCTYPE, and any open ancestors they
+/// carried would be missing from the result. Passing a parser that has
+/// produced events returns an error rather than a truncated tree.
 pub fn document_from_pull<'a>(
     input: &'a str,
     mut parser: PullParser<'a>,
 ) -> XmlResult<Document<'a>> {
+    if parser.core.phase != Phase::Start {
+        return Err(XmlError::parse(
+            "document_from_pull requires an unconsumed PullParser: events were already taken from it",
+            0,
+            0,
+        ));
+    }
     let mut sink = DomSink::new(input);
     while let Some(event) = parser.next_event()? {
         match event {
@@ -1451,6 +1473,23 @@ mod tests {
             from_pull.node_range(from_pull.document_element().unwrap()),
             normal.node_range(normal.document_element().unwrap())
         );
+    }
+
+    #[test]
+    fn document_from_pull_rejects_consumed_parser() {
+        let xml = "<?xml version=\"1.0\"?><r><a/></r>";
+        let mut p = PullParser::new(xml);
+        assert!(matches!(
+            p.next_event(),
+            Ok(Some(PullEvent::XmlDeclaration(_)))
+        ));
+        let err = document_from_pull(xml, p).expect_err("consumed parser must be rejected");
+        assert!(err.to_string().contains("unconsumed"), "{err}");
+        // A fresh parser over the same input still builds the full document.
+        let from_pull = document_from_pull(xml, PullParser::new(xml)).unwrap();
+        let direct = crate::Parser::new().parse(xml).unwrap();
+        assert_eq!(from_pull.to_xml(), direct.to_xml());
+        assert!(from_pull.xml_declaration.is_some());
     }
 
     #[test]

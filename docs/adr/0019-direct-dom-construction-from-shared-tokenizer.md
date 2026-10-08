@@ -64,7 +64,9 @@ One tokenizer, two sinks, no events on the DOM path.
   `Ok(None)` after an error.
 - `document_from_pull` stays as the explicit event-stream-to-DOM path and now
   feeds a `DomSink` from events. It is the subject of the ADR 0018 differential
-  tests, not the way `Parser::parse` works.
+  tests, not the way `Parser::parse` works. It requires an unconsumed
+  `PullParser` and returns an error otherwise, since events already taken
+  (declaration, DOCTYPE, open ancestors) cannot be reconstructed.
 - `parser::parse_doctype` no longer takes a `Document`; the caller captures the
   raw DOCTYPE text from the cursor range. This removes the throwaway
   `Document` the pull parser allocated per parse.
